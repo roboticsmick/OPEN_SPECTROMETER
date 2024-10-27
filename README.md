@@ -85,6 +85,8 @@ if __name__ == "__main__":
     display_info()
 ```
 
+### Run at ssh display bootup
+
 ```sh
 cd
 crontab -e
@@ -94,8 +96,11 @@ crontab -e
 @reboot /bin/bash -c "source /home/pi/oled-env/bin/activate && /home/pi/oled-env/bin/python /home/pi/oled-env/display_ip.py"
 ```
 
+### Turn off display at shutdown
+
 ```sh
-vim shutdown_oled.py
+cd
+vim /home/pi/oled-env/shutdown_oled.py
 ```
 
 ```py
@@ -145,7 +150,7 @@ sudo systemctl enable oled-shutdown.service
 ```
 
 ```sh
-sudo reboot
+sudo poweroff
 ```
 
 ## To do:
