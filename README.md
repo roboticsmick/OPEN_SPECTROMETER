@@ -25,6 +25,7 @@ import adafruit_ssd1306
 import psutil
 import socket
 from PIL import Image, ImageDraw, ImageFont
+import subprocess
 
 # I2C setup - explicitly specify bus 1
 i2c = busio.I2C(board.SCL, board.SDA)
@@ -43,7 +44,7 @@ image = Image.new("1", (oled.width, oled.height))
 draw = ImageDraw.Draw(image)
 
 # Load a default font
-font = ImageFont.truetype("/usr/share/fonts/opentype/cantarell/Cantarell-Regular.otf", 10)
+font = ImageFont.truetype("/usr/share/fonts/opentype/cantarell/Cantarell-Regular.otf", 8)
 
 def get_ip_address():
     # Get the IP address from network interfaces
@@ -53,22 +54,31 @@ def get_ip_address():
                 return addr.address
     return "No IP"
 
+def get_network_name():
+    try:
+        # Run iwgetid to get the network SSID
+        ssid = subprocess.check_output(["iwgetid", "-r"]).decode("utf-8").strip()
+        return ssid if ssid else "No WiFi"
+    except subprocess.CalledProcessError:
+        return "No WiFi"
+
 def display_info():
     while True:
-        # Get the IP address
+        # Get the IP address and network name
         ip_address = get_ip_address()
+        network_name = get_network_name()
 
         # Clear the drawing area
         draw.rectangle((0, 0, oled.width, oled.height), outline=0, fill=0)
 
         # Draw the IP address on the first line
-        draw.text((0, 0), f"SSH IP: ssh pi@{ip_address}", font=font, fill=255)
+        draw.text((0, 0), f"IP: {ip_address}", font=font, fill=255)
 
-        # Set the default user and password
-        user_info = "USER: pi PASSWORD: logic"
+        # Draw the network name (SSID) on the second line
+        draw.text((0, 10), f"WiFi: {network_name}", font=font, fill=255)
 
-        # Draw the user and password on the second line
-        draw.text((0, 16), user_info, font=font, fill=255)
+        # Draw the user and password on the third line
+        draw.text((0, 20), "USER: pi PASS: logic", font=font, fill=255)
 
         # Display image on the OLED
         oled.image(image)
