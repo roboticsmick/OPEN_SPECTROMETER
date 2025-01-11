@@ -48,6 +48,51 @@ Veiw the spectra or images using feh.
 feh spectrum_20241212102529.png --auto-zoom --scale-down -g 600x600 -
 ```
 
+Run disp_spec_plot.py at startup.
+
+```sh
+cd pysb
+chmod +x /home/pi/pysb/disp_spec_plot.py
+sudo vim /etc/systemd/system/disp_spec.service
+```
+
+```bash
+[Unit]
+Description=Spectrometer Display Service
+After=multi-user.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/pysb
+ExecStart=/home/pi/pysb/venv/bin/python3 /home/pi/pysb/disp_spec_plot.py
+Restart=always
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable disp_spec.service
+sudo systemctl start disp_spec.service
+systemctl status disp_spec.service
+```
+
+To stop it at boot
+
+```sh
+sudo systemctl disable disp_spec.service
+```
+
+If it is currently running you can stop it
+
+```sh
+sudo systemctl stop disp_spec.service
+```
+
 ## Raspberry Pi OLED SSH display
 
 This script will output the Raspberry Pi IP address on bootup via an I2C OLED (dimensions: 128x32 pixels). Our Raspberry Pi is installed in a waterproof acrylic case, so the OLED display allows us to SSH into the Raspberry Pi to download data easily.
