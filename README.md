@@ -1,5 +1,53 @@
 # OPEN_SPECTROMETER
 
+## Setup Pi
+
+```sh
+sudo apt-get update
+sudo apt-get upgrade
+sudo apt install vim
+sudo apt-get install git cmake
+sudo apt install python3-RPi.GPIO
+sudo apt-get install python3-numpy
+sudo apt-get install python3-pil
+sudo apt-get install git-all build-essential libusb-dev
+sudo apt-get install p7zip-full -y
+sudo apt-get install python3-matplotlib
+sudo apt install libatlas-base-dev
+sudo apt-get install python3-pip
+sudo apt-get install python3-opencv
+sudo apt install feh
+sudo usermod -aG video pi
+sudo usermod -aG i2c,gpio pi
+```
+
+Install Pyseabreeze.
+
+```sh
+cd
+mkdir pysb
+cd pysb
+python3 -m venv --system-site-packages venv
+source venv/bin/activate
+pip install seabreeze[pyseabreeze]
+seabreeze_os_setup
+```
+
+Install the LCD display drivers. May be missing stuff here.
+
+```sh
+wget https://files.waveshare.com/upload/b/bd/1.3inch_LCD_HAT_code.7z
+7z x 1.3inch_LCD_HAT_code.7z -r -o./1.3inch_LCD_HAT_code
+sudo chmod 777 -R 1.3inch_LCD_HAT_code
+mv ~/pysb/1.3inch_LCD_HAT_code/1.3inch_LCD_HAT_code/python ~/pysb/lcd
+```
+
+Veiw the spectra or images using feh. 
+
+```sh
+feh spectrum_20241212102529.png --auto-zoom --scale-down -g 600x600 -
+```
+
 ## Raspberry Pi OLED SSH display
 
 This script will output the Raspberry Pi IP address on bootup via an I2C OLED (dimensions: 128x32 pixels). Our Raspberry Pi is installed in a waterproof acrylic case, so the OLED display allows us to SSH into the Raspberry Pi to download data easily.
