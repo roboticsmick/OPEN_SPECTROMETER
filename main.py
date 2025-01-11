@@ -63,19 +63,28 @@ class SpectrometerSystem:
         self._setup_camera()
 
     def _setup_camera(self):
-        """Initialize the camera with configured settings."""
+        """Initialize the camera with full-resolution and preview streams."""
         try:
             self.camera = Picamera2()
-            config = self.camera.create_preview_configuration(
-                main={"size": (240, 240)},
-                transform=libcamera.Transform(hflip=1, vflip=1)  # Flip image if needed
+            
+            # Create a still configuration
+            still_config = self.camera.create_still_configuration(
+                main={"size": (1456, 1088)},  # Full resolution for saving
+                transform=libcamera.Transform(hflip=1, vflip=1)  # Adjust for orientation
             )
-            self.camera.configure(config)
+            
+            # Configure the camera with this multi-stream configuration
+            self.camera.configure(still_config)
+            
+            # Optional: Apply timestamp overlay to the lores stream
             self.camera.pre_callback = self._apply_timestamp
+            
             self.logger.info("Camera setup completed successfully")
         except Exception as e:
             self.logger.error(f"Camera setup failed: {str(e)}")
             self.camera = None
+
+
 
     def _apply_timestamp(self, request):
         """Apply timestamp overlay to camera preview."""
@@ -233,24 +242,45 @@ class SpectrometerSystem:
     def handle_state_3(self):
         """Handle CAMERA state operations."""
         try:
-            # Show live preview if no image is captured
+            # If no captured image is being displayed, show the live preview
             if self.current_image is None:
-                frame = self.camera.capture_array()
-                image = Image.fromarray(frame)
-                self.disp.ShowImage(image)
+                # Capture frame from main (full resolution) stream
+                frame = self.camera.capture_array("main")
+                # Resize to display dimensions while preserving color
+                frame_resized = cv2.resize(frame, (240, 240), interpolation=cv2.INTER_AREA)
+                # Convert to PIL Image for display
+                preview_image = Image.fromarray(cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB))
+                self.disp.ShowImage(preview_image)
 
-            if self.disp.digital_read(self.KEY1_PIN) == 1:  # Capture photo
-                self.logger.info("Capturing photo...")
-                self.current_image = self.camera.capture_array()
-                image = Image.fromarray(self.current_image)
-                self.disp.ShowImage(image)
-                self.logger.info("Photo captured and displayed")
-                while self.disp.digital_read(self.KEY1_PIN) == 1:
-                    time.sleep(0.1)
+                # Button 1: Capture photo and display it
+                if self.disp.digital_read(self.KEY1_PIN) == 1:
+                    self.logger.info("Capturing photo for preview...")
+                    # Capture full resolution image
+                    captured_frame = self.camera.capture_array("main")
+                    # Store the full resolution image for later saving
+                    self.current_image = captured_frame
+                    # Create preview version
+                    preview_frame = cv2.resize(captured_frame, (240, 240), interpolation=cv2.INTER_AREA)
+                    preview_image = Image.fromarray(cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB))
+                    self.disp.ShowImage(preview_image)
+                    
+                    while self.disp.digital_read(self.KEY1_PIN) == 1:
+                        time.sleep(0.1)
 
-            elif self.disp.digital_read(self.KEY2_PIN) == 1:  # Save and return
-                if self.current_image is not None:
-                    self.save_data(*self.spectrum_data, self.current_image)
+            else:
+                # A photo has been taken and is being displayed
+                # Button 2: Save the captured photo and return to State 1
+                if self.disp.digital_read(self.KEY2_PIN) == 1:
+                    self.logger.info("Saving captured photo...")
+                    if self.current_filename is None:
+                        self.current_filename = f"spectrum_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+                    
+                    # Save the full resolution image
+                    full_image_filename = f"{self.current_filename}_photo.jpg"
+                    cv2.imwrite(full_image_filename, self.current_image)
+                    self.logger.info(f"Full resolution photo saved: {full_image_filename}")
+                    
+                    # Clean up and return to State 1
                     self.camera.stop()
                     self.current_state = self.STATE_1
                     self.spectrum_data = None
@@ -258,19 +288,24 @@ class SpectrometerSystem:
                     self.current_filename = None
                     self.disp.clear()
                     self.disp.bl_DutyCycle(0)
-                while self.disp.digital_read(self.KEY2_PIN) == 1:
-                    time.sleep(0.1)
+                    
+                    while self.disp.digital_read(self.KEY2_PIN) == 1:
+                        time.sleep(0.1)
 
-            elif self.disp.digital_read(self.KEY3_PIN) == 1:  # Restart camera
-                self.current_image = None
-                while self.disp.digital_read(self.KEY3_PIN) == 1:
-                    time.sleep(0.1)
+                # Button 3: Discard the captured photo and return to live preview
+                elif self.disp.digital_read(self.KEY3_PIN) == 1:
+                    self.logger.info("Discarding photo and returning to preview...")
+                    self.current_image = None  # Discard the stored image
+                    
+                    while self.disp.digital_read(self.KEY3_PIN) == 1:
+                        time.sleep(0.1)
 
         except Exception as e:
             self.logger.error(f"Error in camera handling: {str(e)}")
             # Reset state on error
             self.current_image = None
             self.current_state = self.STATE_1
+
 
     def run(self):
         """Main program loop."""
