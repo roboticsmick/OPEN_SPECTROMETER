@@ -107,13 +107,13 @@ sudo systemctl status spectrometer.service
 To stop it at boot
 
 ```sh
+sudo systemctl disable spectrometer.service
 ```
 
 If it is currently running you can stop it
 
 ```sh
 sudo systemctl stop spectrometer.service
-sudo systemctl disable spectrometer.service
 ```
 
 To make changes to the service file:
