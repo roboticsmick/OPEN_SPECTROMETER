@@ -114,7 +114,7 @@ class SpectrometerSystem:
         self.KEY3_PIN = self.disp.GPIO_KEY3_PIN
 
         # Spectrometer integration time (microseconds)
-        self.INTEGRATION_TIME_MICROS = 5000000  # 1 second
+        self.INTEGRATION_TIME_MICROS = 5000000  # 0.5 second
 
         # Font settings for on-screen text
         self.FONT_SIZE = 16
@@ -222,17 +222,34 @@ class SpectrometerSystem:
 
     def get_datetime_info(self):
         """
-        Get current date and time information.
+        Get current date, time, and time zone information dynamically.
 
         Returns
         -------
         tuple
-            (date_str, time_str, tz_str)
+            (date_str, time_str, tz_str_line1, tz_str_line2)
         """
+        # Current date and time
         date_str = time.strftime("%d %b %Y")
         time_str = time.strftime("%H:%M:%S")
-        tz_str = "Australia/Brisbane (AEST, +1000)"
-        return date_str, time_str, tz_str
+        
+        # Time zone details
+        tz_name = time.tzname[0]  # Local timezone name
+        tz_offset_hours = -time.timezone // 3600  # Offset in hours
+        tz_offset = f"{'+' if tz_offset_hours >= 0 else ''}{tz_offset_hours:02d}00"  # Format +hhmm
+
+        # Full time zone string
+        tz_str = f"{tz_name} (UTC{tz_offset})"
+
+        # Split into two lines if necessary
+        if len(tz_str) > 20:  # Assuming 20 characters fit on one line
+            tz_str_line1 = tz_str[:20]
+            tz_str_line2 = tz_str[20:]
+        else:
+            tz_str_line1 = tz_str
+            tz_str_line2 = ""
+
+        return date_str, time_str, tz_str_line1, tz_str_line2
 
     def capture_spectrum(self):
         """
@@ -350,7 +367,12 @@ class SpectrometerSystem:
         """
         # If KEY1 is pressed, transition to capturing spectra
         if self.disp.digital_read(self.KEY1_PIN) == 1:
-            self.show_message(["Starting Spectrometer"], duration=1)
+            self.show_message([
+                "Starting ST-VIS-25",
+                "Button 1: Capture",
+                "Button 2: Save",
+                "Button 3: Discard"
+            ], duration=3)
             self.current_state = self.STATE_2
             # Wait until button is released to avoid accidental repeated triggers
             while self.disp.digital_read(self.KEY1_PIN) == 1:
@@ -369,11 +391,12 @@ class SpectrometerSystem:
 
         # If KEY3 is pressed, show date/time info
         elif self.disp.digital_read(self.KEY3_PIN) == 1:
-            date_str, time_str, tz_str = self.get_datetime_info()
+            date_str, time_str, tz_str_line1, tz_str_line2 = self.get_datetime_info()
             self.show_message([
                 f"Date: {date_str}",
                 f"Time: {time_str}",
-                f"TZ: {tz_str}"
+                f"TZ: {tz_str_line1}",
+                tz_str_line2  # Empty string if no overflow
             ])
             while self.disp.digital_read(self.KEY3_PIN) == 1:
                 time.sleep(0.1)
@@ -514,7 +537,7 @@ class SpectrometerSystem:
             if self.current_image is None and self.camera is not None:
                 frame = self.camera.capture_array("main")
                 frame_resized = cv2.resize(frame, (240, 240), interpolation=cv2.INTER_AREA)
-                preview_image = Image.fromarray(cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB))
+                preview_image = Image.fromarray(frame_resized)
                 self.disp.ShowImage(preview_image)
 
                 # KEY1 pressed: Capture photo for preview
@@ -523,7 +546,7 @@ class SpectrometerSystem:
                     captured_frame = self.camera.capture_array("main")
                     self.current_image = captured_frame
                     preview_frame = cv2.resize(captured_frame, (240, 240), interpolation=cv2.INTER_AREA)
-                    preview_image = Image.fromarray(cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB))
+                    preview_image = Image.fromarray(frame_resized)
                     self.disp.ShowImage(preview_image)
 
                     while self.disp.digital_read(self.KEY1_PIN) == 1:
@@ -538,7 +561,8 @@ class SpectrometerSystem:
                         self.current_filename = f"spectrum_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
 
                     full_image_filename = f"{self.current_filename}_photo.jpg"
-                    cv2.imwrite(full_image_filename, self.current_image)
+                    image_to_save = cv2.cvtColor(self.current_image, cv2.COLOR_RGB2BGR)
+                    cv2.imwrite(full_image_filename, image_to_save)
                     self.logger.info(f"Full resolution photo saved: {full_image_filename}")
 
                     # Clean up and revert to IDLE
