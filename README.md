@@ -37,6 +37,47 @@ pip install seabreeze[pyseabreeze]
 seabreeze_os_setup
 ```
 
+## 2.4inch RPi Display For RPi
+
+Setting up the pi for the LCD
+
+```sh
+cd
+nano setup_pi.sh
+chmod +x setup_pi.sh
+./setup_pi.sh
+```
+
+```bash
+#!/bin/bash
+
+# Update and upgrade
+sudo apt-get update -y && sudo apt-get upgrade -y
+
+# Install packages with auto-confirm
+sudo apt-get install -y vim git cmake python3-RPi.GPIO python3-numpy python3-pil \
+  git-all build-essential libusb-dev p7zip-full python3-matplotlib \
+  libatlas-base-dev python3-pip python3-opencv feh
+
+# Add user to groups
+sudo usermod -aG video pi
+sudo usermod -aG i2c,gpio pi
+
+# Pyseabreeze setup
+cd ~ || exit
+mkdir -p pysb && cd pysb || exit
+python3 -m venv --system-site-packages venv
+source venv/bin/activate
+pip install seabreeze[pyseabreeze]
+seabreeze_os_setup
+
+# LCD screen setup
+git clone https://github.com/goodtft/LCD-show.git
+chmod -R 755 LCD-show
+cd LCD-show
+sudo ./LCD24-3A+-show
+```
+
 ## Wave share 1.3inch LCD and Raspberry Pi Global Shutter Camera version.
 
 This script manages a spectrometer and camera system with an LCD display and button inputs. 
