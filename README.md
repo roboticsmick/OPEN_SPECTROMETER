@@ -39,43 +39,84 @@ seabreeze_os_setup
 
 ## 2.4inch RPi Display For RPi
 
-Setting up the pi for the LCD
+Flash the pi with Raspberry Pi OS (32-bit)
+
+```sh
+sudo apt install rpi-imager
+```
+
+Setup parameters:
+1. Raspberry Pi Device: Raspberry Pi Zeroe 2 W
+2. Operating System: Raspberry Pi OS (32 Bit) (Note: I have found the 64 bit OS to be buggy with the Raspberry Pi Zero 2 W. If you change to a Raspberry Pi 4 I would go with the 64 bit OS.)
+3. Stoage - Use a Samsung 128GB PRO Plus microSD Card or high quality SD card. Get the best one you can afford from a reputable supplier. Don't be cheap here.
+4. Select $Edit Settings$
+  1. Set hostname: rpi
+  2.Tick Setusername and password
+  3. Set username: pi
+  4. Set password: spectro
+  5. Tick Configure wireless LAN
+  6. Enter known wifi name (I use my mobile hotspot name so I can access this easily in the field)
+  7. Enter wifi password I use my mobile hotspot password so I can access this easily in the field)
+  8. Set Wireless LAN country: AU
+  9. Tick Set locale settings
+  10. Timezone: Australia/Brisbane
+  11. Keyboard Layout: US
+  12. Select Services Tab
+  13. Tick Enable SSH - Use password authentication
+  14. Click Save
+  15. Click Yes to apply OS customisation settings when you write the image to the storage device.
+
+This will flash the OS to the SD card.
+
+Enable your mobile phone hotspot so it can connect to the wifi.
+Insert the SD card into the Raspberry Pi. 
+Boot up the Raspberry Pi. 
+Check you mobile phone hotspot. 
+When a connection is detected, you Raspberry Pi will have internet access. Check you mobile phone hotspot connections. The Raspberry Pi should show. Click on this and you should be able to see the IP address.
+Connect you laptops wifi to your mobile phone hotspot. 
+From a terminal on you PC SSH into the Raspberry Pi.
+
+```sh
+ssh -X pi@192.XXX.X.X
+```
+Enter password: spectro
+
+### Setting up the Raspberry Pi software for the LCD
+
 
 ```sh
 cd
 nano setup_pi.sh
-chmod +x setup_pi.sh
-./setup_pi.sh
 ```
 
 ```bash
 #!/bin/bash
-
 # Update and upgrade
 sudo apt-get update -y && sudo apt-get upgrade -y
-
 # Install packages with auto-confirm
 sudo apt-get install -y vim git cmake python3-RPi.GPIO python3-numpy python3-pil \
   git-all build-essential libusb-dev p7zip-full python3-matplotlib \
   libatlas-base-dev python3-pip python3-opencv feh
-
+# Ttkbootstrap setup
+pip3 install ttkbootstrap
 # Add user to groups
 sudo usermod -aG video pi
 sudo usermod -aG i2c,gpio pi
-
-# Pyseabreeze setup
-cd ~ || exit
-mkdir -p pysb && cd pysb || exit
-python3 -m venv --system-site-packages venv
-source venv/bin/activate
-pip install seabreeze[pyseabreeze]
+# PySeabreeze setup - without venv
+pip3 install seabreeze[pyseabreeze]
 seabreeze_os_setup
-
 # LCD screen setup
+sudo touch /etc/rc.local
+sudo chmod +x /etc/rc.local
 git clone https://github.com/goodtft/LCD-show.git
 chmod -R 755 LCD-show
 cd LCD-show
 sudo ./LCD24-3A+-show
+```
+
+```sh
+chmod +x setup_pi.sh
+./setup_pi.sh
 ```
 
 ## Wave share 1.3inch LCD and Raspberry Pi Global Shutter Camera version.
