@@ -91,27 +91,34 @@ nano setup_pi.sh
 
 ```bash
 #!/bin/bash
+
 # Update and upgrade
 sudo apt-get update -y && sudo apt-get upgrade -y
+
 # Install packages with auto-confirm
 sudo apt-get install -y vim git cmake python3-RPi.GPIO python3-numpy python3-pil \
   git-all build-essential libusb-dev p7zip-full python3-matplotlib \
   libatlas-base-dev python3-pip python3-opencv feh
-# Ttkbootstrap setup
-pip3 install ttkbootstrap
+
 # Add user to groups
 sudo usermod -aG video pi
 sudo usermod -aG i2c,gpio pi
-# PySeabreeze setup - without venv
-pip3 install seabreeze[pyseabreeze]
-seabreeze_os_setup
-# LCD screen setup
-sudo touch /etc/rc.local
-sudo chmod +x /etc/rc.local
-git clone https://github.com/goodtft/LCD-show.git
-chmod -R 755 LCD-show
-cd LCD-show
-sudo ./LCD24-3A+-show
+
+# Enable SPI
+sudo raspi-config nonint do_spi 0
+
+# Pyseabreeze setup
+cd ~ || exit
+mkdir -p pysb/assets && cd pysb || exit
+python3 -m venv --system-site-packages venv
+source venv/bin/activate
+pip install seabreeze[pyseabreeze]
+
+# Install Display HAT Mini (latest version from GitHub)
+git clone https://github.com/pimoroni/displayhatmini-python
+cd displayhatmini-python || exit
+sudo ./install.sh
+
 ```
 
 ```sh
