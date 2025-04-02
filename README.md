@@ -113,11 +113,11 @@ mkdir -p pysb/assets && cd pysb || exit
 python3 -m venv --system-site-packages venv
 source venv/bin/activate
 pip install seabreeze[pyseabreeze]
+seabreeze_os_setup
+
 
 # Install Display HAT Mini (latest version from GitHub)
-git clone https://github.com/pimoroni/displayhatmini-python
-cd displayhatmini-python || exit
-sudo ./install.sh
+pip3 install displayhatmini
 
 ```
 
