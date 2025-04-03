@@ -47,7 +47,7 @@ sudo apt install rpi-imager
 
 Setup parameters:
 1. Raspberry Pi Device: Raspberry Pi Zeroe 2 W
-2. Operating System: Raspberry Pi OS (32 Bit) (Note: I have found the 64 bit OS to be buggy with the Raspberry Pi Zero 2 W. If you change to a Raspberry Pi 4 I would go with the 64 bit OS.)
+2. Operating System: Ubuntu 22.04 Server LTS. If you change to a Raspberry Pi 4 I would go with the 64 bit OS.)
 3. Stoage - Use a Samsung 128GB PRO Plus microSD Card or high quality SD card. Get the best one you can afford from a reputable supplier. Don't be cheap here.
 4. Select $Edit Settings$
   1. Set hostname: rpi
@@ -77,7 +77,9 @@ Connect you laptops wifi to your mobile phone hotspot.
 From a terminal on you PC SSH into the Raspberry Pi.
 
 ```sh
-ssh -X pi@192.XXX.X.X
+ping rpi.local
+# Copy IP address from ping below into <IP>
+ssh -X pi@<IP>
 ```
 Enter password: spectro
 
