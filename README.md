@@ -91,36 +91,84 @@ cd
 nano setup_pi.sh
 ```
 
+Copy the code into the text file editor.
+
 ```bash
 #!/bin/bash
+# Exit on error
+set -e
 
-# Update and upgrade
-sudo apt-get update -y && sudo apt-get upgrade -y
+echo "Starting Raspberry Pi Zero 2 W setup script..."
 
-# Install packages with auto-confirm
-sudo apt-get install -y vim git cmake python3-RPi.GPIO python3-numpy python3-pil \
-  git-all build-essential libusb-dev p7zip-full python3-matplotlib \
-  libatlas-base-dev python3-pip python3-opencv feh
+# Increase swap size to help with memory issues
+echo "Configuring additional swap space..."
+sudo fallocate -l 1G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+# Make swap permanent
+if ! grep -q "/swapfile" /etc/fstab; then
+    echo "/swapfile swap swap defaults 0 0" | sudo tee -a /etc/fstab
+fi
 
-# Add user to groups
-sudo usermod -aG video pi
-sudo usermod -aG i2c,gpio pi
+# Update package lists
+echo "Updating package lists..."
+sudo apt-get update -y
 
-# Enable SPI
-sudo raspi-config nonint do_spi 0
+# Install dependencies one by one to manage memory usage
+echo "Installing essential packages..."
+sudo apt-get install -y pkg-config
+sudo apt-get install -y libusb-1.0-0-dev
+sudo apt-get install -y python3-pip
+sudo apt-get install -y python3-dev
+sudo apt-get install -y git
+sudo apt-get install -y vim
+sudo apt-get install -y build-essential
+sudo apt-get install -y feh
 
-# Pyseabreeze setup
-cd ~ || exit
-mkdir -p pysb/assets && cd pysb || exit
-python3 -m venv --system-site-packages venv
-source venv/bin/activate
-pip install seabreeze[pyseabreeze]
-seabreeze_os_setup
+# Add user to required groups
+echo "Setting up user permissions..."
+sudo usermod -aG video,i2c,gpio,spi pi
 
+# Enable SPI on Ubuntu
+echo "Enabling SPI interface..."
+if ! grep -q "dtparam=spi=on" /boot/firmware/config.txt; then
+    echo "dtparam=spi=on" | sudo tee -a /boot/firmware/config.txt
+fi
 
-# Install Display HAT Mini (latest version from GitHub)
-pip3 install displayhatmini
+# Configure inputrc for better terminal experience
+echo "Setting up terminal history search with arrow keys..."
+cat > ~/.inputrc << 'EOL'
+# Respect default shortcuts.
+$include /etc/inputrc
 
+## arrow up
+"\e[A":history-search-backward
+## arrow down
+"\e[B":history-search-forward
+EOL
+
+# Update pip and setuptools system-wide
+echo "Updating pip and setuptools..."
+sudo pip3 install --upgrade pip setuptools wheel
+
+# Install seabreeze using system-wide pip
+echo "Installing seabreeze (this may take a while)..."
+sudo pip3 install seabreeze[pyseabreeze]
+
+# Run the seabreeze setup script to create udev rules
+echo "Setting up seabreeze udev rules..."
+sudo seabreeze_os_setup
+
+# Install Display HAT Mini and pygame
+echo "Installing Display HAT Mini and pygame..."
+sudo pip3 install displayhatmini pygame spidev RPi.GPIO
+
+echo ""
+echo "====================================="
+echo "Setup complete! A reboot is required."
+echo "Please run: sudo reboot"
+echo "====================================="
 ```
 
 ```sh
