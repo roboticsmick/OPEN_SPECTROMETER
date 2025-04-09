@@ -80,14 +80,27 @@ set -e
 
 echo "Starting Raspberry Pi Zero 2 W setup script..."
 
-# Check and correct date/time
-echo "Checking system date and time..."
-current_year=$(date +"%Y")
-if [ "$current_year" -lt "2024" ]; then
-    echo "======================================"
-    echo "ERROR: System date appears to be wrong"
-    echo "Current system date is: $(date)"
-    echo "======================================"
+# Check for running unattended-upgrades and wait if active
+check_apt_locks() {
+    if pgrep -f "unattended-upgr" > /dev/null; then
+        echo "Unattended upgrades are running. Waiting for them to complete..."
+        while pgrep -f "unattended-upgr" > /dev/null; do
+            echo -n "."
+            sleep 5
+        done
+        echo "Unattended upgrades completed."
+        sleep 2  # Give a moment for locks to release
+    fi
+}
+
+# Always check date with user
+echo "======================================"
+echo "IMPORTANT: Please verify the system date and time"
+echo "Current system date and time is: $(date)"
+echo "Is this correct? (y/n)"
+read -p "Enter choice [y/n]: " date_correct
+
+if [ "$date_correct" != "y" ] && [ "$date_correct" != "Y" ]; then
     echo "Would you like to:"
     echo "1) Set date/time automatically via NTP (requires internet)"
     echo "2) Set date/time manually"
@@ -97,17 +110,38 @@ if [ "$current_year" -lt "2024" ]; then
     case $dt_choice in
         1)
             echo "Attempting to sync time via NTP..."
+            echo "First ensuring NTP service is enabled..."
+            sudo systemctl enable systemd-timesyncd
             sudo timedatectl set-ntp true
-            # Give NTP a moment to sync
-            sleep 5
+            
+            # Try to restart timesyncd service
+            echo "Restarting time synchronization service..."
             sudo systemctl restart systemd-timesyncd
-            sleep 2
+            
+            # Wait up to 20 seconds for sync
+            echo "Waiting for time synchronization (this may take a moment)..."
+            for i in {1..20}; do
+                sleep 1
+                echo -n "."
+                if timedatectl status | grep -q "System clock synchronized: yes"; then
+                    echo " Synchronized!"
+                    break
+                fi
+            done
+            
             echo "Current system date is now: $(date)"
-            current_year=$(date +"%Y")
-            if [ "$current_year" -lt "2024" ]; then
-                echo "NTP sync failed or not connected to internet."
-                echo "Please ensure internet connectivity or set time manually."
-                exit 1
+            echo "Is this date correct now? (y/n)"
+            read -p "Enter choice [y/n]: " date_correct_now
+            
+            if [ "$date_correct_now" != "y" ] && [ "$date_correct_now" != "Y" ]; then
+                echo "NTP sync failed. Switching to manual time setting."
+                echo "Please enter the current date in the format YYYY-MM-DD:"
+                read -p "Date (YYYY-MM-DD): " manual_date
+                echo "Please enter the current time in the format HH:MM:SS (24-hour):"
+                read -p "Time (HH:MM:SS): " manual_time
+                sudo timedatectl set-ntp false
+                sudo timedatectl set-time "${manual_date} ${manual_time}"
+                echo "Date and time set to: $(date)"
             fi
             ;;
         2)
@@ -146,7 +180,7 @@ if [ ! -f /swapfile ] || [ "$(stat -c %s /swapfile)" -lt "1000000000" ]; then
     echo "Configuring additional swap space..."
     # Remove existing swap if too small
     if [ -f /swapfile ]; then
-        sudo swapoff /swapfile
+        sudo swapoff /swapfile || true
         sudo rm /swapfile
     fi
     sudo fallocate -l 1G /swapfile
@@ -189,17 +223,26 @@ fi
 
 # Update package lists
 echo "Updating package lists..."
+check_apt_locks
 sudo apt-get update -y
 
 # Install dependencies one by one to manage memory usage
 echo "Installing essential packages..."
+check_apt_locks
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y pkg-config
+check_apt_locks
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libusb-1.0-0-dev
+check_apt_locks
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip
+check_apt_locks
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-dev
+check_apt_locks
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git
+check_apt_locks
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y vim
+check_apt_locks
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential
+check_apt_locks
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y feh
 
 # Add user to required groups if not already added
