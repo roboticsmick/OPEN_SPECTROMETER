@@ -4,28 +4,7 @@ This library allows you to use the Ocean Optics ST-VIS range of spectrometers us
 
 Lots of love to the the people working on keeping the PySeabreeze API alive. This let me get the Ocena Optic Spectrometer working on an ARM device. 
 
-## Setup Pi
-
-```sh
-sudo apt-get update
-sudo apt-get upgrade
-sudo apt install vim
-sudo apt-get install git cmake
-sudo apt install python3-RPi.GPIO
-sudo apt-get install python3-numpy
-sudo apt-get install python3-pil
-sudo apt-get install git-all build-essential libusb-dev
-sudo apt-get install p7zip-full -y
-sudo apt-get install python3-matplotlib
-sudo apt install libatlas-base-dev
-sudo apt-get install python3-pip
-sudo apt-get install python3-opencv
-sudo apt install feh
-sudo usermod -aG video pi
-sudo usermod -aG i2c,gpio pi
-```
-
-Install Pyseabreeze.
+## Installing Pyseabreeze on PC
 
 ```sh
 cd
@@ -47,22 +26,22 @@ sudo apt install rpi-imager
 
 Setup parameters:
 1. Raspberry Pi Device: Raspberry Pi Zeroe 2 W
-2. Operating System: Ubuntu 22.04 Server LTS. If you change to a Raspberry Pi 4 I would go with the 64 bit OS.)
+2. Operating System: Ubuntu 22.04 Server LTS (https://ubuntu.com/tutorials/how-to-install-ubuntu-on-your-raspberry-pi#1-overview)
 3. Stoage - Use a Samsung 128GB PRO Plus microSD Card or high quality SD card. Get the best one you can afford from a reputable supplier. Don't be cheap here.
 4. Select $Edit Settings$
-  1. Set hostname: rpi
-  2.Tick Setusername and password
-  3. Set username: pi
-  4. Set password: spectro
-  5. Tick Configure wireless LAN
+  1. Set hostname: $rpi$
+  2.Tick $Set username and password$
+  3. Set username: $pi$
+  4. Set password: $spectro$
+  5. Tick $Configure wireless LAN$
   6. Enter known wifi name (I use my mobile hotspot name so I can access this easily in the field)
   7. Enter wifi password I use my mobile hotspot password so I can access this easily in the field)
-  8. Set Wireless LAN country: AU
-  9. Tick Set locale settings
-  10. Timezone: Australia/Brisbane
-  11. Keyboard Layout: US
+  8. Set Wireless LAN country: $AU$
+  9. Tick $Set locale settings$
+  10. Timezone: $Australia/Brisbane$
+  11. Keyboard Layout: $US$
   12. Select Services Tab
-  13. Tick Enable SSH - Use password authentication
+  13. Tick $Enable SSH - Use password authentication$
   14. Click Save
   15. Click Yes to apply OS customisation settings when you write the image to the storage device.
 
@@ -70,7 +49,8 @@ This will flash the OS to the SD card.
 
 Enable your mobile phone hotspot so it can connect to the wifi.
 Insert the SD card into the Raspberry Pi. 
-Boot up the Raspberry Pi. 
+Boot up the Raspberry Pi.
+*Note: When first booting *
 Check you mobile phone hotspot. 
 When a connection is detected, you Raspberry Pi will have internet access. Check you mobile phone hotspot connections. The Raspberry Pi should show. Click on this and you should be able to see the IP address.
 Connect you laptops wifi to your mobile phone hotspot. 
@@ -100,45 +80,101 @@ set -e
 
 echo "Starting Raspberry Pi Zero 2 W setup script..."
 
-# Increase swap size to help with memory issues
-echo "Configuring additional swap space..."
-sudo fallocate -l 1G /swapfile
-sudo chmod 600 /swapfile
-sudo mkswap /swapfile
-sudo swapon /swapfile
-# Make swap permanent
-if ! grep -q "/swapfile" /etc/fstab; then
-    echo "/swapfile swap swap defaults 0 0" | sudo tee -a /etc/fstab
+# Check and correct date/time
+echo "Checking system date and time..."
+current_year=$(date +"%Y")
+if [ "$current_year" -lt "2024" ]; then
+    echo "======================================"
+    echo "ERROR: System date appears to be wrong"
+    echo "Current system date is: $(date)"
+    echo "======================================"
+    echo "Would you like to:"
+    echo "1) Set date/time automatically via NTP (requires internet)"
+    echo "2) Set date/time manually"
+    echo "3) Exit script to fix date/time yourself"
+    read -p "Enter choice [1-3]: " dt_choice
+    
+    case $dt_choice in
+        1)
+            echo "Attempting to sync time via NTP..."
+            sudo timedatectl set-ntp true
+            # Give NTP a moment to sync
+            sleep 5
+            sudo systemctl restart systemd-timesyncd
+            sleep 2
+            echo "Current system date is now: $(date)"
+            current_year=$(date +"%Y")
+            if [ "$current_year" -lt "2024" ]; then
+                echo "NTP sync failed or not connected to internet."
+                echo "Please ensure internet connectivity or set time manually."
+                exit 1
+            fi
+            ;;
+        2)
+            echo "Please enter the current date in the format YYYY-MM-DD:"
+            read -p "Date (YYYY-MM-DD): " manual_date
+            echo "Please enter the current time in the format HH:MM:SS (24-hour):"
+            read -p "Time (HH:MM:SS): " manual_time
+            sudo timedatectl set-ntp false
+            sudo timedatectl set-time "${manual_date} ${manual_time}"
+            echo "Date and time set to: $(date)"
+            ;;
+        3)
+            echo "Exiting script. Please fix the date/time and run the script again."
+            echo "You can set the date/time with: sudo timedatectl set-time \"YYYY-MM-DD HH:MM:SS\""
+            exit 1
+            ;;
+        *)
+            echo "Invalid choice. Exiting."
+            exit 1
+            ;;
+    esac
 fi
 
-# Update package lists
-echo "Updating package lists..."
-sudo apt-get update -y
+# Configure needrestart to automatic mode (no prompts) if not already done
+echo "Checking needrestart configuration..."
+if grep -q "#\$nrconf{restart} = 'i';" /etc/needrestart/needrestart.conf && ! grep -q "\$nrconf{restart} = 'a';" /etc/needrestart/needrestart.conf; then
+    echo "Configuring needrestart to automatic mode..."
+    sudo sed -i 's/#$nrconf{restart} = '"'"'i'"'"';/$nrconf{restart} = '"'"'a'"'"';/g' /etc/needrestart/needrestart.conf
+else
+    echo "Needrestart already configured for automatic mode."
+fi
 
-# Install dependencies one by one to manage memory usage
-echo "Installing essential packages..."
-sudo apt-get install -y pkg-config
-sudo apt-get install -y libusb-1.0-0-dev
-sudo apt-get install -y python3-pip
-sudo apt-get install -y python3-dev
-sudo apt-get install -y git
-sudo apt-get install -y vim
-sudo apt-get install -y build-essential
-sudo apt-get install -y feh
+# Increase swap size to help with memory issues if not already done
+echo "Checking swap configuration..."
+if [ ! -f /swapfile ] || [ "$(stat -c %s /swapfile)" -lt "1000000000" ]; then
+    echo "Configuring additional swap space..."
+    # Remove existing swap if too small
+    if [ -f /swapfile ]; then
+        sudo swapoff /swapfile
+        sudo rm /swapfile
+    fi
+    sudo fallocate -l 1G /swapfile
+    sudo chmod 600 /swapfile
+    sudo mkswap /swapfile
+    sudo swapon /swapfile
+    # Make swap permanent if not already in fstab
+    if ! grep -q "/swapfile swap swap defaults 0 0" /etc/fstab; then
+        echo "/swapfile swap swap defaults 0 0" | sudo tee -a /etc/fstab
+    fi
+else
+    echo "Swap already configured."
+fi
 
-# Add user to required groups
-echo "Setting up user permissions..."
-sudo usermod -aG video,i2c,gpio,spi pi
-
-# Enable SPI on Ubuntu
-echo "Enabling SPI interface..."
+# Enable SPI on Ubuntu if not already enabled
+echo "Checking SPI interface configuration..."
 if ! grep -q "dtparam=spi=on" /boot/firmware/config.txt; then
+    echo "Enabling SPI interface..."
     echo "dtparam=spi=on" | sudo tee -a /boot/firmware/config.txt
+else
+    echo "SPI interface already enabled."
 fi
 
-# Configure inputrc for better terminal experience
-echo "Setting up terminal history search with arrow keys..."
-cat > ~/.inputrc << 'EOL'
+# Configure inputrc for better terminal experience if not already done
+echo "Checking terminal history configuration..."
+if [ ! -f ~/.inputrc ] || ! grep -q "history-search-backward" ~/.inputrc; then
+    echo "Setting up terminal history search with arrow keys..."
+    cat > ~/.inputrc << 'EOL'
 # Respect default shortcuts.
 $include /etc/inputrc
 
@@ -147,22 +183,54 @@ $include /etc/inputrc
 ## arrow down
 "\e[B":history-search-forward
 EOL
+else
+    echo "Terminal history search already configured."
+fi
+
+# Update package lists
+echo "Updating package lists..."
+sudo apt-get update -y
+
+# Install dependencies one by one to manage memory usage
+echo "Installing essential packages..."
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y pkg-config
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libusb-1.0-0-dev
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-dev
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y vim
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y feh
+
+# Add user to required groups if not already added
+echo "Setting up user permissions..."
+for group in video i2c gpio spi; do
+    if ! groups pi | grep -q "\b$group\b"; then
+        sudo usermod -aG $group pi
+        echo "Added user to $group group."
+    else
+        echo "User already in $group group."
+    fi
+done
 
 # Update pip and setuptools system-wide
 echo "Updating pip and setuptools..."
 sudo pip3 install --upgrade pip setuptools wheel
 
-# Install seabreeze using system-wide pip
-echo "Installing seabreeze (this may take a while)..."
+# Install Python packages
+echo "Installing Python packages..."
+sudo pip3 install matplotlib
 sudo pip3 install seabreeze[pyseabreeze]
-
-# Run the seabreeze setup script to create udev rules
-echo "Setting up seabreeze udev rules..."
-sudo seabreeze_os_setup
-
-# Install Display HAT Mini and pygame
-echo "Installing Display HAT Mini and pygame..."
 sudo pip3 install displayhatmini pygame spidev RPi.GPIO
+
+# Check if udev rules for seabreeze already exist
+echo "Checking seabreeze udev rules..."
+if [ ! -f /etc/udev/rules.d/10-oceanoptics.rules ] || ! grep -q "Ocean Optics" /etc/udev/rules.d/10-oceanoptics.rules; then
+    echo "Setting up seabreeze udev rules..."
+    sudo seabreeze_os_setup
+else
+    echo "Seabreeze udev rules already configured."
+fi
 
 echo ""
 echo "====================================="
