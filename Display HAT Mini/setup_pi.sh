@@ -248,8 +248,8 @@ update_system() {
 install_system_packages() {
     echo "======================================"
     echo "Installing System Packages"
-    local packages=( git build-essential pkg-config libusb-1.0-0-dev libudev-dev
-                     python3-pip python3-dev python3-venv vim feh )
+    local packages=( git git-all build-essential pkg-config libusb-1.0-0-dev libudev-dev
+                     python3-pip python3-dev python3-venv vim feh screen wireless-tools )
     echo "Installing: ${packages[@]}"
     wait_for_apt_lock
     if ! sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"; then
@@ -348,11 +348,12 @@ setup_python_venv() {
         echo "Virtual environment directory already exists."
     fi
 
-    # Define Python packages
+    # Define Python packages - Note: seabreeze is handled separately
     local python_packages=(
         "wheel" "setuptools --upgrade" "pip --upgrade"
-        "matplotlib" "pygame" "spidev" "RPi.GPIO"
-        "seabreeze[pyseabreeze]" "displayhatmini"
+        "matplotlib" "pygame" "pygame-menu" "spidev" "RPi.GPIO"
+        "displayhatmini"
+        "rpi-lgpio"
     )
 
     echo "Installing Python packages into virtual environment..."
@@ -361,12 +362,7 @@ setup_python_venv() {
     for package in "${python_packages[@]}"; do
         echo "Installing $package..."
         if ! sudo -u "$ACTUAL_USER" "$venv_python" -m pip install --no-cache-dir $package; then
-            if [[ "$package" == "seabreeze[pyseabreeze]" ]]; then
-                 warning "Failed to install $package. Check libusb-1.0-dev/libudev-dev installation and pkg-config."
-                 echo "Try manual install: source $VENV_PATH/bin/activate && pip install $package --verbose"
-            else
-                 warning "Failed to install Python package '$package'."
-            fi
+            warning "Failed to install Python package '$package'."
         fi
     done
 
@@ -383,6 +379,27 @@ setup_python_venv() {
          echo "Adding project activation hint to $bashrc_path..."
          { echo ""; echo "# Hint for activating the Python virtual environment for ${PROJECT_DIR_NAME}"; echo "$activation_hint"; } | sudo -u "$ACTUAL_USER" tee -a "$bashrc_path" > /dev/null
          sudo chown "$ACTUAL_USER:$ACTUAL_USER" "$bashrc_path"
+    fi
+}
+
+# Install seabreeze separately (last step of Python package installation)
+install_seabreeze() {
+    echo "======================================"
+    echo "Installing Seabreeze (Special Handling)"
+    local venv_python="$VENV_PATH/bin/python"
+    local venv_pip="$VENV_PATH/bin/pip"
+    
+    echo "Installing seabreeze[pyseabreeze] package (this may take a while)..."
+    echo "Note: This step can take several minutes, especially on Raspberry Pi Zero 2 W."
+    
+    if ! sudo -u "$ACTUAL_USER" "$venv_pip" install --no-cache-dir seabreeze[pyseabreeze]; then
+        warning "Failed to install seabreeze[pyseabreeze] package."
+        echo "You may need to install it manually after setup:"
+        echo "  1. cd $PROJECT_DIR_PATH"
+        echo "  2. source $VENV_DIR_NAME/bin/activate"
+        echo "  3. pip install seabreeze[pyseabreeze]"
+    else
+        echo "Seabreeze installation successful."
     fi
 }
 
@@ -410,6 +427,10 @@ setup_seabreeze_udev() {
     echo "Running seabreeze_os_setup to install udev rules..."
     if ! sudo "$seabreeze_setup_cmd"; then
         warning "Failed to execute seabreeze_os_setup."
+        echo "You may need to run it manually after setup:"
+        echo "  1. cd $PROJECT_DIR_PATH"
+        echo "  2. source $VENV_DIR_NAME/bin/activate" 
+        echo "  3. sudo seabreeze_os_setup"
     else
         echo "Seabreeze udev rules installed. Reloading udev rules..."
         sudo udevadm control --reload-rules && sudo udevadm trigger
@@ -428,7 +449,7 @@ verify_setup() {
     else echo "SPI device nodes (/dev/spidev*) not found (expected until reboot)." ; fi
 
     echo "Checking Python package imports within the virtual environment ($VENV_PATH)..."
-    local python_check_packages=("matplotlib" "pygame" "spidev" "RPi.GPIO" "seabreeze")
+    local python_check_packages=("matplotlib" "pygame" "pygame_menu" "spidev" "RPi.GPIO")
     local failed_imports=()
     local venv_python="$VENV_PATH/bin/python"
     if [ ! -x "$venv_python" ]; then
@@ -442,6 +463,15 @@ verify_setup() {
             echo "  - $package: FAILED to import" ; failed_imports+=("$package")
         fi
     done
+
+    # Special check for seabreeze (which may not be installed yet)
+    echo "Checking seabreeze (optional at this point):"
+    if sudo -u "$ACTUAL_USER" "$venv_python" -c "import seabreeze" >/dev/null 2>&1; then
+        echo "  - seabreeze: OK"
+    else
+        echo "  - seabreeze: NOT IMPORTED (may need manual installation)"
+        echo "    Follow the steps in the 'Next Steps' section below"
+    fi
 
     if [ ${#failed_imports[@]} -gt 0 ]; then
         warning "Some Python packages failed to import: ${failed_imports[*]}"
@@ -476,7 +506,9 @@ main() {
     configure_terminal
 
     setup_python_venv # Creates project dir and venv inside
-
+    
+    # Special handling for seabreeze
+    install_seabreeze
     setup_seabreeze_udev # Uses command from venv
 
     verify_setup # Checks venv imports
@@ -493,11 +525,17 @@ main() {
     echo "   cd $PROJECT_DIR_PATH"
     echo "   source $VENV_DIR_NAME/bin/activate"
     echo ""
-    echo "3. Test core imports again within the activated environment:"
-    echo "   python -c 'import matplotlib, pygame, spidev, RPi.GPIO, seabreeze; print(\"OK\")'"
+    echo "3. If seabreeze installation failed, install it manually after reboot:"
+    echo "   cd $PROJECT_DIR_PATH"
+    echo "   source $VENV_DIR_NAME/bin/activate"
+    echo "   pip install seabreeze[pyseabreeze]"
+    echo "   sudo seabreeze_os_setup"
     echo ""
-    echo "4. Place your Python scripts inside '$PROJECT_DIR_PATH'."
-    echo "5. Check seabreeze device detection (activate venv, plug in device):"
+    echo "4. Test core imports again within the activated environment:"
+    echo "   python -c 'import matplotlib, pygame, pygame_menu, spidev, RPi.GPIO; print(\"OK\")'"
+    echo ""
+    echo "5. Place your Python scripts inside '$PROJECT_DIR_PATH'."
+    echo "6. Check seabreeze device detection (activate venv, plug in device):"
     echo "   python -m seabreeze.cseabreeze_backend ListDevices"
     echo "====================================="
 }
