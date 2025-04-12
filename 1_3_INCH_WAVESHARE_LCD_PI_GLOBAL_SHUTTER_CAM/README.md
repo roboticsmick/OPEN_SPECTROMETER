@@ -1,4 +1,4 @@
-## Wave share 1.3inch LCD and Raspberry Pi Global Shutter Camera version.
+# Waveshare 1.3inch LCD and Raspberry Pi Global Shutter Camera Ocean Optics Spectrometer
 
 This script manages a spectrometer and camera system with an LCD display and button inputs. 
 
