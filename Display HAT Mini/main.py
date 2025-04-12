@@ -11,18 +11,6 @@ Features:
 - Configuration flags for optional hardware components.
 - Display of system status (time, network).
 - Placeholder for spectrometer operations.
-
-Adherence to Safety Principles (NASA Guideline Inspired):
-- Rule 1 (Simple Control Flow): Avoids goto, setjmp, recursion. Uses simple loops/conditionals.
-- Rule 2 (Loop Bounds): Main loop runs indefinitely until shutdown signal; internal loops are bounded. Network thread runs until shutdown.
-- Rule 3 (Dynamic Memory): Minimized after init. Fonts loaded once. Pygame/PIL allocations occur but are managed. String formatting used.
-- Rule 4 (Function Length): Functions broken down for clarity and length limits.
-- Rule 5 (Assertions): Assertions added to check preconditions, postconditions, and invariants. Aiming for >= 2 per function where meaningful.
-- Rule 6 (Scope): Data declared at the narrowest practical scope. Constants are global.
-- Rule 7 (Return/Parameter Checks): Assertions check parameters. Return values from critical libs handled via exceptions or checks where possible.
-- Rule 8 (Preprocessor): N/A (Python). Comments and docstrings used for clarity.
-- Rule 9 (Pointers): N/A (Python references). Callbacks used simply for GPIO/threading.
-- Rule 10 (Warnings): Assumes linter usage (e.g., pylint/flake8) during development.
 """
 
 import os
@@ -108,7 +96,7 @@ PIN_HALL_DOWN = 23   # Mirrors DH Y (Down) -> Check if 23 is okay
 PIN_HALL_ENTER = 20  # Mirrors DH A (Enter/Right) -> Check if 20 is okay
 PIN_HALL_BACK = 8    # Mirrors DH B (Back/Left) -> Check if 8 is okay
 
-# Leak Sensor Pin
+# --- Leak Sensor Pin ---
 PIN_LEAK = 21 # Changed from 26 in original code to match user request
 
 # Button Logical Names (used internally)
@@ -131,16 +119,18 @@ YELLOW = (255, 255, 0)
 GRAY = (128, 128, 128)
 
 # Menu Layout
-FONT_SIZE = 16
-TITLE_FONT_SIZE = 22
-MENU_SPACING = 30
-MENU_MARGIN_TOP = 50
-MENU_MARGIN_LEFT = 20
+FONT_SIZE = 18
+TITLE_FONT_SIZE = 20
+HINT_FONT_SIZE = 13
+MENU_SPACING = 26
+MENU_MARGIN_TOP = 40
+MENU_MARGIN_LEFT = 12
 
 # Timing
 DEBOUNCE_DELAY_S = 0.2  # Debounce time for buttons
 NETWORK_UPDATE_INTERVAL_S = 10.0 # How often to check network status
 MAIN_LOOP_DELAY_S = 0.03 # Target ~30 FPS
+SPLASH_DURATION_S = 6.0 #
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -151,7 +141,6 @@ logger = logging.getLogger(__name__)
 g_shutdown_flag = threading.Event() # Used to signal shutdown to threads and loops
 
 # --- Helper Functions ---
-
 def get_safe_datetime(year, month, day, hour=0, minute=0, second=0):
     """
     Attempts to create a datetime object, handling potential ValueErrors.
@@ -174,8 +163,35 @@ def get_safe_datetime(year, month, day, hour=0, minute=0, second=0):
         logger.warning(f"Invalid date/time combination attempted: {year}-{month}-{day} {hour}:{minute}:{second}. Error: {e}")
         return None
 
-# --- Classes ---
+def update_hardware_display(screen, display_hat_obj):
+    """
+    Updates the physical display (Pimoroni or standard Pygame window).
+    Args:
+        screen: The Pygame Surface to display.
+        display_hat_obj: The initialized DisplayHATMini object, or None.
+    """
+    if USE_DISPLAY_HAT and display_hat_obj: # Check flag AND object validity
+        try:
+            rotated_surface = pygame.transform.rotate(screen, 180)
+            pixelbytes = rotated_surface.convert(16, 0).get_buffer()
+            pixelbytes_swapped = bytearray(pixelbytes)
+            pixelbytes_swapped[0::2], pixelbytes_swapped[1::2] = pixelbytes_swapped[1::2], pixelbytes_swapped[0::2]
 
+            assert hasattr(display_hat_obj, 'st7789'), "Display HAT object missing st7789 interface"
+            display_hat_obj.st7789.set_window()
+            chunk_size = 4096
+            for i in range(0, len(pixelbytes_swapped), chunk_size):
+                display_hat_obj.st7789.data(pixelbytes_swapped[i:i + chunk_size])
+        except Exception as e:
+            logger.error(f"Error updating Display HAT Mini: {e}", exc_info=False)
+    else:
+        # Standard Pygame window update
+        try:
+             pygame.display.flip()
+        except Exception as e:
+             logger.error(f"Error updating Pygame display: {e}", exc_info=True)
+
+# --- Classes ---
 class ButtonHandler:
     """
     Handles GPIO button inputs (Display HAT via library callback + optional Hall sensors/Leak)
@@ -412,7 +428,6 @@ class ButtonHandler:
         else:
             logger.info("Manual GPIO cleanup skipped (not used or unavailable).")
 
-
 class NetworkInfo:
     """
     Handles retrieval of network information (WiFi SSID, IP Address).
@@ -566,22 +581,17 @@ class NetworkInfo:
 
         logger.info("Network update loop finished.")
 
-
 class MenuSystem:
     """
     Manages the main menu UI, state, and interactions.
-    Adheres to NASA Guideline 4: Functions broken down.
-    Adheres to NASA Guideline 5: Uses assertions.
-    Adheres to NASA Guideline 6: Scopes data appropriately.
-    Adheres to NASA Guideline 7: Checks parameters, handles returns.
     """
     # Define menu items and their corresponding actions or edit types
-    MENU_ITEM_CAPTURE = "Capture Spectra"
-    MENU_ITEM_INTEGRATION = "Integration Time"
-    MENU_ITEM_DATE = "Date"
-    MENU_ITEM_TIME = "Time"
-    MENU_ITEM_WIFI = "WiFi"
-    MENU_ITEM_IP = "IP Address"
+    MENU_ITEM_CAPTURE = "LOG SPECTRA"
+    MENU_ITEM_INTEGRATION = "INTEGRATION TIME"
+    MENU_ITEM_DATE = "DATE"
+    MENU_ITEM_TIME = "TIME"
+    MENU_ITEM_WIFI = "WIFI"
+    MENU_ITEM_IP = "IP"
 
     EDIT_TYPE_NONE = 0
     EDIT_TYPE_INTEGRATION = 1
@@ -598,6 +608,9 @@ class MenuSystem:
 
 
     def __init__(self, screen, button_handler, network_info):
+        """
+        Initializes the menu system with display, input, and network info sources.
+        """
         assert screen is not None, "Pygame screen object is required"
         assert button_handler is not None, "ButtonHandler object is required"
         assert network_info is not None, "NetworkInfo object is required"
@@ -605,20 +618,20 @@ class MenuSystem:
         self.screen = screen
         self.button_handler = button_handler
         self.network_info = network_info
-        self.display_hat = None
+        self.display_hat = None  # To be set externally if available
 
         # --- Application State ---
         self._integration_time_ms = DEFAULT_INTEGRATION_TIME_MS
-        # --- NEW: Application's internal time reference ---
+        # Store date/time being edited separately from system time initially
         # Initialized from system time at startup. Can be adjusted by user.
         self._app_datetime_ref = datetime.datetime.now()
-        # Store original state only to allow discarding edits within a session
-        self._original_datetime_on_edit_start = None
-        # Store time offset relative to system clock
-        self._time_offset = datetime.timedelta(0) # Initialise with zero offset
+        # Store date/time being edited separately
+        self._editable_datetime = datetime.datetime.now()
+        self._time_offset = datetime.timedelta(0) # Initialize with zero offset
+        self._original_datetime_on_edit_start = None # To revert on BACK
 
         # --- Menu Structure ---
-        self._menu_items = [
+        self._menu_items = [ # Ensure these are correct
             (self.MENU_ITEM_CAPTURE, self.EDIT_TYPE_NONE),
             (self.MENU_ITEM_INTEGRATION, self.EDIT_TYPE_INTEGRATION),
             (self.MENU_ITEM_DATE, self.EDIT_TYPE_DATE),
@@ -631,30 +644,92 @@ class MenuSystem:
         # --- Editing State ---
         self._is_editing = False
         self._editing_field = None
+        # Temporary absolute datetime being manipulated during edits
         self._datetime_being_edited = None
+        # Store offset before editing starts, for discard
         self._original_offset_on_edit_start = None
 
         # --- Font Initialization ---
+        self.font = None
+        self.title_font = None
+        self.hint_font = None 
+        
         try:
             pygame.font.init()
-            # Use a common font if possible, provide fallback
+            logger.info("Initializing fonts from assets folder...")
+
+            # --- Get the absolute path to the script's directory ---
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            # --- Construct the path to the assets directory ---
+            assets_dir = os.path.join(script_dir, 'assets')
+
+            # --- Define paths to the specific Roboto font files ---
+            # Choose the variants you want:
+            title_font_path = os.path.join(assets_dir, 'Roboto-Bold.ttf')
+            main_font_path = os.path.join(assets_dir, 'Roboto-Regular.ttf')
+            hint_font_path = os.path.join(assets_dir, 'Roboto-Regular.ttf') # Often okay to use Regular for hints too
+
+            # --- Load fonts using the constructed paths ---
             try:
-                 # Try a specific common font first
-                 self.font = pygame.font.Font("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", FONT_SIZE)
-                 self.title_font = pygame.font.Font("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", TITLE_FONT_SIZE)
-            except: # Broad except for font loading issues
-                 try: # Try default pygame font
-                      self.font = pygame.font.Font(pygame.font.get_default_font(), FONT_SIZE)
-                      self.title_font = pygame.font.Font(pygame.font.get_default_font(), TITLE_FONT_SIZE)
-                 except: # Fallback to SysFont
-                      self.font = pygame.font.SysFont(None, FONT_SIZE)
-                      self.title_font = pygame.font.SysFont(None, TITLE_FONT_SIZE)
-            logger.info("Fonts initialized.")
+                self.title_font = pygame.font.Font(title_font_path, TITLE_FONT_SIZE)
+                logger.info(f"Loaded title font: {title_font_path}")
+            except Exception as e:
+                logger.error(f"Failed to load title font '{title_font_path}': {e}. Using fallback.")
+                self.title_font = pygame.font.SysFont(None, TITLE_FONT_SIZE) # Fallback
+
+            try:
+                self.font = pygame.font.Font(main_font_path, FONT_SIZE)
+                logger.info(f"Loaded main font: {main_font_path}")
+            except Exception as e:
+                logger.error(f"Failed to load main font '{main_font_path}': {e}. Using fallback.")
+                self.font = pygame.font.SysFont(None, FONT_SIZE) # Fallback
+
+            try:
+                self.hint_font = pygame.font.Font(hint_font_path, HINT_FONT_SIZE)
+                logger.info(f"Loaded hint font: {hint_font_path}")
+            except Exception as e:
+                logger.error(f"Failed to load hint font '{hint_font_path}': {e}. Using fallback.")
+                self.hint_font = pygame.font.SysFont(None, HINT_FONT_SIZE) # Fallback
+
+            # Final check if fonts are usable
+            if not (self.font and self.title_font and self.hint_font):
+                 logger.error("One or more essential fonts failed to load, even with fallbacks.")
+                 # Decide if this is critical: raise RuntimeError("Essential fonts failed to load")
+
         except Exception as e:
-            logger.error(f"Failed to initialize Pygame fonts: {e}", exc_info=True)
+            logger.error(f"Critical error during Pygame font initialization: {e}", exc_info=True)
+            # Ensure fonts are None if init fails badly
             self.font = None
             self.title_font = None
-            # Consider raising RuntimeError here if fonts are essential
+            self.hint_font = None
+            # Optional: raise RuntimeError("Font initialization failed")
+        
+        self._value_start_offset_x = 0 # Initialize
+        if self.font: # Proceed only if font loaded
+            try:
+                max_label_width = 0
+                # Define the prefixes for items that will display a value next to them
+                # Use the actual text that will be rendered before the value
+                prefixes = {
+                    self.MENU_ITEM_INTEGRATION: "INTEGRATION: ", # Match text in _draw_menu_items
+                    self.MENU_ITEM_DATE: "DATE: ",
+                    self.MENU_ITEM_TIME: "TIME: ",
+                    self.MENU_ITEM_WIFI: "WIFI: ",
+                    self.MENU_ITEM_IP: "IP: "
+                }
+                for item_text, _ in self._menu_items:
+                     prefix = prefixes.get(item_text)
+                     if prefix: # Only consider items with a defined prefix
+                          label_width = self.font.size(prefix)[0]
+                          max_label_width = max(max_label_width, label_width)
+
+                # Add a small gap after the longest label
+                label_gap = 5
+                self._value_start_offset_x = max_label_width + label_gap
+                logger.info(f"Calculated value start offset X: {self._value_start_offset_x} (based on max label width {max_label_width})")
+            except Exception as e:
+                logger.error(f"Failed to calculate value start offset: {e}. Using default.")
+                self._value_start_offset_x = self.font.size("INTEGRATION: ")[0] + 5 # Fallback guess
 
     # --- Helper to get the time to display/use ---
     def _get_current_app_display_time(self):
@@ -694,8 +769,10 @@ class MenuSystem:
             self._datetime_being_edited = None # Clear temporary edit object
             self._original_offset_on_edit_start = None
             return None
-        elif action == "START_CAPTURE": return "CAPTURE"
-        elif action == "QUIT": return "QUIT"
+        elif action == "START_CAPTURE":
+            return "CAPTURE"
+        elif action == "QUIT":
+            return "QUIT"
         else: return None
 
     def draw(self):
@@ -704,49 +781,78 @@ class MenuSystem:
         self._draw_title()
         self._draw_menu_items() # Will use offset calculation
         self._draw_hints()
-        self._update_hardware_display()
+        update_hardware_display(self.screen, self.display_hat)
 
     def get_timestamp_datetime(self):
         """Returns a datetime object representing the current app time (System + Offset)."""
         # Useful for getting the time to embed in filenames etc.
         return self._get_current_app_display_time()
 
+
+    def cleanup(self):
+        """Performs any cleanup needed by the menu system."""
+        # Nothing specific to clean up in MenuSystem itself currently
+        logger.info("MenuSystem cleanup completed.")
+        pass
+
     # --- Private Input Handling Methods ---
 
     def _handle_navigation_input(self):
-        # ... (Remains unchanged) ...
-        assert not self._is_editing
-        if self.button_handler.check_button(BTN_UP): self._navigate_menu(-1)
-        elif self.button_handler.check_button(BTN_DOWN): self._navigate_menu(1)
-        elif self.button_handler.check_button(BTN_ENTER): return self._select_menu_item()
-        elif self.button_handler.check_button(BTN_BACK): logger.info("BACK pressed in main menu (no action).")
+        # --- This function remains unchanged ---
+        assert not self._is_editing, "Navigation input called while editing"
+        if self.button_handler.check_button(BTN_UP):
+            self._navigate_menu(-1)
+        elif self.button_handler.check_button(BTN_DOWN):
+            self._navigate_menu(1)
+        elif self.button_handler.check_button(BTN_ENTER):
+            return self._select_menu_item() # Select action might start editing
+        elif self.button_handler.check_button(BTN_BACK):
+            logger.info("BACK pressed in main menu (no action).")
+            pass
         return None
 
     def _handle_editing_input(self):
-        # ... (Remains unchanged - calls adjust or next_field) ...
-        assert self._is_editing
+        """ Handles UP/DOWN/ENTER/BACK when editing a value (NEW LOGIC). """
+        assert self._is_editing, "Editing input called while not editing"
+
         edit_type = self._menu_items[self._current_selection_idx][1]
         action = None
-        if self.button_handler.check_button(BTN_UP): action = self._handle_edit_adjust(edit_type, 1)
-        elif self.button_handler.check_button(BTN_DOWN): action = self._handle_edit_adjust(edit_type, -1)
-        elif self.button_handler.check_button(BTN_ENTER): action = self._handle_edit_next_field(edit_type)
-        elif self.button_handler.check_button(BTN_BACK): action = "EXIT_EDIT_DISCARD" # Discard offset changes
+
+        # UP/DOWN adjust the current field's value
+        if self.button_handler.check_button(BTN_UP):
+            action = self._handle_edit_adjust(edit_type, 1) # Increment/Increase
+        elif self.button_handler.check_button(BTN_DOWN):
+             action = self._handle_edit_adjust(edit_type, -1) # Decrement/Decrease
+
+        # ENTER cycles to the next field or confirms/exits
+        elif self.button_handler.check_button(BTN_ENTER):
+            action = self._handle_edit_next_field(edit_type) # Changed role
+
+        # BACK exits edit mode WITHOUT saving
+        elif self.button_handler.check_button(BTN_BACK):
+            action = "EXIT_EDIT_DISCARD" # New action for discarding
+
         return action
 
+    # --- Add this method back ---
     def _navigate_menu(self, direction):
-        # ... (Remains unchanged) ...
-        assert direction in [-1, 1]
+        """Updates the current menu selection index."""
+        assert direction in [-1, 1], "Invalid navigation direction"
         num_items = len(self._menu_items)
-        assert num_items > 0
+        # Assertion: Ensure num_items is positive before modulo
+        assert num_items > 0, "Menu has no items"
         self._current_selection_idx = (self._current_selection_idx + direction) % num_items
         logger.debug(f"Menu navigated. New selection index: {self._current_selection_idx}, Item: {self._menu_items[self._current_selection_idx][0]}")
-    
+    # --- End of added method ---
+
     def _select_menu_item(self):
-        # ... (Capture logic unchanged) ...
+        """ Handles the ENTER action in navigation mode (Starts editing). """
+        # ... (Check selection index assertion) ...
         item_text, edit_type = self._menu_items[self._current_selection_idx]
         logger.info(f"Menu item selected: {item_text}")
 
         if item_text == self.MENU_ITEM_CAPTURE:
+            # ... (Same capture logic) ...
             if USE_SPECTROMETER: return "START_CAPTURE"
             else: logger.warning("Capture Spectra selected, but USE_SPECTROMETER is False."); return None
 
@@ -769,7 +875,7 @@ class MenuSystem:
                 logger.info(f"Starting to edit Time. Initial edit value: {self._datetime_being_edited.strftime('%H:%M')}")
         # ... (Read-only items) ...
         return None
-
+    
     def _handle_edit_adjust(self, edit_type, delta):
         """ Adjusts integration time OR the temporary _datetime_being_edited. """
         assert self._is_editing, "Adjust called when not editing"
@@ -788,19 +894,72 @@ class MenuSystem:
              self._change_time_field(delta)
         return None
 
-    def _handle_edit_next_field(self, edit_type):
-        # ... (Logic remains the same, returns EXIT_EDIT_SAVE on finish) ...
-        assert self._is_editing
-        if edit_type == self.EDIT_TYPE_INTEGRATION: return "EXIT_EDIT_SAVE"
+    def _handle_edit_increment(self, edit_type):
+        """Handles incrementing the value for the current edit type."""
+        # Assertion: Check edit type validity
+        assert edit_type in [self.EDIT_TYPE_INTEGRATION, self.EDIT_TYPE_DATE, self.EDIT_TYPE_TIME], f"Invalid edit type for increment: {edit_type}"
+
+        if edit_type == self.EDIT_TYPE_INTEGRATION:
+            self._integration_time_ms = min(
+                self._integration_time_ms + INTEGRATION_TIME_STEP_MS,
+                MAX_INTEGRATION_TIME_MS
+            )
+            logger.debug(f"Integration time increased to {self._integration_time_ms} ms")
         elif edit_type == self.EDIT_TYPE_DATE:
-            if self._editing_field == self.FIELD_YEAR: self._editing_field = self.FIELD_MONTH; logger.debug("Editing next field: Month")
-            elif self._editing_field == self.FIELD_MONTH: self._editing_field = self.FIELD_DAY; logger.debug("Editing next field: Day")
-            elif self._editing_field == self.FIELD_DAY: logger.debug("Finished editing Date fields."); return "EXIT_EDIT_SAVE"
+            self._change_date_field(1)
         elif edit_type == self.EDIT_TYPE_TIME:
-            if self._editing_field == self.FIELD_HOUR: self._editing_field = self.FIELD_MINUTE; logger.debug("Editing next field: Minute")
-            elif self._editing_field == self.FIELD_MINUTE: logger.debug("Finished editing Time fields."); return "EXIT_EDIT_SAVE"
+            self._change_time_field(1)
+        return None # Stay in edit mode
+
+
+    def _handle_edit_next_field(self, edit_type):
+        # ... (Logic remains the same, but returns EXIT_EDIT_SAVE) ...
+        assert self._is_editing
+        if edit_type == self.EDIT_TYPE_INTEGRATION:
+            return "EXIT_EDIT_SAVE"
+        elif edit_type == self.EDIT_TYPE_DATE:
+            if self._editing_field == self.FIELD_YEAR:
+                self._editing_field = self.FIELD_MONTH;
+                logger.debug("Editing next field: Month")
+            elif self._editing_field == self.FIELD_MONTH:
+                self._editing_field = self.FIELD_DAY;
+                logger.debug("Editing next field: Day")
+            elif self._editing_field == self.FIELD_DAY:
+                logger.debug("Finished editing Date fields.");
+                return "EXIT_EDIT_SAVE"
+        elif edit_type == self.EDIT_TYPE_TIME:
+            if self._editing_field == self.FIELD_HOUR:
+                self._editing_field = self.FIELD_MINUTE;
+                logger.debug("Editing next field: Minute")
+            elif self._editing_field == self.FIELD_MINUTE:
+                logger.debug("Finished editing Time fields.");
+                return "EXIT_EDIT_SAVE"
         return None
 
+    def _handle_edit_previous_field(self, edit_type):
+        """Handles moving to the previous field (or exiting) when editing Date/Time."""
+         # Assertion: Check edit type validity
+        assert edit_type in [self.EDIT_TYPE_DATE, self.EDIT_TYPE_TIME], f"Invalid edit type for previous field: {edit_type}"
+
+        if edit_type == self.EDIT_TYPE_INTEGRATION:
+             # UP/DOWN exits edit mode for integration time
+             return "EXIT_EDIT"
+        elif edit_type == self.EDIT_TYPE_DATE:
+            if self._editing_field == self.FIELD_DAY:
+                self._editing_field = self.FIELD_MONTH
+            elif self._editing_field == self.FIELD_MONTH:
+                self._editing_field = self.FIELD_YEAR
+            elif self._editing_field == self.FIELD_YEAR:
+                return "EXIT_EDIT" # Cycle back to exit
+        elif edit_type == self.EDIT_TYPE_TIME:
+            if self._editing_field == self.FIELD_SECOND:
+                self._editing_field = self.FIELD_MINUTE
+            elif self._editing_field == self.FIELD_MINUTE:
+                self._editing_field = self.FIELD_HOUR
+            elif self._editing_field == self.FIELD_HOUR:
+                return "EXIT_EDIT" # Cycle back to exit
+        logger.debug(f"Editing previous field: {self._editing_field}")
+        return None
 
     # --- Private Date/Time Manipulation ---
 
@@ -878,193 +1037,262 @@ class MenuSystem:
             logger.warning("Commit called but no datetime was being edited.")
 
 
-    # --- Private Drawing Methods ---        
+    def _commit_app_datetime_changes(self):
+        """ Logs the final application reference datetime after editing. Does NOT change system time. """
+        if self._original_datetime_on_edit_start: # Check if editing actually occurred
+            final_time_str = self._app_datetime_ref.strftime("%Y-%m-%d %H:%M")
+            logger.info(f"Application time reference update finalized.")
+            logger.info(f"New internal App Time Reference: {final_time_str}")
+            # No attempt to change system time here.
+        self._original_datetime_on_edit_start = None # Clear saved state
+
+    # --- Private Drawing Methods ---
+    def _draw_title(self):
+        """Draws the main title."""
+        # Assertion: Should have valid font here (checked in draw)
+        assert self.title_font, "Title font not loaded"
+        title_text = self.title_font.render("OPEN SPECTRO MENU", True, YELLOW)
+        # Center the title horizontally, place it near the top
+        title_rect = title_text.get_rect(centerx=SCREEN_WIDTH // 2, top=10)
+        self.screen.blit(title_text, title_rect)
+        
+        
     def _draw_menu_items(self):
-        """ Draws the menu, using the calculated display time OR the value being edited. """
+        """ Draws the menu, aligning values and handling highlight condition. """
         y_position = MENU_MARGIN_TOP
-        # Calculate the time to show when *not* editing this specific line
         datetime_to_display_default = self._get_current_app_display_time()
 
         for i, (item_text, edit_type) in enumerate(self._menu_items):
-            display_text = ""
+            label_text = ""
+            value_text = ""
             is_selected = (i == self._current_selection_idx)
             is_being_edited = (is_selected and self._is_editing)
 
             # --- Determine which datetime object to use for formatting ---
             datetime_for_formatting = None
             if is_being_edited and edit_type in [self.EDIT_TYPE_DATE, self.EDIT_TYPE_TIME]:
-                # If editing Date/Time, use the temporary value being changed
-                # Ensure it's not None (shouldn't be if _is_editing is True for these types)
-                assert self._datetime_being_edited is not None, "In edit mode for Date/Time but _datetime_being_edited is None"
+                assert self._datetime_being_edited is not None
                 datetime_for_formatting = self._datetime_being_edited
             else:
-                # Otherwise, use the calculated (now + offset) time
                 datetime_for_formatting = datetime_to_display_default
 
-            # --- Generate display strings using the selected datetime object ---
+            # --- Generate Label and Value Strings ---
+            # Default label is the menu item text
+            label_text = item_text + ":" if item_text in [self.MENU_ITEM_INTEGRATION, self.MENU_ITEM_DATE, self.MENU_ITEM_TIME, self.MENU_ITEM_WIFI, self.MENU_ITEM_IP] else item_text
+
             if item_text == self.MENU_ITEM_INTEGRATION:
-                 display_text = f"Integration: {self._integration_time_ms} ms" # Integration is simple value
+                 label_text = "INTEGRATION:" # Use consistent prefix
+                 value_text = f"{self._integration_time_ms} ms"
             elif item_text == self.MENU_ITEM_DATE:
-                 display_text = f"Date: {datetime_for_formatting.strftime('%Y-%m-%d')}"
+                 label_text = "DATE:"
+                 value_text = f"{datetime_for_formatting.strftime('%Y-%m-%d')}"
             elif item_text == self.MENU_ITEM_TIME:
-                 display_text = f"Time: {datetime_for_formatting.strftime('%H:%M')}" # No seconds
+                 label_text = "TIME:"
+                 value_text = f"{datetime_for_formatting.strftime('%H:%M')}" # No seconds
             elif item_text == self.MENU_ITEM_WIFI:
-                 display_text = f"WiFi: {self.network_info.get_wifi_name()}"
+                 label_text = "WIFI:"
+                 value_text = f"{self.network_info.get_wifi_name()}"
             elif item_text == self.MENU_ITEM_IP:
-                 display_text = f"IP: {self.network_info.get_ip_address()}"
-            else: display_text = item_text # e.g., "Capture Spectra"
+                 label_text = "IP:"
+                 value_text = f"{self.network_info.get_ip_address()}"
+            # else: value_text remains empty for "LOG SPECTRA"
+
 
             # --- Determine color ---
             color = WHITE
-            is_connected = "Not Connected" not in display_text and "Error" not in display_text
-            if is_selected: color = YELLOW if self._is_editing else GREEN
+            is_connected = "Not Connected" not in value_text and "Error" not in value_text # Check value part
+            if is_selected: color = YELLOW # Selected is always yellow now? (Previously GREEN if not editing) Choose desired behavior. Let's keep it yellow.
             elif (item_text == self.MENU_ITEM_WIFI or item_text == self.MENU_ITEM_IP) and not is_connected: color = GRAY
 
-            # --- Render and Blit ---
-            text_surface = self.font.render(display_text, True, color)
-            self.screen.blit(text_surface, (MENU_MARGIN_LEFT, y_position))
+            # --- Render and Blit Label and Value separately for alignment ---
+            label_surface = self.font.render(label_text, True, color)
+            self.screen.blit(label_surface, (MENU_MARGIN_LEFT, y_position))
+
+            if value_text: # Only blit value if it exists
+                value_surface = self.font.render(value_text, True, color)
+                # Use the calculated offset for the value's starting position
+                value_pos_x = MENU_MARGIN_LEFT + self._value_start_offset_x
+                self.screen.blit(value_surface, (value_pos_x, y_position))
+
 
             # --- Draw Editing Highlight ---
-            # Highlight logic remains the same, it needs the string representation
-            # of the value being edited for positioning.
-            if is_being_edited and edit_type in [self.EDIT_TYPE_DATE, self.EDIT_TYPE_TIME]:
-                 # We still need the string based on _datetime_being_edited for the highlight function
-                 if self._datetime_being_edited:
+            # Condition now includes EDIT_TYPE_INTEGRATION
+            if is_being_edited and edit_type in [self.EDIT_TYPE_INTEGRATION, self.EDIT_TYPE_DATE, self.EDIT_TYPE_TIME]:
+                 # Determine the source string for highlight calculation
+                 highlight_text_source = ""
+                 if edit_type == self.EDIT_TYPE_INTEGRATION:
+                      # Need the *current* value being edited (which is just _integration_time_ms)
+                      highlight_text_source = f"{label_text} {value_text}" # Combine label + value for context if needed by highlight func
+                 elif self._datetime_being_edited: # For Date/Time use the temp obj
                      if edit_type == self.EDIT_TYPE_DATE:
-                          highlight_text_source = f"Date: {self._datetime_being_edited.strftime('%Y-%m-%d')}"
+                          highlight_text_source = f"{label_text} {self._datetime_being_edited.strftime('%Y-%m-%d')}"
                      elif edit_type == self.EDIT_TYPE_TIME:
-                          highlight_text_source = f"Time: {self._datetime_being_edited.strftime('%H:%M')}"
-                     self._draw_editing_highlight(highlight_text_source, y_position)
+                          highlight_text_source = f"{label_text} {self._datetime_being_edited.strftime('%H:%M')}"
+
+                 if highlight_text_source:
+                      self._draw_editing_highlight(highlight_text_source, y_position, edit_type) # Pass edit_type too
                  else:
-                      logger.warning("Attempting to draw highlight but _datetime_being_edited is None")
+                      logger.warning(f"Could not determine source string for highlight. Type: {edit_type}")
+
 
             y_position += MENU_SPACING
 
-
-    def _draw_title(self):
-        """Draws the main title."""
-        # Assertion: Should have valid font here (checked in draw)
-        assert self.title_font, "Title font not loaded"
-        title_text = self.title_font.render("Underwater Spectrometer", True, WHITE)
-        # Center the title horizontally, place it near the top
-        title_rect = title_text.get_rect(centerx=SCREEN_WIDTH // 2, top=10)
-        self.screen.blit(title_text, title_rect)
-
-    def _draw_editing_highlight(self, full_text_being_edited, y_pos):
+    def _draw_editing_highlight(self, full_text_being_edited, y_pos, edit_type): # Added edit_type arg
         """ Draws highlight based on the string representation of the value being edited. """
-        # This function's logic remains the same - it works on the passed string
-        # ... (Calculations based on full_text_being_edited) ...
-        assert self._editing_field is not None
-        assert self.font
-        try: prefix_width = self.font.size(full_text_being_edited.split(':')[0] + ': ')[0]; value_start_x = MENU_MARGIN_LEFT + prefix_width
-        except Exception as e: logger.error(f"Highlight prefix error: {e}"); return
+        assert self.font, "Font not available for highlight"
+        # Use the consistent starting X offset calculated in __init__
+        value_start_x = MENU_MARGIN_LEFT + self._value_start_offset_x
 
-        highlight_rect = None; value_str = ""; field_str = ""; offset_str = ""
+        highlight_rect = None
+        field_str = ""  # The specific part being highlighted (e.g., "2025" or "1000")
+        offset_str = "" # The part of the value *before* the field_str (e.g., "YYYY-" for month)
+
         try:
-            edit_type = self._menu_items[self._current_selection_idx][1]
-            # Use the passed string directly for parsing highlight position
-            value_part = full_text_being_edited.split(': ')[1]
-
-            if edit_type == self.EDIT_TYPE_DATE:
+            # Extract the value part *after* the prefix (which we know starts at value_start_x)
+            # This parsing logic needs adjustment if the label isn't simply "LABEL: "
+            # For safety, let's re-render just the value part to measure offsets within it
+            if edit_type == self.EDIT_TYPE_INTEGRATION:
+                 # Value is like "1000 ms"
+                 value_part = f"{self._integration_time_ms} ms" # Get current value
+                 field_str = str(self._integration_time_ms) # Highlight the number
+                 offset_str = "" # No offset within the value itself
+            elif edit_type == self.EDIT_TYPE_DATE:
+                assert self._datetime_being_edited is not None and self._editing_field is not None
+                value_part = self._datetime_being_edited.strftime('%Y-%m-%d')
                 if self._editing_field == self.FIELD_YEAR: field_str, offset_str = value_part[0:4], ""
                 elif self._editing_field == self.FIELD_MONTH: field_str, offset_str = value_part[5:7], value_part[0:5]
                 elif self._editing_field == self.FIELD_DAY: field_str, offset_str = value_part[8:10], value_part[0:8]
                 else: return
-            elif edit_type == self.EDIT_TYPE_TIME: # Format is HH:MM
+            elif edit_type == self.EDIT_TYPE_TIME:
+                assert self._datetime_being_edited is not None and self._editing_field is not None
+                value_part = self._datetime_being_edited.strftime('%H:%M')
                 if self._editing_field == self.FIELD_HOUR: field_str, offset_str = value_part[0:2], ""
                 elif self._editing_field == self.FIELD_MINUTE: field_str, offset_str = value_part[3:5], value_part[0:3]
                 else: return
+            else:
+                 return # Unknown type
 
-            field_width = self.font.size(field_str)[0]; offset_width = self.font.size(offset_str)[0]
-            highlight_x = value_start_x + offset_width
+            # Calculate widths based *only* on the value part's segments
+            field_width = self.font.size(field_str)[0]
+            offset_within_value_width = self.font.size(offset_str)[0]
+
+            # Calculate final X position
+            highlight_x = value_start_x + offset_within_value_width
+
+            # Define the rectangle
             highlight_rect = pygame.Rect(highlight_x - 1, y_pos - 1, field_width + 2, FONT_SIZE + 2)
-        except Exception as e: logger.error(f"Highlight calc error: {e}"); return
+
+        except Exception as e: logger.error(f"Highlight calc error: {e}", exc_info=True); return # Show traceback for calc errors
 
         if highlight_rect: pygame.draw.rect(self.screen, RED, highlight_rect, 1)
 
-    def _draw_hints(self):
-        """ Draws context-sensitive control hints at the bottom. (Updated) """
-        hint_text = ""
-        if self._is_editing:
-            # New editing hints
-             hint_text = "UP/DN: Adjust | ENT: Next/Save | BCK: Cancel"
-        else:
-            # Navigation hints remain the same
-            hint_text = "UP/DN: Navigate | ENT: Select/Edit | BCK: Back"
 
-        hint_surface = self.font.render(hint_text, True, YELLOW)
+    def _draw_hints(self):
+        # ... (Draw hints - No changes needed here) ...
+        assert self.hint_font, "Hint font object is not available"
+        hint_text = ""
+        if self._is_editing: hint_text = "UP/DN: Adjust | ENT: Next/Save | BCK: Cancel"
+        else: hint_text = "UP/DN: Navigate | ENT: Select/Edit | BCK: Back"
+        hint_surface = self.hint_font.render(hint_text, True, YELLOW)
         hint_rect = hint_surface.get_rect(left=MENU_MARGIN_LEFT, bottom=SCREEN_HEIGHT - 10)
         self.screen.blit(hint_surface, hint_rect)
 
-    def _update_hardware_display(self):
-        """Updates the physical display (Pimoroni or standard Pygame window)."""
-        if USE_DISPLAY_HAT and self.display_hat:
-            try:
-                # Rotate buffer for Display HAT Mini orientation
-                rotated_surface = pygame.transform.rotate(self.screen, 180)
-                # Convert to 16-bit format expected by display
-                pixelbytes = rotated_surface.convert(16, 0).get_buffer()
-                # Perform byteswap needed for ST7789
-                pixelbytes_swapped = bytearray(pixelbytes)
-                pixelbytes_swapped[0::2], pixelbytes_swapped[1::2] = pixelbytes_swapped[1::2], pixelbytes_swapped[0::2]
+# --- Splash Screen Function ---
+def show_splash_screen(screen, display_hat_obj, duration_s):
+    """
+    Displays the splash screen image for a specified duration.
+    Args:
+        screen: The Pygame Surface to draw on.
+        display_hat_obj: The initialized DisplayHATMini object, or None.
+        duration_s: How long to display the splash screen in seconds.
+    """
+    logger.info(f"Displaying splash screen for {duration_s} seconds...")
+    splash_image = None # Initialize to None
+    try:
+        # Construct path to image
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        assets_dir = os.path.join(script_dir, 'assets')
+        image_path = os.path.join(assets_dir, 'pysb-app.png')
 
-                # Send data to display in chunks
-                # Assertion: Ensure display_hat object and st7789 interface exist
-                assert hasattr(self.display_hat, 'st7789'), "Display HAT object missing st7789 interface"
-                self.display_hat.st7789.set_window()
-                chunk_size = 4096
-                for i in range(0, len(pixelbytes_swapped), chunk_size):
-                    self.display_hat.st7789.data(pixelbytes_swapped[i:i + chunk_size])
+        # Load the image
+        if not os.path.exists(image_path):
+             logger.error(f"Splash screen image not found at: {image_path}")
+             return # Skip splash if image missing
 
-            except Exception as e:
-                logger.error(f"Error updating Display HAT Mini: {e}", exc_info=False) # Avoid excessive logging
-                # Consider fallback or marking display as failed?
+        splash_image_raw = pygame.image.load(image_path)
+        logger.info(f"Loaded splash screen image: {image_path}")
+
+        # --- CONDITIONAL CONVERT ---
+        # Only convert if NOT using the Display HAT (i.e., if a real video mode is set)
+        # We also need to check if pygame.display is actually initialized,
+        # as convert() might still fail if only pygame.init() was called without display.init()
+        if not USE_DISPLAY_HAT and pygame.display.get_init() and pygame.display.get_surface():
+             try:
+                  logger.debug("Attempting splash image conversion for standard display.")
+                  splash_image = splash_image_raw.convert()
+             except pygame.error as convert_error:
+                  logger.warning(f"pygame.Surface.convert() failed even for standard display: {convert_error}. Using raw surface.")
+                  splash_image = splash_image_raw # Use raw as fallback
         else:
-            # Standard Pygame window update
-            try:
-                 pygame.display.flip()
-            except Exception as e:
-                 logger.error(f"Error updating Pygame display: {e}", exc_info=True)
-                 # If display fails, maybe trigger shutdown?
+             logger.debug("Skipping splash image conversion (using Display HAT or no video mode).")
+             splash_image = splash_image_raw # Use the raw loaded image directly
+        # --- END CONDITIONAL CONVERT ---
 
+    except pygame.error as e:
+        logger.error(f"Failed to load splash screen image: {e}", exc_info=True)
+        return # Skip splash on error
+    except Exception as e:
+        logger.error(f"An unexpected error occurred loading splash screen: {e}", exc_info=True)
+        return # Skip splash on error
+
+    # --- Proceed only if splash_image was successfully assigned ---
+    if splash_image:
+        try:
+            # Clear screen
+            screen.fill(BLACK)
+
+            # Get image dimensions and screen dimensions
+            splash_rect = splash_image.get_rect()
+            screen_rect = screen.get_rect()
+
+            # Center the splash image on the screen
+            splash_rect.center = screen_rect.center
+
+            # Draw the image
+            screen.blit(splash_image, splash_rect)
+
+            # Update the physical display using the helper
+            update_hardware_display(screen, display_hat_obj)
+
+            # Wait for the specified duration
+            time.sleep(duration_s)
+            logger.info("Splash screen finished.")
+
+        except Exception as e:
+             logger.error(f"Error displaying splash screen: {e}", exc_info=True)
 
 # --- Spectrometer Placeholder Screen ---
-# TODO: Implement this screen properly later
-
-def show_capture_placeholder(screen, display_hat):
+def show_capture_placeholder(screen, display_hat_obj): # Renamed arg for consistency
      """Displays a placeholder message for the capture screen."""
      logger.info("Displaying Capture Spectra placeholder screen.")
-     font = pygame.font.SysFont(None, 30)
-     text = font.render("Capture Mode (Not Implemented)", True, WHITE)
-     screen.fill(BLACK)
-     screen_rect = screen.get_rect()
-     text_rect = text.get_rect(center=screen_rect.center)
-     screen.blit(text, text_rect)
+     # Consider using loaded fonts if font object is available/passed
+     try:
+          font = pygame.font.SysFont(None, 30)
+          text = font.render("Capture Mode (Not Implemented)", True, WHITE)
+          screen.fill(BLACK)
+          screen_rect = screen.get_rect()
+          text_rect = text.get_rect(center=screen_rect.center)
+          screen.blit(text, text_rect)
+          # --- Use the helper function ---
+          update_hardware_display(screen, display_hat_obj)
+     except Exception as e:
+          logger.error(f"Error rendering capture placeholder: {e}")
 
-     # Update display
-     if USE_DISPLAY_HAT and display_hat:
-         # Re-use the hardware update logic (maybe refactor _update_hardware_display into a utility?)
-         try:
-            rotated_surface = pygame.transform.rotate(screen, 180)
-            pixelbytes = rotated_surface.convert(16, 0).get_buffer()
-            pixelbytes_swapped = bytearray(pixelbytes)
-            pixelbytes_swapped[0::2], pixelbytes_swapped[1::2] = pixelbytes_swapped[1::2], pixelbytes_swapped[0::2]
-            display_hat.st7789.set_window()
-            chunk_size = 4096
-            for i in range(0, len(pixelbytes_swapped), chunk_size):
-                display_hat.st7789.data(pixelbytes_swapped[i:i + chunk_size])
-         except Exception as e:
-            logger.error(f"Error updating Display HAT Mini for placeholder: {e}")
-     else:
-         pygame.display.flip()
-
-     # Wait a moment then allow return (or handle input here for placeholder)
+     # Wait a moment then allow return
      time.sleep(2.0)
      logger.info("Returning from placeholder screen.")
 
-
 # --- Signal Handling ---
-
 def setup_signal_handlers(button_handler, network_info):
     """Sets up signal handlers for graceful shutdown."""
     # Assertion: Ensure handlers are provided
@@ -1080,7 +1308,7 @@ def setup_signal_handlers(button_handler, network_info):
     signal.signal(signal.SIGTERM, signal_handler) # kill command
     logger.info("Signal handlers set up for SIGINT and SIGTERM.")
 
-
+# --- Main Application ---
 def main():
     """Main application entry point."""
     logger.info("============================================")
@@ -1138,6 +1366,10 @@ def main():
 
         assert screen is not None, "Failed to create Pygame screen surface"
 
+        # --- *AFTER* Display Init, Show Splash Screen ---  # <<< INSERT CALL HERE
+        show_splash_screen(screen, display_hat if display_hat_operational else None, SPLASH_DURATION_S)
+        # --- End Splash Screen ---                        # <<< END INSERTED CALL
+
         # --- Initialize Core Components ---
         logger.info("Initializing core components...")
         network_info = NetworkInfo()
@@ -1162,10 +1394,11 @@ def main():
                 g_shutdown_flag.set()
                 continue
             elif menu_action == "CAPTURE":
+                 # Use the helper function here too
                  show_capture_placeholder(screen, display_hat if display_hat_operational else None)
                  continue
 
-            menu_system.draw()
+            menu_system.draw() # Draws the menu screen
             main_clock.tick(1.0 / MAIN_LOOP_DELAY_S)
 
     except Exception as e:
@@ -1174,6 +1407,7 @@ def main():
 
     finally:
         # --- Cleanup Resources ---
+        # ... (Cleanup code remains the same) ...
         logger.warning("Initiating final cleanup...")
         if network_info: network_info.stop_updates()
         if menu_system: menu_system.cleanup()
@@ -1187,8 +1421,5 @@ def main():
         logger.info("   Application Finished.")
         logger.info("============================================")
 
-
 if __name__ == "__main__":
-    # Ensure iwgetid is installed before running
-    # sudo apt update && sudo apt install wireless-tools
     main()
