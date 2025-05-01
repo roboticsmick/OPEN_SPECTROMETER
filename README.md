@@ -16,9 +16,9 @@ pip install seabreeze[pyseabreeze]
 seabreeze_os_setup
 ```
 
-## 2.4inch RPi Display For RPi
+## 2 inch RPi Display For RPi
 
-Flash the pi with Raspberry Pi OS (32-bit)
+Flash the Raspberry Pi Zeroe 2 W with Ubuntu 22.04 Server LTS
 
 ```sh
 sudo apt install rpi-imager
@@ -73,13 +73,24 @@ nano setup_pi.sh
 
 Copy the code into the text file editor.
 
-```bash
-
-```
-
 ```sh
 chmod +x setup_pi.sh
 ./setup_pi.sh
 ```
+## Run the main script
+
+```sh
+cd pysb-app/
+vim main.py
+```
+
+Copy the main.py script
+
+```py
+source venv/bin/activate
+python3 main.py
+```
+
+
 
 
