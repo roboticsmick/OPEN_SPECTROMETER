@@ -28,20 +28,20 @@ Setup parameters:
 1. Raspberry Pi Device: Raspberry Pi Zeroe 2 W
 2. Operating System: Ubuntu 22.04 Server LTS (https://ubuntu.com/tutorials/how-to-install-ubuntu-on-your-raspberry-pi#1-overview)
 3. Stoage - Use a Samsung 128GB PRO Plus microSD Card or high quality SD card. Get the best one you can afford from a reputable supplier. Don't be cheap here.
-4. Select $Edit Settings$
-  1. Set hostname: $rpi$
-  2.Tick $Set username and password$
-  3. Set username: $pi$
-  4. Set password: $spectro$
-  5. Tick $Configure wireless LAN$
+4. Select `Edit Settings`
+  1. Set hostname: `rpi`
+  2.Tick `Set username and password`
+  3. Set username: `pi`
+  4. Set password: `spectro`
+  5. Tick `Configure wireless LAN`
   6. Enter known wifi name (I use my mobile hotspot name so I can access this easily in the field)
   7. Enter wifi password I use my mobile hotspot password so I can access this easily in the field)
-  8. Set Wireless LAN country: $AU$
-  9. Tick $Set locale settings$
-  10. Timezone: $Australia/Brisbane$
-  11. Keyboard Layout: $US$
+  8. Set Wireless LAN country: `AU`
+  9. Tick `Set locale settings`
+  10. Timezone: `Australia/Brisbane`
+  11. Keyboard Layout: `US`
   12. Select Services Tab
-  13. Tick $Enable SSH - Use password authentication$
+  13. Tick `Enable SSH - Use password authentication`
   14. Click Save
   15. Click Yes to apply OS customisation settings when you write the image to the storage device.
 
