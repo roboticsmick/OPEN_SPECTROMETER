@@ -249,20 +249,13 @@ install_system_packages() {
     echo "======================================"
     echo "Installing System Packages"
     local packages=( git git-all build-essential pkg-config libusb-dev libudev-dev
-                     python3-pip python3-dev python3-venv vim feh screen wireless-tools )
+                     python3-pip python3-dev python3-venv vim feh screen wireless-tools i2c-tools )
     echo "Installing: ${packages[@]}"
     wait_for_apt_lock
     if ! sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"; then
         critical_error "Failed to install one or more essential system packages."
     fi
     echo "System packages installed successfully."
-
-    echo "Verifying libusb installation..."
-    if ! pkg-config --exists libusb-1.0; then
-        warning "pkg-config cannot find libusb-1.0. Seabreeze installation might fail."
-    else
-        echo "libusb-1.0 found by pkg-config: $(pkg-config --modversion libusb-1.0)"
-    fi
 }
 
 
