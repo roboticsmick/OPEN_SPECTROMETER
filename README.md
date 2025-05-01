@@ -86,6 +86,18 @@ vim main.py
 
 Copy the main.py script
 
+```sh
+mkdir assets
+```
+
+From whereever I have saved the fonts and images:
+
+```sh
+scp -r . pi@rpi.local:~/pysb-app/assets/
+```
+
+Now run the script:
+
 ```py
 source venv/bin/activate
 python3 main.py
