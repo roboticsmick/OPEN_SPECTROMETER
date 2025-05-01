@@ -21,7 +21,7 @@ import datetime
 import subprocess
 import threading
 import logging
-import RPi.GPIO # Placeholder for type hinting
+import RPi.GPIO
 import io         # For in-memory plot rendering
 import csv        # For future data saving
 import numpy as np # Might need later for data manipulation
@@ -69,7 +69,6 @@ sb = None
 plt = None
 Image = None # PIL/Pillow
 Spectrometer = None # Specific class from seabreeze
-# <<< NEW: Add pyusb import if needed for USBError catch >>>
 usb = None
 
 if USE_SPECTROMETER:
@@ -87,7 +86,6 @@ if USE_SPECTROMETER:
         import seabreeze.spectrometers as sb
         from seabreeze.spectrometers import Spectrometer # Import the class directly
 
-        # <<< NEW: Import usb.core specifically for catching USBError >>>
         try:
             import usb.core
         except ImportError:
@@ -142,6 +140,12 @@ DATA_DIR = os.path.join(DATA_BASE_DIR, "spectra_data")
 CSV_FILENAME = os.path.join(DATA_DIR, "spectra_log.csv")
 PLOT_SAVE_DIR = DATA_DIR # Save plots in the same directory
 
+# Collection Mode Constants
+MODE_RAW = "Raw"
+MODE_RADIANCE = "Radiance"
+MODE_REFLECTANCE = "Reflectance"
+DEFAULT_COLLECTION_MODE = MODE_RADIANCE # Start with Radiance as default
+
 # Integration Time (ms)
 INTEGRATION_TIME_SCALE_FACTOR = 10.0 # Factor to multiply calculated microseconds by
 DEFAULT_INTEGRATION_TIME_MS = 500
@@ -195,11 +199,11 @@ GRAY = (128, 128, 128)
 CYAN = (0, 255, 255)
 
 # Menu Layout
-FONT_SIZE = 18
-TITLE_FONT_SIZE = 24
+FONT_SIZE = 16
+TITLE_FONT_SIZE = 22
 HINT_FONT_SIZE = 14
 DISCLAIMER_FONT_SIZE = 14
-MENU_SPACING = 26
+MENU_SPACING = 24
 MENU_MARGIN_TOP = 44
 MENU_MARGIN_LEFT = 12
 
@@ -736,6 +740,7 @@ class MenuSystem:
     # Define menu items and their corresponding actions or edit types
     MENU_ITEM_CAPTURE = "LOG SPECTRA"
     MENU_ITEM_INTEGRATION = "INTEGRATION TIME"
+    MENU_ITEM_COLLECTION_MODE = "COLLECTION MODE"    
     MENU_ITEM_DATE = "DATE"
     MENU_ITEM_TIME = "TIME"
     MENU_ITEM_WIFI = "WIFI"
@@ -745,7 +750,8 @@ class MenuSystem:
     EDIT_TYPE_INTEGRATION = 1
     EDIT_TYPE_DATE = 2
     EDIT_TYPE_TIME = 3
-
+    EDIT_TYPE_COLLECTION_MODE = 4 
+    
     # Fields for date/time editing
     FIELD_YEAR = 'year'
     FIELD_MONTH = 'month'
@@ -753,6 +759,8 @@ class MenuSystem:
     FIELD_HOUR = 'hour'
     FIELD_MINUTE = 'minute'
     # FIELD_SECOND = 'second' # Seconds editing removed for simplicity
+    
+    COLLECTION_MODES = (MODE_RAW, MODE_RADIANCE, MODE_REFLECTANCE)
 
     def __init__(self, screen: pygame.Surface, button_handler: ButtonHandler, network_info: NetworkInfo):
         """
@@ -770,6 +778,18 @@ class MenuSystem:
 
         # --- Application State ---
         self._integration_time_ms = DEFAULT_INTEGRATION_TIME_MS
+        # Collection Mode State 
+        try:
+             # Find the index of the default mode
+             self._collection_mode_idx = self.COLLECTION_MODES.index(DEFAULT_COLLECTION_MODE)
+        except ValueError:
+             logger.warning(f"Default collection mode '{DEFAULT_COLLECTION_MODE}' not found in modes list. Defaulting to index 0.")
+             self._collection_mode_idx = 0 # Fallback to first item
+        self._collection_mode = self.COLLECTION_MODES[self._collection_mode_idx]
+        # Assertion: Ensure initial mode index is valid
+        assert 0 <= self._collection_mode_idx < len(self.COLLECTION_MODES), "Initial collection mode index out of bounds"
+        # Assertion: Ensure initial mode is a valid string
+        assert isinstance(self._collection_mode, str) and self._collection_mode in self.COLLECTION_MODES, "Initial collection mode is invalid"
         # Store offset from system time, not an absolute editable time
         self._time_offset = datetime.timedelta(0)
         # Store offset before editing starts, for discard/revert
@@ -782,6 +802,7 @@ class MenuSystem:
         self._menu_items = (
             (self.MENU_ITEM_CAPTURE, self.EDIT_TYPE_NONE),
             (self.MENU_ITEM_INTEGRATION, self.EDIT_TYPE_INTEGRATION),
+            (self.MENU_ITEM_COLLECTION_MODE, self.EDIT_TYPE_COLLECTION_MODE),
             (self.MENU_ITEM_DATE, self.EDIT_TYPE_DATE),
             (self.MENU_ITEM_TIME, self.EDIT_TYPE_TIME),
             (self.MENU_ITEM_WIFI, self.EDIT_TYPE_NONE),
@@ -913,6 +934,7 @@ class MenuSystem:
             # These should match exactly how they are rendered in _draw_menu_items
             label_prefixes = {
                 self.MENU_ITEM_INTEGRATION: "INTEGRATION:",
+                self.MENU_ITEM_COLLECTION_MODE: "MODE:",
                 self.MENU_ITEM_DATE: "DATE:",
                 self.MENU_ITEM_TIME: "TIME:",
                 self.MENU_ITEM_WIFI: "WIFI:",
@@ -980,6 +1002,14 @@ class MenuSystem:
         # Assertion: Ensure return value is datetime
         assert isinstance(dt, datetime.datetime), "get_current_app_display_time returned invalid type"
         return dt
+    
+    # Accessor for Collection Mode 
+    def get_collection_mode(self) -> str:
+        """Returns the currently selected collection mode string."""
+        # Assertion: Ensure mode is valid
+        assert self._collection_mode in self.COLLECTION_MODES, "Internal collection mode state is invalid"
+        return self._collection_mode
+
 
     def handle_input(self) -> str | None:
         """
@@ -996,10 +1026,13 @@ class MenuSystem:
         # 2. Handle button presses based on state
         action = None
         if self._is_editing:
-            # Assertion: Editing field must be set if editing (except for integration time)
+            # Assertion: Editing field must be set if editing (except complex types)
+            # Ensure index is valid before accessing menu item
+            assert 0 <= self._current_selection_idx < len(self._menu_items), "Invalid index for editing state check"
             item_text, edit_type = self._menu_items[self._current_selection_idx]
-            assert self._editing_field is not None or edit_type == self.EDIT_TYPE_INTEGRATION, \
-                   f"Inconsistent editing state: _is_editing=True but _editing_field is None for type {edit_type}"
+            # Modified Assertion: Field is only required for Date/Time edit types
+            assert (self._editing_field is not None or edit_type not in [self.EDIT_TYPE_DATE, self.EDIT_TYPE_TIME]), \
+                   f"Editing state inconsistent: _editing_field is None for type {edit_type}"
             action = self._handle_editing_input()
         else:
             # Assertion: Should not be editing
@@ -1013,7 +1046,7 @@ class MenuSystem:
         # 3. Process actions returned by input handlers
         if action == "EXIT_EDIT_SAVE":
             self._is_editing = False
-            self._editing_field = None
+            self._editing_field = None # Clear field even if not used
             if self._datetime_being_edited is not None: # Only commit if a datetime was edited
                  # Assertion: Check object type before commit
                  assert isinstance(self._datetime_being_edited, datetime.datetime), "Cannot commit invalid datetime object"
@@ -1024,6 +1057,8 @@ class MenuSystem:
             logger.info("Exited editing mode, changes saved (if any).")
             return None # Stay in menu
         elif action == "EXIT_EDIT_DISCARD":
+             # For simple modes like Collection Mode, discard is same as save currently
+             # because changes apply immediately on Up/Down. Keep separate for now.
             self._is_editing = False
             self._editing_field = None
             # Restore the original offset if it was saved
@@ -1033,11 +1068,13 @@ class MenuSystem:
                 self._time_offset = self._original_offset_on_edit_start
                 logger.info("Exited editing mode, time offset changes discarded.")
             else:
-                # This case shouldn't happen if logic is correct, but log if it does
-                logger.warning("Exited editing mode via BACK, but no original offset found to revert to.")
+                # This case shouldn't happen if logic is correct for Date/Time,
+                # but is expected for Integration/Collection modes
+                logger.debug("Exited editing mode via BACK (discard), no original offset to revert.")
             # Clear temporary edit state
             self._datetime_being_edited = None
             self._original_offset_on_edit_start = None
+            logger.info("Exited editing mode (Discard).")
             return None # Stay in menu
         elif action == "START_CAPTURE":
             logger.info("Capture action triggered.")
@@ -1122,24 +1159,25 @@ class MenuSystem:
 
         action = None # Action to return (e.g., exit states)
 
-        # UP/DOWN adjust the current field's value
+        # UP/DOWN adjust the current field's value or cycle mode
         if self.button_handler.check_button(BTN_UP):
-            self._handle_edit_adjust(edit_type, 1) # Increment/Increase
+            self._handle_edit_adjust(edit_type, 1) # Increment/Increase/Cycle Up
         elif self.button_handler.check_button(BTN_DOWN):
-             self._handle_edit_adjust(edit_type, -1) # Decrement/Decrease
+             self._handle_edit_adjust(edit_type, -1) # Decrement/Decrease/Cycle Down
 
         # ENTER cycles to the next field or confirms/exits (SAVE)
         elif self.button_handler.check_button(BTN_ENTER):
             action = self._handle_edit_next_field(edit_type) # Returns "EXIT_EDIT_SAVE" on finish
 
-        # BACK exits edit mode WITHOUT saving (DISCARD)
+        # BACK exits edit mode
+        # <<< MODIFIED: Let BACK also save for simple types like Mode/Integration >>>
+        # <<< For Date/Time, keep it as discard? Revert: Keep discard for now for consistency. >>>
         elif self.button_handler.check_button(BTN_BACK):
             action = "EXIT_EDIT_DISCARD" # Signal discard
 
         # Assertion: Check action type
         assert isinstance(action, (str, type(None))), "Editing input returning invalid type"
         return action # Returns None if just adjusting/changing field, or exit action
-
 
     def _navigate_menu(self, direction: int):
         """Updates the current menu selection index, wrapping around."""
@@ -1169,37 +1207,43 @@ class MenuSystem:
                 action_result = "START_CAPTURE" # Signal action to main loop
             else:
                 logger.warning("Capture Spectra selected, but USE_SPECTROMETER is False.")
-                # Optionally show a brief message on screen?
                 action_result = None
 
-        # --- Start Editing ---
-        elif edit_type in [self.EDIT_TYPE_INTEGRATION, self.EDIT_TYPE_DATE, self.EDIT_TYPE_TIME]:
+        # --- Start Editing (Includes new Collection Mode type) ---
+        elif edit_type in [self.EDIT_TYPE_INTEGRATION, self.EDIT_TYPE_COLLECTION_MODE, self.EDIT_TYPE_DATE, self.EDIT_TYPE_TIME]:
             logger.info(f"Entering edit mode for: {item_text}")
             self._is_editing = True
-            # Store current offset for potential discard/revert
-            self._original_offset_on_edit_start = self._time_offset
-            # Initialize the temporary absolute datetime object based on current *apparent* app time
-            self._datetime_being_edited = self._get_current_app_display_time()
-            # Assertion: Ensure datetime object created
-            assert self._datetime_being_edited is not None, "Failed to get current app time for editing"
 
-            # Set the initial field to edit
-            if edit_type == self.EDIT_TYPE_INTEGRATION:
-                self._editing_field = None # Integration time doesn't use fields
-                logger.debug(f"Starting edit: Integration Time (Current: {self._integration_time_ms} ms)")
-            elif edit_type == self.EDIT_TYPE_DATE:
+            # Store current offset ONLY for Date/Time edits
+            if edit_type in [self.EDIT_TYPE_DATE, self.EDIT_TYPE_TIME]:
+                self._original_offset_on_edit_start = self._time_offset
+                self._datetime_being_edited = self._get_current_app_display_time()
+                # Assertion: Ensure datetime object created
+                assert self._datetime_being_edited is not None, "Failed to get current app time for editing"
+            else:
+                 self._original_offset_on_edit_start = None # Not needed for Integ/Mode
+                 self._datetime_being_edited = None
+
+
+            # Set the initial field to edit (only for Date/Time)
+            if edit_type == self.EDIT_TYPE_DATE:
                 self._editing_field = self.FIELD_YEAR # Start with Year
                 logger.debug(f"Starting edit: Date (Initial: {self._datetime_being_edited.strftime('%Y-%m-%d')}, Field: Year)")
             elif edit_type == self.EDIT_TYPE_TIME:
                 self._editing_field = self.FIELD_HOUR # Start with Hour
                 logger.debug(f"Starting edit: Time (Initial: {self._datetime_being_edited.strftime('%H:%M')}, Field: Hour)")
+            elif edit_type == self.EDIT_TYPE_INTEGRATION:
+                 self._editing_field = None # Integration time doesn't use fields
+                 logger.debug(f"Starting edit: Integration Time (Current: {self._integration_time_ms} ms)")
+            elif edit_type == self.EDIT_TYPE_COLLECTION_MODE:
+                 self._editing_field = None # Collection mode doesn't use fields
+                 logger.debug(f"Starting edit: Collection Mode (Current: {self._collection_mode})")
+
             action_result = None # Stay in menu, now in edit mode
 
         # --- Read-only items (WIFI, IP) ---
         elif item_text in [self.MENU_ITEM_WIFI, self.MENU_ITEM_IP]:
              logger.info(f"Selected read-only item: {item_text}")
-             # Optionally: Could force a refresh of network info here?
-             # Or display more details on a sub-screen?
              action_result = None # No action on select for these items
 
         # --- Fallback ---
@@ -1210,14 +1254,13 @@ class MenuSystem:
         # Assertion: Check return type
         assert isinstance(action_result, (str, type(None))), "Select menu item returning invalid type"
         return action_result
-
-
     def _handle_edit_adjust(self, edit_type: int, delta: int):
-        """ Adjusts the value of the currently edited field (Integration, Date, or Time). """
+        """ Adjusts the value of the currently edited item (Integration, Mode, Date, Time). """
         # Assertions: Check state and parameters
         assert self._is_editing, "Adjust called when not editing"
         assert delta in [-1, 1], f"Invalid adjustment delta: {delta}"
-        assert edit_type in [self.EDIT_TYPE_INTEGRATION, self.EDIT_TYPE_DATE, self.EDIT_TYPE_TIME], f"Invalid edit type for adjustment: {edit_type}"
+        # <<< MODIFIED: Include COLLECTION_MODE in valid types >>>
+        assert edit_type in [self.EDIT_TYPE_INTEGRATION, self.EDIT_TYPE_COLLECTION_MODE, self.EDIT_TYPE_DATE, self.EDIT_TYPE_TIME], f"Invalid edit type for adjustment: {edit_type}"
 
         if edit_type == self.EDIT_TYPE_INTEGRATION:
             # Adjust integration time directly
@@ -1230,6 +1273,20 @@ class MenuSystem:
             assert MIN_INTEGRATION_TIME_MS <= clamped_val <= MAX_INTEGRATION_TIME_MS, "Integration time out of bounds after clamp"
             self._integration_time_ms = clamped_val
             logger.debug(f"Integration time adjusted to {self._integration_time_ms} ms")
+
+        # <<< NEW: Handle Collection Mode cycling >>>
+        elif edit_type == self.EDIT_TYPE_COLLECTION_MODE:
+             num_modes = len(self.COLLECTION_MODES)
+             # Assertion: Check number of modes is positive
+             assert num_modes > 0, "Collection modes list is empty"
+             # Calculate new index with wrapping
+             new_idx = (self._collection_mode_idx + delta) % num_modes
+             # Assertion: Check new index is valid
+             assert 0 <= new_idx < num_modes, "Calculated collection mode index is out of bounds"
+             self._collection_mode_idx = new_idx
+             self._collection_mode = self.COLLECTION_MODES[new_idx]
+             logger.debug(f"Collection mode changed to: {self._collection_mode}")
+
 
         elif edit_type == self.EDIT_TYPE_DATE:
              # Assertion: Ensure datetime object exists for editing
@@ -1247,14 +1304,19 @@ class MenuSystem:
     def _handle_edit_next_field(self, edit_type: int) -> str | None:
         """ Moves to the next editable field, or returns 'EXIT_EDIT_SAVE' if done. """
         # Assertion: Check state
-        assert self._is_editing, "Next field called when not editing"
-        # Assertion: Check edit type validity
-        assert edit_type in [self.EDIT_TYPE_INTEGRATION, self.EDIT_TYPE_DATE, self.EDIT_TYPE_TIME], f"Invalid edit type for next field: {edit_type}"
+        assert self._is_editing
+        # <<< MODIFIED: Include COLLECTION_MODE in valid types >>>
+        assert edit_type in [self.EDIT_TYPE_INTEGRATION, self.EDIT_TYPE_COLLECTION_MODE, self.EDIT_TYPE_DATE, self.EDIT_TYPE_TIME], f"Invalid edit type for next field: {edit_type}"
 
         action_result = None # Default return
 
         if edit_type == self.EDIT_TYPE_INTEGRATION:
             logger.debug("Finished editing Integration Time.")
+            action_result = "EXIT_EDIT_SAVE" # No fields, Enter saves/exits
+
+        # <<< NEW: Handle Collection Mode exit >>>
+        elif edit_type == self.EDIT_TYPE_COLLECTION_MODE:
+            logger.debug("Finished editing Collection Mode.")
             action_result = "EXIT_EDIT_SAVE" # No fields, Enter saves/exits
 
         elif edit_type == self.EDIT_TYPE_DATE:
@@ -1277,16 +1339,12 @@ class MenuSystem:
                 self._editing_field = self.FIELD_MINUTE
                 logger.debug("Editing next field: Minute")
             elif self._editing_field == self.FIELD_MINUTE:
-                # Removed seconds editing
-                # self._editing_field = self.FIELD_SECOND; logger.debug("Editing next field: Second")
-                # elif self._editing_field == self.FIELD_SECOND:
                 logger.debug("Finished editing Time fields.")
                 action_result = "EXIT_EDIT_SAVE" # Finished all time fields
 
         # Assertion: Check return type
         assert isinstance(action_result, (str, type(None))), "Next field returning invalid type"
         return action_result # Stay in edit mode (return None) or exit (return string)
-
 
     # --- Private Date/Time Manipulation ---
 
@@ -1489,6 +1547,11 @@ class MenuSystem:
                     prefix = "INTEGRATION:"
                     label_text = prefix
                     value_text = f"{self._integration_time_ms} ms"
+                # <<< NEW: Handle Collection Mode Display >>>
+                elif item_text == self.MENU_ITEM_COLLECTION_MODE:
+                    prefix = "MODE:"
+                    label_text = prefix
+                    value_text = self._collection_mode # Get current mode string
                 elif item_text == self.MENU_ITEM_DATE:
                     prefix = "DATE:"
                     label_text = prefix
@@ -1545,7 +1608,8 @@ class MenuSystem:
                     self.screen.blit(value_surface, (value_pos_x, y_position))
 
                 # --- Draw Editing Highlight ---
-                if is_being_edited and edit_type in [self.EDIT_TYPE_INTEGRATION, self.EDIT_TYPE_DATE, self.EDIT_TYPE_TIME]:
+                # <<< MODIFIED: Include Collection Mode Highlight >>>
+                if is_being_edited and edit_type in [self.EDIT_TYPE_INTEGRATION, self.EDIT_TYPE_COLLECTION_MODE, self.EDIT_TYPE_DATE, self.EDIT_TYPE_TIME]:
                     self._draw_editing_highlight(y_position, edit_type, label_text, value_text)
 
             except pygame.error as e:
@@ -1559,9 +1623,8 @@ class MenuSystem:
             # Assertion: Ensure y_position remains numeric
             assert isinstance(y_position, int), "y_position is not integer"
 
-
     def _draw_editing_highlight(self, y_pos: int, edit_type: int, label_str: str, value_str: str):
-        """ Draws highlight rectangle around the specific field being edited. """
+        """ Draws highlight rectangle around the specific field or value being edited. """
         # Assertion: Font must be loaded
         assert self.font is not None, "Cannot draw highlight without main font."
         # Assertions: Check input parameters
@@ -1579,12 +1642,17 @@ class MenuSystem:
         highlight_rect = None
         try:
             # Determine the text segment corresponding to the specific field being edited
-            field_str = ""  # The text part (e.g., "2024", "08", "15", "1000")
+            field_str = ""  # The text part (e.g., "2024", "08", "15", "1000", "Radiance")
             offset_str = "" # The text *before* the field within the value string (e.g., "YYYY-", "YYYY-MM-")
 
             if edit_type == self.EDIT_TYPE_INTEGRATION:
-                 # Value is like "1000 ms". Highlight the number part.
+                 # Highlight the number part of "1000 ms"
                  field_str = str(self._integration_time_ms) # The number itself
+                 offset_str = "" # No prefix within the value part
+            # <<< NEW: Highlight Collection Mode >>>
+            elif edit_type == self.EDIT_TYPE_COLLECTION_MODE:
+                 # Highlight the entire mode string ("Raw", "Radiance", etc.)
+                 field_str = self._collection_mode # The mode string itself
                  offset_str = "" # No prefix within the value part
             elif edit_type == self.EDIT_TYPE_DATE:
                 # Assertion: Must have datetime object and field
@@ -1595,7 +1663,6 @@ class MenuSystem:
                 elif self._editing_field == self.FIELD_MONTH: field_str, offset_str = formatted_date[5:7], formatted_date[0:5] # "YYYY-"
                 elif self._editing_field == self.FIELD_DAY:   field_str, offset_str = formatted_date[8:10], formatted_date[0:8] # "YYYY-MM-"
                 else:
-                     # Should not happen due to assertions elsewhere
                      logger.error(f"Invalid editing field '{self._editing_field}' for date highlight")
                      return
             elif edit_type == self.EDIT_TYPE_TIME:
@@ -1606,12 +1673,11 @@ class MenuSystem:
                 if self._editing_field == self.FIELD_HOUR:   field_str, offset_str = formatted_time[0:2], ""
                 elif self._editing_field == self.FIELD_MINUTE: field_str, offset_str = formatted_time[3:5], formatted_time[0:3] # "HH:"
                 else:
-                    # Should not happen
                      logger.error(f"Invalid editing field '{self._editing_field}' for time highlight")
                      return
             else:
-                 logger.warning(f"Highlight requested for non-field edit type {edit_type}")
-                 return # Not an editable type with fields
+                 logger.warning(f"Highlight requested for unknown edit type {edit_type}")
+                 return
 
             # Assertions: Check string types after calculation
             assert isinstance(field_str, str), "field_str is not string"
@@ -1651,8 +1717,6 @@ class MenuSystem:
             # Assertion: Check screen exists
             assert self.screen is not None, "Screen is None, cannot draw highlight"
             pygame.draw.rect(self.screen, BLUE, highlight_rect, 1) # 1px thick border
-
-
     def _draw_hints(self):
         """Draws contextual hints at the bottom."""
         # Assertion: Font must be loaded
