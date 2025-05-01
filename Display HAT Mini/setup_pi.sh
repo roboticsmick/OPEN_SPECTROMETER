@@ -500,7 +500,6 @@ main() {
 
     update_system
     install_system_packages
-    fix_libusb_config    # Add this line to call our new function
 
     enable_spi
     setup_user_permissions
