@@ -248,7 +248,7 @@ update_system() {
 install_system_packages() {
     echo "======================================"
     echo "Installing System Packages"
-    local packages=( git git-all build-essential pkg-config libusb-1.0-0-dev libudev-dev
+    local packages=( git git-all build-essential pkg-config libusb-dev libudev-dev
                      python3-pip python3-dev python3-venv vim feh screen wireless-tools )
     echo "Installing: ${packages[@]}"
     wait_for_apt_lock
@@ -265,116 +265,6 @@ install_system_packages() {
     fi
 }
 
-# Fix libusb pkg-config configuration
-fix_libusb_config() {
-    echo "======================================"
-    echo "Fixing libusb pkg-config and include configurations"
-    
-    # Part 1: Fix pkg-config
-    # Check if libusb-1.0.pc exists
-    local libusb_pc="/usr/lib/aarch64-linux-gnu/pkgconfig/libusb-1.0.pc"
-    local libusb_link="/usr/lib/aarch64-linux-gnu/pkgconfig/libusb.pc"
-    
-    if [ -f "$libusb_pc" ]; then
-        echo "Found libusb-1.0.pc at $libusb_pc"
-        
-        # Check if the symlink already exists
-        if [ -f "$libusb_link" ]; then
-            echo "libusb.pc symlink already exists at $libusb_link"
-        else
-            echo "Creating symbolic link from libusb-1.0.pc to libusb.pc..."
-            if sudo ln -s "$libusb_pc" "$libusb_link"; then
-                echo "Symbolic link created successfully."
-            else
-                warning "Failed to create symbolic link for libusb.pc. Seabreeze installation might fail."
-            fi
-        fi
-        
-        # Verify that pkg-config can find libusb (not just libusb-1.0)
-        if pkg-config --exists libusb; then
-            echo "pkg-config can now find 'libusb': $(pkg-config --modversion libusb)"
-        else
-            warning "pkg-config still cannot find 'libusb'. Check permissions or paths."
-        fi
-    else
-        # Check other possible locations
-        local pc_dirs=("/usr/lib/pkgconfig" "/usr/share/pkgconfig" "/usr/local/lib/pkgconfig")
-        local found=false
-        local found_path=""
-        
-        for dir in "${pc_dirs[@]}"; do
-            if [ -f "$dir/libusb-1.0.pc" ]; then
-                found=true
-                found_path="$dir/libusb-1.0.pc"
-                break
-            fi
-        done
-        
-        if [ "$found" = true ]; then
-            echo "Found libusb-1.0.pc at alternate location: $found_path"
-            local target_dir=$(dirname "$found_path")
-            if sudo ln -s "$found_path" "$target_dir/libusb.pc"; then
-                echo "Symbolic link created successfully at $target_dir/libusb.pc"
-            else
-                warning "Failed to create symbolic link for libusb.pc. Seabreeze installation might fail."
-            fi
-        else
-            warning "Could not find libusb-1.0.pc in standard locations. Seabreeze installation might fail."
-            echo "Please ensure libusb-1.0-0-dev is installed correctly."
-        fi
-    fi
-
-    # Part 2: Fix for missing usb.h (from libusb-0.1)
-    echo "Checking for libusb-dev package (needed for usb.h)..."
-    
-    # First, try to install libusb-dev package which should provide usb.h
-    wait_for_apt_lock
-    if ! sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libusb-dev; then
-        warning "Failed to install libusb-dev. Will create a compatibility wrapper for usb.h."
-        
-        # Create a compatibility wrapper for usb.h
-        echo "Creating compatibility wrapper for usb.h..."
-        sudo bash -c 'cat << EOF > /usr/include/usb.h
-/* Compatibility wrapper for libusb-0.1 -> libusb-1.0 */
-#ifndef USB_H
-#define USB_H
-#warning "Using compatibility wrapper for libusb-1.0"
-#include <libusb-1.0/libusb.h>
-#endif /* USB_H */
-EOF'
-        
-        # Check if the wrapper was created successfully
-        if [ -f "/usr/include/usb.h" ]; then
-            echo "Compatibility wrapper created successfully at /usr/include/usb.h"
-        else
-            warning "Failed to create compatibility wrapper. Seabreeze installation might fail."
-        fi
-    else
-        echo "Successfully installed libusb-dev. This should provide usb.h."
-        
-        # Check if usb.h exists now
-        if [ -f "/usr/include/usb.h" ]; then
-            echo "Verified usb.h is now available at /usr/include/usb.h"
-        else
-            # If usb.h is still missing despite package installation, create the wrapper
-            warning "usb.h not found despite installing libusb-dev. Creating compatibility wrapper..."
-            sudo bash -c 'cat << EOF > /usr/include/usb.h
-/* Compatibility wrapper for libusb-0.1 -> libusb-1.0 */
-#ifndef USB_H
-#define USB_H
-#warning "Using compatibility wrapper for libusb-1.0"
-#include <libusb-1.0/libusb.h>
-#endif /* USB_H */
-EOF'
-            
-            if [ -f "/usr/include/usb.h" ]; then
-                echo "Compatibility wrapper created successfully as fallback."
-            else
-                warning "Failed to create compatibility wrapper. Seabreeze installation might fail."
-            fi
-        fi
-    fi
-}
 
 # Enable SPI interface
 enable_spi() {
