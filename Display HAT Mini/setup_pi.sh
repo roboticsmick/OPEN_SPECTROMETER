@@ -160,6 +160,84 @@ check_date_time() {
     fi
 }
 
+# Configure DS3231 RTC module
+setup_rtc() {
+    echo "======================================"
+    echo "Setting Up DS3231 RTC Module"
+    
+    # Check if I2C is enabled
+    local config_file=""
+    if [ -f /boot/firmware/config.txt ]; then 
+        config_file="/boot/firmware/config.txt"
+    elif [ -f /boot/config.txt ]; then 
+        config_file="/boot/config.txt"
+    else 
+        warning "Could not find config.txt. Cannot configure RTC automatically."
+        return
+    fi
+    
+    echo "Using config file: $config_file"
+    
+    # Add RTC overlay if not already present
+    if grep -q "dtoverlay=i2c-rtc,ds3231" "$config_file"; then
+        echo "RTC overlay already enabled in $config_file"
+    else
+        echo "Adding DS3231 RTC overlay to $config_file..."
+        echo "" | sudo tee -a "$config_file" > /dev/null
+        echo "# Enable DS3231 RTC" | sudo tee -a "$config_file" > /dev/null
+        echo "dtoverlay=i2c-rtc,ds3231" | sudo tee -a "$config_file" > /dev/null
+        echo "RTC overlay added. Will take effect after reboot."
+    fi
+    
+    # Remove fake-hwclock if installed
+    echo "Checking for fake-hwclock..."
+    if dpkg -l | grep -q fake-hwclock; then
+        echo "Removing fake-hwclock package..."
+        wait_for_apt_lock
+        sudo apt-get -y remove fake-hwclock
+        sudo update-rc.d -f fake-hwclock remove
+    else
+        echo "fake-hwclock package not installed. Skipping removal."
+    fi
+    
+    # Modify the hwclock-set file to work with hardware RTC
+    echo "Configuring hwclock-set file..."
+    local hwclock_set="/lib/udev/hwclock-set"
+    
+    if [ -f "$hwclock_set" ]; then
+        # Make a backup if not already done
+        if [ ! -f "${hwclock_set}.backup" ]; then
+            sudo cp "$hwclock_set" "${hwclock_set}.backup"
+            echo "Created backup of original hwclock-set file: ${hwclock_set}.backup"
+        fi
+        
+        # Comment out problematic lines
+        echo "Modifying hwclock-set to work with hardware RTC..."
+        # Comment out the systemd condition
+        sudo sed -i 's/^if \[ -e \/run\/systemd\/system \] ; then/\#if \[ -e \/run\/systemd\/system \] ; then/g' "$hwclock_set"
+        sudo sed -i 's/^    exit 0/\#    exit 0/g' "$hwclock_set"
+        sudo sed -i 's/^fi/\#fi/g' "$hwclock_set"
+        
+        # Comment out the udev condition as well
+        sudo sed -i 's/^if \[ -e \/run\/udev\/hwclock-set \] ; then/\#if \[ -e \/run\/udev\/hwclock-set \] ; then/g' "$hwclock_set"
+        
+        echo "hwclock-set file has been configured for hardware RTC."
+    else
+        warning "hwclock-set file not found at $hwclock_set. Manual configuration may be needed."
+    fi
+    
+    # Note about setting the hardware clock
+    echo ""
+    echo "Note: After system time is set correctly (either manually or via NTP),"
+    echo "you should set the hardware RTC from the system time with:"
+    echo "  sudo hwclock -w"
+    echo ""
+    echo "After reboot, verify RTC is working with:"
+    echo "  sudo hwclock -r"
+    echo "  ls -l /dev/rtc*"
+    echo "  lsmod | grep rtc"
+}
+
 # Configure swap space
 configure_swap() {
     echo "======================================"
@@ -495,6 +573,7 @@ main() {
     install_system_packages
 
     enable_spi
+    setup_rtc       # Add this line to call the new RTC setup function
     setup_user_permissions
 
     configure_terminal
@@ -506,6 +585,11 @@ main() {
     setup_seabreeze_udev # Uses command from venv
 
     verify_setup # Checks venv imports
+
+    # Set hardware RTC from system time (if the system time was set correctly)
+    echo "Setting hardware RTC from system time..."
+    sudo hwclock -w
+    echo "Hardware RTC set to: $(sudo hwclock -r)"
 
     echo ""
     echo "====================================="
@@ -531,8 +615,11 @@ main() {
     echo "5. Place your Python scripts inside '$PROJECT_DIR_PATH'."
     echo "6. Check seabreeze device detection (activate venv, plug in device):"
     echo "   python -m seabreeze.cseabreeze_backend ListDevices"
+    echo ""
+    echo "7. Verify RTC is working after reboot:"
+    echo "   sudo hwclock -r"
+    echo "   ls -l /dev/rtc*"
     echo "====================================="
 }
-
 # Execute the main function
 main
