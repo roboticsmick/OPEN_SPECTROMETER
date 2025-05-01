@@ -268,8 +268,9 @@ install_system_packages() {
 # Fix libusb pkg-config configuration
 fix_libusb_config() {
     echo "======================================"
-    echo "Fixing libusb pkg-config configuration"
+    echo "Fixing libusb pkg-config and include configurations"
     
+    # Part 1: Fix pkg-config
     # Check if libusb-1.0.pc exists
     local libusb_pc="/usr/lib/aarch64-linux-gnu/pkgconfig/libusb-1.0.pc"
     local libusb_link="/usr/lib/aarch64-linux-gnu/pkgconfig/libusb.pc"
@@ -320,6 +321,57 @@ fix_libusb_config() {
         else
             warning "Could not find libusb-1.0.pc in standard locations. Seabreeze installation might fail."
             echo "Please ensure libusb-1.0-0-dev is installed correctly."
+        fi
+    fi
+
+    # Part 2: Fix for missing usb.h (from libusb-0.1)
+    echo "Checking for libusb-dev package (needed for usb.h)..."
+    
+    # First, try to install libusb-dev package which should provide usb.h
+    wait_for_apt_lock
+    if ! sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libusb-dev; then
+        warning "Failed to install libusb-dev. Will create a compatibility wrapper for usb.h."
+        
+        # Create a compatibility wrapper for usb.h
+        echo "Creating compatibility wrapper for usb.h..."
+        sudo bash -c 'cat << EOF > /usr/include/usb.h
+/* Compatibility wrapper for libusb-0.1 -> libusb-1.0 */
+#ifndef USB_H
+#define USB_H
+#warning "Using compatibility wrapper for libusb-1.0"
+#include <libusb-1.0/libusb.h>
+#endif /* USB_H */
+EOF'
+        
+        # Check if the wrapper was created successfully
+        if [ -f "/usr/include/usb.h" ]; then
+            echo "Compatibility wrapper created successfully at /usr/include/usb.h"
+        else
+            warning "Failed to create compatibility wrapper. Seabreeze installation might fail."
+        fi
+    else
+        echo "Successfully installed libusb-dev. This should provide usb.h."
+        
+        # Check if usb.h exists now
+        if [ -f "/usr/include/usb.h" ]; then
+            echo "Verified usb.h is now available at /usr/include/usb.h"
+        else
+            # If usb.h is still missing despite package installation, create the wrapper
+            warning "usb.h not found despite installing libusb-dev. Creating compatibility wrapper..."
+            sudo bash -c 'cat << EOF > /usr/include/usb.h
+/* Compatibility wrapper for libusb-0.1 -> libusb-1.0 */
+#ifndef USB_H
+#define USB_H
+#warning "Using compatibility wrapper for libusb-1.0"
+#include <libusb-1.0/libusb.h>
+#endif /* USB_H */
+EOF'
+            
+            if [ -f "/usr/include/usb.h" ]; then
+                echo "Compatibility wrapper created successfully as fallback."
+            else
+                warning "Failed to create compatibility wrapper. Seabreeze installation might fail."
+            fi
         fi
     fi
 }
