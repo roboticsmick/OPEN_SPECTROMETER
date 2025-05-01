@@ -265,6 +265,65 @@ install_system_packages() {
     fi
 }
 
+# Fix libusb pkg-config configuration
+fix_libusb_config() {
+    echo "======================================"
+    echo "Fixing libusb pkg-config configuration"
+    
+    # Check if libusb-1.0.pc exists
+    local libusb_pc="/usr/lib/aarch64-linux-gnu/pkgconfig/libusb-1.0.pc"
+    local libusb_link="/usr/lib/aarch64-linux-gnu/pkgconfig/libusb.pc"
+    
+    if [ -f "$libusb_pc" ]; then
+        echo "Found libusb-1.0.pc at $libusb_pc"
+        
+        # Check if the symlink already exists
+        if [ -f "$libusb_link" ]; then
+            echo "libusb.pc symlink already exists at $libusb_link"
+        else
+            echo "Creating symbolic link from libusb-1.0.pc to libusb.pc..."
+            if sudo ln -s "$libusb_pc" "$libusb_link"; then
+                echo "Symbolic link created successfully."
+            else
+                warning "Failed to create symbolic link for libusb.pc. Seabreeze installation might fail."
+            fi
+        fi
+        
+        # Verify that pkg-config can find libusb (not just libusb-1.0)
+        if pkg-config --exists libusb; then
+            echo "pkg-config can now find 'libusb': $(pkg-config --modversion libusb)"
+        else
+            warning "pkg-config still cannot find 'libusb'. Check permissions or paths."
+        fi
+    else
+        # Check other possible locations
+        local pc_dirs=("/usr/lib/pkgconfig" "/usr/share/pkgconfig" "/usr/local/lib/pkgconfig")
+        local found=false
+        local found_path=""
+        
+        for dir in "${pc_dirs[@]}"; do
+            if [ -f "$dir/libusb-1.0.pc" ]; then
+                found=true
+                found_path="$dir/libusb-1.0.pc"
+                break
+            fi
+        done
+        
+        if [ "$found" = true ]; then
+            echo "Found libusb-1.0.pc at alternate location: $found_path"
+            local target_dir=$(dirname "$found_path")
+            if sudo ln -s "$found_path" "$target_dir/libusb.pc"; then
+                echo "Symbolic link created successfully at $target_dir/libusb.pc"
+            else
+                warning "Failed to create symbolic link for libusb.pc. Seabreeze installation might fail."
+            fi
+        else
+            warning "Could not find libusb-1.0.pc in standard locations. Seabreeze installation might fail."
+            echo "Please ensure libusb-1.0-0-dev is installed correctly."
+        fi
+    fi
+}
+
 # Enable SPI interface
 enable_spi() {
     echo "======================================"
@@ -499,6 +558,7 @@ main() {
 
     update_system
     install_system_packages
+    fix_libusb_config    # Add this line to call our new function
 
     enable_spi
     setup_user_permissions
