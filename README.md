@@ -145,6 +145,8 @@ python3 main.py
 
 Schematic and broad design can be found in PCB folder. 
 
+![image](https://github.com/user-attachments/assets/a64ad8f9-ed21-4b6f-b43d-9462d401118d)
+
 ![image](https://github.com/user-attachments/assets/7c0f146f-47bb-43a3-b808-453892763aac)
 
 Leak sensor is based on the Blue Robotics leak sensor and uses Blue Robotics SOS leak sensor probes.
