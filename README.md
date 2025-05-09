@@ -63,8 +63,46 @@ ssh -X pi@<IP>
 ```
 Enter password: spectro
 
-### Setting up the Raspberry Pi software for the LCD
+### Add a new wifi connection
 
+1. Insert the SD card into your computer.
+2. Navigate to the root filesystem on the SD card. You should see a directory structure similar to a Linux system.
+3. Find and edit the network configuration file. On Ubuntu 22.04 Server, this is typically located at /etc/netplan/50-cloud-init.yaml (or similar).
+4. Open this file with a text editor. On Ubuntu: 
+
+```sh
+sudo vim 50-cloud-init.yaml
+```
+
+If you're on Windows, make sure to use an editor that preserves Linux line endings (like Notepad++, VS Code, etc.). 
+5. Add your new WiFi network to the existing configuration. Here's an example of how to modify the file:
+
+```sh
+# This file is generated from information provided by the datasource.  Changes
+# to it will not persist across an instance reboot.  To disable cloud-init's
+# network configuration capabilities, write a file
+# /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg with the following:
+# network: {config: disabled}
+network:
+    version: 2
+    wifis:
+        renderer: networkd
+        wlan0:
+            access-points:
+                wifi_name:
+                    password: password
+                new_wifi_name:
+                    password: new_password
+            dhcp4: true
+            optional: true
+```
+Make sure the indentation is consistent. 
+
+6 If using the vim editor save (esc -> shift + : -> wq -> enter)
+7. Insert the SD card back in the Pi and power it on. 
+8. If you did it correctly it will show the new wifi connection and the IP address in the menu.
+
+### Setting up the Raspberry Pi software for the LCD
 
 ```sh
 cd
