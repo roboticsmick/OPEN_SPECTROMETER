@@ -11791,6 +11791,7 @@ Created by Ella Wu 2024-03-08&lt;br&gt;
 <part name="GND4" library="_L_Symbols" library_urn="urn:adsk.wipprod:fs.file:vf.5DBbLlRNS2mpwKCAG8bHJA" deviceset="GND" device=""/>
 <part name="GND14" library="_L_Symbols" library_urn="urn:adsk.wipprod:fs.file:vf.5DBbLlRNS2mpwKCAG8bHJA" deviceset="GND" device=""/>
 <part name="FR1" library="_L_Symbols" library_urn="urn:adsk.wipprod:fs.file:vf.5DBbLlRNS2mpwKCAG8bHJA" deviceset="SCH-FRAME-BIG" device=""/>
+<part name="GND18" library="_L_Symbols" library_urn="urn:adsk.wipprod:fs.file:vf.5DBbLlRNS2mpwKCAG8bHJA" deviceset="GND" device=""/>
 </parts>
 <sheets>
 <sheet>
@@ -12006,6 +12007,9 @@ Created by Ella Wu 2024-03-08&lt;br&gt;
 <attribute name="SHEET" x="373.38" y="5.08" size="1.778" layer="94" font="vector" ratio="10"/>
 <attribute name="LAST_DATE_TIME" x="313.69" y="5.08" size="1.778" layer="94" ratio="10"/>
 </instance>
+<instance part="GND18" gate="1" x="68.58" y="182.88" smashed="yes">
+<attribute name="VALUE" x="68.58" y="181.356" size="1.27" layer="96" font="vector" align="top-center"/>
+</instance>
 </instances>
 <busses>
 </busses>
@@ -12184,6 +12188,11 @@ Created by Ella Wu 2024-03-08&lt;br&gt;
 <pinref part="D4" gate="G$1" pin="C"/>
 <wire x1="93.98" y1="187.96" x2="93.98" y2="185.42" width="0.1524" layer="91"/>
 <pinref part="GND14" gate="1" pin="BGND"/>
+</segment>
+<segment>
+<wire x1="68.58" y1="193.04" x2="68.58" y2="185.42" width="0.1524" layer="91"/>
+<pinref part="GND18" gate="1" pin="BGND"/>
+<pinref part="D3" gate="G$1" pin="C1"/>
 </segment>
 </net>
 <net name="3.3V" class="0">
