@@ -141,6 +141,12 @@ source venv/bin/activate
 python3 main.py
 ```
 
+## Raspberry Pi breakout PCB
+
+Schematic and broad design can be found in PCB folder.
+
+![image](https://github.com/user-attachments/assets/7c0f146f-47bb-43a3-b808-453892763aac)
+
 
 
 
