@@ -143,10 +143,12 @@ python3 main.py
 
 ## Raspberry Pi breakout PCB
 
-Schematic and broad design can be found in PCB folder.
+Schematic and broad design can be found in PCB folder. 
 
 ![image](https://github.com/user-attachments/assets/7c0f146f-47bb-43a3-b808-453892763aac)
 
+Leak sensor is based on the Blue Robotics leak sensor and uses Blue Robotics SOS leak sensor probes.
 
+![image](https://github.com/user-attachments/assets/3c34cd6f-63d9-44bc-a1fa-a32ff59414d8)
 
 
