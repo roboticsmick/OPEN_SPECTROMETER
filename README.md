@@ -143,7 +143,9 @@ python3 main.py
 
 ## Raspberry Pi breakout PCB
 
-Schematic and broad design can be found in PCB folder. 
+A custom PCB was built to add a USB-C power input, power switch, real time clock (RTC) and battery, leak sensor and button inputs. An I2C and UART breakout was also added.
+
+This complete schematic and board design can be found in the PCB folder. 
 
 ![image](https://github.com/user-attachments/assets/a64ad8f9-ed21-4b6f-b43d-9462d401118d)
 
