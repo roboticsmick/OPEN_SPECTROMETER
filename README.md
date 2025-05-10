@@ -4,7 +4,7 @@ This library allows you to use the Ocean Optics ST-VIS range of spectrometers us
 
 Lots of love to the the people working on keeping the PySeabreeze API alive. This let me get the Ocena Optic Spectrometer working on an ARM device. 
 
-## Installing Pyseabreeze on PC
+## Installing Pyseabreeze on Ubuntu PC for testing the spectrometer
 
 ```sh
 cd
