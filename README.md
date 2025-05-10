@@ -143,7 +143,7 @@ python3 main.py
 
 ## Raspberry Pi breakout PCB
 
-A custom PCB was built to add a USB-C power input, power switch, real time clock (RTC) and battery, leak sensor and button inputs. An I2C and UART breakout was also added.
+A custom PCB was built to add a USB-C power input, Blue Robotics waterproof power switch, real time clock (RTC) and battery, leak sensor and button inputs. An I2C and UART breakout was also added just for fun.
 
 This complete schematic and board design can be found in the PCB folder. 
 
@@ -154,5 +154,10 @@ This complete schematic and board design can be found in the PCB folder.
 Leak sensor is based on the Blue Robotics leak sensor and uses Blue Robotics SOS leak sensor probes.
 
 ![image](https://github.com/user-attachments/assets/3c34cd6f-63d9-44bc-a1fa-a32ff59414d8)
+
+RTC is based on Adafruit's I2C DS3231 module.
+
+![image](https://github.com/user-attachments/assets/7edfee91-a727-4598-ba51-139883b82f8c)
+
 
 
