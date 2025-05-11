@@ -1547,22 +1547,29 @@ class MenuSystem:
 class SpectrometerScreen:
     """
     Handles the spectrometer live view, capture, saving, and state management.
-    Includes adjustable Y-axis scaling, integration time scaling workaround,
-    and a simplified state-based calibration workflow.
+    Calibration (Dark/White) now follows a freeze-review-save model similar to sample capture.
     """
-    # Internal state flags
-    STATE_LIVE_VIEW = "live"
-    STATE_FROZEN_VIEW = "frozen"
-    STATE_CALIBRATE = "calibrate"
-    STATE_WHITE_REF_SETUP = "white_setup"
-    STATE_DARK_CAPTURE = "dark_capture"
+    # --- Internal State Flags ---
+    STATE_LIVE_VIEW = "live_view" # Main live view (Raw/Reflectance as per menu)
+    STATE_CALIBRATE = "calibrate_menu" # Intermediate menu to choose Dark/White setup
+
+    STATE_DARK_CAPTURE_SETUP = "dark_setup" # Live raw view, preparing for Dark capture
+    STATE_WHITE_CAPTURE_SETUP = "white_setup" # Live raw view, preparing for White capture
+
+    # Generic frozen state for OOI, Dark, or White captures
+    STATE_FROZEN_VIEW = "frozen_view"
+
+    # --- Constants for Frozen Capture Types ---
+    FROZEN_TYPE_OOI = "OOI" # Represents a sample capture (Raw or Reflectance)
+    FROZEN_TYPE_DARK = "DARK"
+    FROZEN_TYPE_WHITE = "WHITE"
+
 
     def __init__(self, screen: pygame.Surface, button_handler: ButtonHandler, menu_system: MenuSystem, display_hat_obj):
         # Assertions for parameters
         assert screen is not None, "Screen object is required for SpectrometerScreen"
         assert button_handler is not None, "ButtonHandler object is required for SpectrometerScreen"
         assert menu_system is not None, "MenuSystem object is required for SpectrometerScreen"
-        # display_hat_obj can be None, handled by update_hardware_display
 
         self.screen = screen
         self.button_handler = button_handler
@@ -1570,43 +1577,38 @@ class SpectrometerScreen:
         self.display_hat = display_hat_obj
 
         self.spectrometer: Spectrometer | None = None
-        self.wavelengths: np.ndarray | None = None # Ensure type hint consistency
+        self.wavelengths: np.ndarray | None = None
         self._initialize_spectrometer_device()
 
         self.plot_fig: plt.Figure | None = None
         self.plot_ax: plt.Axes | None = None
         self.plot_line: plt.Line2D | None = None
-        # self.plot_buffer = None # io.BytesIO is created and closed locally in _capture_and_plot
         self._initialize_plot()
 
         self.overlay_font: pygame.font.Font | None = None
         self._load_overlay_font()
 
         self.is_active = False
-        self._current_state = self.STATE_LIVE_VIEW
+        self._current_state = self.STATE_LIVE_VIEW # Initial state
         self._last_integration_time_ms = 0
 
+        # --- Frozen Data Storage (used by OOI, Dark, and White captures) ---
         self._frozen_intensities: np.ndarray | None = None
         self._frozen_wavelengths: np.ndarray | None = None
         self._frozen_timestamp: datetime.datetime | None = None
-        self._frozen_integration_time_ms: int | None = None
+        self._frozen_integration_ms: int | None = None
+        self._frozen_capture_type: str | None = None # Stores FROZEN_TYPE_OOI, _DARK, or _WHITE
+        self._frozen_sample_collection_mode: str | None = None # Specific for OOI: "RAW" or "REFLECTANCE"
 
         self._current_y_max: float = float(Y_AXIS_DEFAULT_MAX)
+        self._scans_today_count: int = 0
 
-        self._stored_white_reference: np.ndarray | None = None
-        self._white_ref_capture_timestamp: datetime.datetime | None = None
-        self._white_ref_integration_ms: int | None = None
-
-        self._scans_today_count: int = 0 # <<< NEW: Initialize scans today counter
-
-        # Ensure data directories exist on init to avoid race conditions later
         try:
             os.makedirs(DATA_DIR, exist_ok=True)
         except OSError as e:
             logger.error(f"Could not create base data directory {DATA_DIR} on SpectrometerScreen init: {e}")
-        except Exception as e_mkdir: # Catch any other unexpected error
+        except Exception as e_mkdir:
             logger.error(f"Unexpected error creating data directory {DATA_DIR}: {e_mkdir}")
-
 
     def _initialize_spectrometer_device(self):
             """Finds the first available spectrometer device and stores the object."""
@@ -1622,25 +1624,22 @@ class SpectrometerScreen:
                     self.spectrometer = None
                     return
 
-                # Attempt to create Spectrometer instance from the first device
                 self.spectrometer = Spectrometer.from_serial_number(devices[0].serial_number)
-                if self.spectrometer is None: # Should not happen if from_serial_number succeeds or raises
+                if self.spectrometer is None:
                     logger.error("Failed to create Spectrometer instance (returned None).")
                     return
 
-                # pyseabreeze specific check for backend device
                 if not hasattr(self.spectrometer, '_dev'):
                     logger.error("Spectrometer object initialized but missing '_dev' backend attribute (pyseabreeze).")
-                    self.spectrometer = None # Invalidate if backend is missing
+                    self.spectrometer = None
                     return
 
                 self.wavelengths = self.spectrometer.wavelengths()
                 if self.wavelengths is None or len(self.wavelengths) == 0:
                     logger.error("Failed to get wavelengths from spectrometer.")
-                    self.spectrometer = None # Invalidate if wavelengths are bad
+                    self.spectrometer = None
                     return
 
-                # Assertions for successful initialization
                 assert isinstance(self.spectrometer, Spectrometer), "Spectrometer object is not of expected type."
                 assert isinstance(self.wavelengths, np.ndarray) and self.wavelengths.size > 0, "Wavelengths are not a valid numpy array."
 
@@ -1649,7 +1648,7 @@ class SpectrometerScreen:
                 logger.info(f"  Serial: {self.spectrometer.serial_number}")
                 logger.info(f"  Wavelength range: {self.wavelengths[0]:.1f} nm to {self.wavelengths[-1]:.1f} nm ({len(self.wavelengths)} points)")
 
-                try: # Get integration time limits
+                try:
                     limits_tuple = self.spectrometer.integration_time_micros_limits
                     if isinstance(limits_tuple, tuple) and len(limits_tuple) == 2:
                         min_integ, max_integ = limits_tuple
@@ -1661,10 +1660,10 @@ class SpectrometerScreen:
                 except Exception as e_int_limits:
                     logger.warning(f"  Could not query integration time limits: {e_int_limits}")
 
-            except sb.SeaBreezeError as e_sb: # Catch specific seabreeze errors
+            except sb.SeaBreezeError as e_sb:
                 logger.error(f"SeaBreezeError initializing spectrometer device: {e_sb}", exc_info=True)
                 self.spectrometer = None
-            except Exception as e: # Catch any other unexpected errors
+            except Exception as e:
                 logger.error(f"Unexpected error initializing spectrometer device: {e}", exc_info=True)
                 self.spectrometer = None
 
@@ -1675,14 +1674,12 @@ class SpectrometerScreen:
                 return
             logger.debug("Initializing Matplotlib plot for SpectrometerScreen...")
             try:
-                # Define plot dimensions carefully
                 plot_width_px = SCREEN_WIDTH
-                plot_height_px = SCREEN_HEIGHT - 45 # Adjusted for more text overlays
-                dpi = float(self.screen.get_width() / 3.33) if self.screen else 96.0 # approx 3.33 inches width
+                plot_height_px = SCREEN_HEIGHT - 45
+                dpi = float(self.screen.get_width() / 3.33) if self.screen else 96.0
 
                 figsize_inches_w = plot_width_px / dpi
                 figsize_inches_h = plot_height_px / dpi
-                # Assertion: Ensure figsize components are positive
                 assert figsize_inches_w > 0 and figsize_inches_h > 0, "Calculated figsize must be positive."
 
                 self.plot_fig, self.plot_ax = plt.subplots(figsize=(figsize_inches_w, figsize_inches_h), dpi=dpi)
@@ -1690,32 +1687,29 @@ class SpectrometerScreen:
                 if not self.plot_fig or not self.plot_ax:
                     raise RuntimeError("plt.subplots failed to return figure and/or axes.")
 
-                (self.plot_line,) = self.plot_ax.plot([], [], linewidth=1.0, color='cyan') # Ensure float for linewidth
+                (self.plot_line,) = self.plot_ax.plot([], [], linewidth=1.0, color='cyan')
                 if not self.plot_line:
                     raise RuntimeError("plot_ax.plot failed to return a line object.")
 
-                # Styling
                 self.plot_ax.grid(True, linestyle=":", alpha=0.6, color='gray')
-                self.plot_ax.tick_params(axis='both', which='major', labelsize=8, colors='white') # Smaller labelsize
+                self.plot_ax.tick_params(axis='both', which='major', labelsize=8, colors='white')
                 self.plot_ax.set_xlabel("Wavelength (nm)", fontsize=9, color='white')
                 self.plot_ax.set_ylabel("Intensity", fontsize=9, color='white')
                 self.plot_fig.patch.set_facecolor('black')
                 self.plot_ax.set_facecolor('black')
 
-                # Set spine colors
                 spines_to_color = ['top', 'bottom', 'left', 'right']
-                # Bounded loop (fixed number of spines)
                 for spine_key in spines_to_color:
                     self.plot_ax.spines[spine_key].set_color('gray')
 
-                self.plot_fig.tight_layout(pad=0.3) # Reduced padding
+                self.plot_fig.tight_layout(pad=0.3)
                 logger.debug("Matplotlib plot initialized successfully with styling.")
 
-            except RuntimeError as e_rt: # Catch specific runtime errors from checks
+            except RuntimeError as e_rt:
                  logger.error(f"Runtime error during plot initialization: {e_rt}", exc_info=True)
                  if self.plot_fig and plt and plt.fignum_exists(self.plot_fig.number): plt.close(self.plot_fig)
                  self.plot_fig = self.plot_ax = self.plot_line = None
-            except Exception as e: # Catch any other unexpected errors
+            except Exception as e:
                 logger.error(f"Failed to initialize Matplotlib plot: {e}", exc_info=True)
                 if self.plot_fig and plt and plt.fignum_exists(self.plot_fig.number): plt.close(self.plot_fig)
                 self.plot_fig = self.plot_ax = self.plot_line = None
@@ -1725,14 +1719,11 @@ class SpectrometerScreen:
         if not pygame.font.get_init():
             logger.info("Pygame font module not initialized. Initializing now for overlay_font.")
             pygame.font.init()
-        # Assertion: Pygame font module must be initialized
         assert pygame.font.get_init(), "Pygame font module failed to initialize."
-
         try:
             script_dir = os.path.dirname(os.path.abspath(__file__))
             assets_dir = os.path.join(script_dir, 'assets')
             font_path = os.path.join(assets_dir, SPECTRO_FONT_FILENAME)
-            # Assertion: Check path is string
             assert isinstance(font_path, str), "Overlay font path is not a string"
 
             if not os.path.isfile(font_path):
@@ -1741,14 +1732,13 @@ class SpectrometerScreen:
             else:
                 self.overlay_font = pygame.font.Font(font_path, SPECTRO_FONT_SIZE)
 
-            if self.overlay_font is None: # Should be caught by SysFont if Font() fails and path is invalid
+            if self.overlay_font is None:
                 raise RuntimeError("Font loading returned None even after attempting fallback.")
             logger.info(f"Loaded overlay font: {SPECTRO_FONT_FILENAME} (Size: {SPECTRO_FONT_SIZE})")
-
-        except RuntimeError as e_rt: # Catch specific runtime errors from checks
+        except RuntimeError as e_rt:
             logger.error(f"Runtime error loading overlay font: {e_rt}", exc_info=True)
-            self.overlay_font = None # Ensure it's None on critical failure
-        except pygame.error as e_pygame: # Catch Pygame-specific errors
+            self.overlay_font = None
+        except pygame.error as e_pygame:
             logger.error(f"Pygame error loading overlay font: {e_pygame}. Attempting SysFont.", exc_info=True)
             try:
                 self.overlay_font = pygame.font.SysFont(None, SPECTRO_FONT_SIZE)
@@ -1756,37 +1746,36 @@ class SpectrometerScreen:
             except Exception as e_sysfont:
                 logger.critical(f"CRITICAL: Could not load any overlay font, SysFont fallback failed: {e_sysfont}")
                 self.overlay_font = None
-        except Exception as e: # Catch any other unexpected errors
+        except Exception as e:
             logger.error(f"Unexpected error loading overlay font: {e}", exc_info=True)
-            self.overlay_font = None # Ensure it's None on failure
+            self.overlay_font = None
+
+    def _clear_frozen_data(self):
+        """Clears all temporarily stored frozen spectrum data."""
+        self._frozen_intensities = None
+        self._frozen_wavelengths = None
+        self._frozen_timestamp = None
+        self._frozen_integration_ms = None
+        self._frozen_capture_type = None
+        self._frozen_sample_collection_mode = None
+        logger.debug("Cleared all frozen spectrum data.")
 
     def activate(self):
         """Called when switching to this screen. Tries to open device and init scan count."""
         logger.info("Activating Spectrometer Screen.")
         self.is_active = True
-        self._current_state = self.STATE_LIVE_VIEW
-        self._frozen_intensities = None
-        self._frozen_wavelengths = None
-        self._frozen_timestamp = None
-        self._frozen_integration_time_ms = None
-        self._stored_white_reference = None
-        self._white_ref_capture_timestamp = None
-        self._white_ref_integration_ms = None
+        self._current_state = self.STATE_LIVE_VIEW # Always start in main live view
+        self._clear_frozen_data() # Ensure no stale frozen data
         self._current_y_max = float(Y_AXIS_DEFAULT_MAX)
         logger.debug(f"Y-axis max reset to default: {self._current_y_max}")
 
-        # --- Initialize/Update scans_today_count ---
-        # Assertion: menu_system must be available
         assert self.menu_system is not None, "MenuSystem is None during SpectrometerScreen activation."
         try:
-            # Use menu_system's timestamp to ensure consistency with saved data timestamps for date matching
             current_app_datetime = self.menu_system.get_timestamp_datetime()
             today_date_str = current_app_datetime.strftime("%Y-%m-%d")
-
             daily_folder_path = os.path.join(DATA_DIR, today_date_str)
             csv_filename_dated = f"{today_date_str}_{CSV_BASE_FILENAME}"
             csv_filepath = os.path.join(daily_folder_path, csv_filename_dated)
-            # Assertion: check path components
             assert isinstance(daily_folder_path, str) and isinstance(csv_filename_dated, str), "CSV path components are not strings."
 
             current_scan_count = 0
@@ -1795,32 +1784,28 @@ class SpectrometerScreen:
                 try:
                     with open(csv_filepath, 'r', newline='') as f_check:
                         reader = csv.reader(f_check)
-                        header = next(reader, None) # Read/skip header
-                        if header: # File has at least a header
-                            # Count remaining data rows
-                            # Loop bounded by number of lines in CSV file
-                            for _row in reader: # Explicitly name _row to indicate it's used for iteration count
+                        header = next(reader, None)
+                        if header:
+                            for _row in reader:
                                 line_count_for_day += 1
                     current_scan_count = line_count_for_day
                     logger.info(f"Found {current_scan_count} existing scans in today's log: {csv_filepath}")
-                except StopIteration: # Handles empty file or file with only header
+                except StopIteration:
                     logger.info(f"Log file {csv_filepath} exists but is empty or has only a header. Scan count is 0.")
                     current_scan_count = 0
                 except csv.Error as e_csv_read:
                     logger.error(f"CSVError reading existing log file {csv_filepath} for scan count: {e_csv_read}. Count may be inaccurate.")
-                    current_scan_count = 0 # Default to 0 on CSV read error
-                except Exception as e_file_read: # Catch other file reading errors
+                    current_scan_count = 0
+                except Exception as e_file_read:
                     logger.error(f"Error reading existing log file {csv_filepath} for scan count: {e_file_read}. Count may be inaccurate.")
-                    current_scan_count = 0 # Default to 0
+                    current_scan_count = 0
             else:
                 logger.info(f"No existing log file for today found at {csv_filepath}. Scan count starts at 0.")
             self._scans_today_count = current_scan_count
         except Exception as e_scan_count_init:
             logger.error(f"Error initializing 'scans today' count: {e_scan_count_init}. Defaulting to 0.")
-            self._scans_today_count = 0 # Fallback on any unexpected error
+            self._scans_today_count = 0
         logger.info(f"Scans today initialized to: {self._scans_today_count}")
-        # --- End scans_today_count initialization ---
-
 
         if not USE_SPECTROMETER:
             logger.warning("Spectrometer use is disabled in configuration.")
@@ -1839,7 +1824,6 @@ class SpectrometerScreen:
                 logger.info(f"Opening spectrometer connection: {self.spectrometer.serial_number}")
                 self.spectrometer.open()
                 logger.info("Spectrometer connection opened.")
-                # Set initial integration time after opening
                 self._last_integration_time_ms = self.menu_system.get_integration_time_ms()
                 integration_micros_scaled = int((self._last_integration_time_ms * 1000) * INTEGRATION_TIME_SCALE_FACTOR)
                 logger.debug(f"ACTIVATE: Sending scaled integration time: {integration_micros_scaled} µs (target {self._last_integration_time_ms} ms)")
@@ -1847,7 +1831,6 @@ class SpectrometerScreen:
                 logger.info(f"Initial integration time set to target: {self._last_integration_time_ms} ms")
             else:
                 logger.info("Spectrometer connection already open.")
-                # Sync integration time if it changed in menu while screen was inactive
                 current_menu_integ_ms = self.menu_system.get_integration_time_ms()
                 if current_menu_integ_ms != self._last_integration_time_ms:
                     integration_micros_scaled = int((current_menu_integ_ms * 1000) * INTEGRATION_TIME_SCALE_FACTOR)
@@ -1857,38 +1840,30 @@ class SpectrometerScreen:
                     logger.info(f"Synced integration time to target: {current_menu_integ_ms} ms")
         except sb.SeaBreezeError as e_sb_open:
             logger.error(f"SeaBreezeError during spectrometer activation/open: {e_sb_open}", exc_info=True)
-        except usb.core.USBError as e_usb: # pyusb can raise this
+        except usb.core.USBError as e_usb:
             logger.error(f"USB Error opening spectrometer: [{getattr(e_usb, 'errno', 'N/A')}] {getattr(e_usb, 'strerror', str(e_usb))}", exc_info=True)
-        except AttributeError as e_attr: # e.g. if _dev or is_open missing
+        except AttributeError as e_attr:
             logger.error(f"Attribute error during spectrometer activation: {e_attr}", exc_info=True)
-        except Exception as e: # Catch any other unexpected error
+        except Exception as e:
             logger.error(f"Unexpected error activating spectrometer: {e}", exc_info=True)
 
     def deactivate(self):
         """Called when switching away from this screen."""
         logger.info("Deactivating Spectrometer Screen.")
         self.is_active = False
-        # Clear temporary data, but _scans_today_count persists until next activate or app restart
-        self._frozen_intensities = None
-        self._frozen_wavelengths = None
-        self._frozen_timestamp = None
-        self._frozen_integration_time_ms = None
-        self._stored_white_reference = None
-        self._white_ref_capture_timestamp = None
-        self._white_ref_integration_ms = None
+        self._clear_frozen_data()
         self._current_state = self.STATE_LIVE_VIEW # Reset state for next activation
+        # _scans_today_count persists for the duration of the app being open.
 
     def handle_input(self) -> str | None:
         """Processes button inputs for the spectrometer screen based on state."""
-        # Assertion: button_handler must be available
         assert self.button_handler is not None, "ButtonHandler is None in SpectrometerScreen.handle_input"
-
         pygame_event_result = self.button_handler.process_pygame_events()
         if pygame_event_result == "QUIT":
             logger.info("QUIT signal from Pygame events received in SpectrometerScreen.")
             return "QUIT"
 
-        action_result: str | None = None # Explicitly type hint
+        action_result: str | None = None
         device_proxy = getattr(self.spectrometer, '_dev', None)
         spec_ready = (
             self.spectrometer is not None and
@@ -1896,362 +1871,198 @@ class SpectrometerScreen:
             hasattr(device_proxy, 'is_open') and
             device_proxy.is_open
         )
-
-        current_state_local = self._current_state # Use local copy for decisions in this call
+        current_state_local = self._current_state
 
         if current_state_local == self.STATE_LIVE_VIEW:
-            if self.button_handler.check_button(BTN_ENTER):
-                if spec_ready: self._handle_freeze_capture()
-                else: logger.warning("Freeze ignored: Spectrometer not ready.")
-            elif self.button_handler.check_button(BTN_BACK):
-                action_result = "BACK_TO_MENU"
-            elif self.button_handler.check_button(BTN_DOWN): # Y-button for rescale
-                if spec_ready: self._rescale_y_axis(relative=False)
-                else: logger.warning("Rescale ignored: Spectrometer not ready.")
-            elif self.button_handler.check_button(BTN_UP): # X-button for Calibrate mode
-                logger.info("Entering Calibrate mode.")
+            if self.button_handler.check_button(BTN_ENTER): # A: Freeze Sample (OOI)
+                if spec_ready: self._perform_freeze_capture(self.FROZEN_TYPE_OOI)
+                else: logger.warning("Freeze Sample ignored: Spectrometer not ready.")
+            elif self.button_handler.check_button(BTN_UP): # X: Enter Calibrate Menu
+                logger.info("Entering Calibrate Menu.")
                 self._current_state = self.STATE_CALIBRATE
-        elif current_state_local == self.STATE_CALIBRATE:
-            if self.button_handler.check_button(BTN_ENTER): # A: White Ref Setup
-                if spec_ready:
-                    logger.info("Entering White Reference Setup mode.")
-                    success = self._capture_and_store_white_ref()
-                    if success:
-                        self._current_state = self.STATE_WHITE_REF_SETUP
-                        self._current_y_max = 2.0 # Reset Y for relative view (0-2 typical)
-                    else:
-                        logger.error("Failed initial white ref capture. Staying in Calibrate mode.")
-                else: logger.warning("White Ref setup ignored: Spectrometer not ready.")
-            elif self.button_handler.check_button(BTN_UP): # X: Dark Capture Setup
-                if spec_ready:
-                    logger.info("Entering Dark Capture Setup mode.")
-                    self._current_state = self.STATE_DARK_CAPTURE
-                    self._current_y_max = float(Y_AXIS_DEFAULT_MAX) # Reset Y for dark raw counts
-                else: logger.warning("Dark Capture setup ignored: Spectrometer not ready.")
+            elif self.button_handler.check_button(BTN_DOWN): # Y: Rescale Y-Axis
+                if spec_ready: self._rescale_y_axis(relative=False) # Standard rescale for live view
+                else: logger.warning("Rescale ignored: Spectrometer not ready.")
+            elif self.button_handler.check_button(BTN_BACK): # B: Back to Main Menu
+                action_result = "BACK_TO_MENU"
+
+        elif current_state_local == self.STATE_CALIBRATE: # Calibration type selection menu
+            if self.button_handler.check_button(BTN_UP): # X: Dark Capture Setup
+                logger.info("Selected Dark Capture Setup.")
+                self._current_state = self.STATE_DARK_CAPTURE_SETUP
+                self._current_y_max = float(Y_AXIS_DEFAULT_MAX) # Reset Y for raw dark counts
+            elif self.button_handler.check_button(BTN_ENTER): # A: White Capture Setup
+                logger.info("Selected White Capture Setup.")
+                self._current_state = self.STATE_WHITE_CAPTURE_SETUP
+                self._current_y_max = float(Y_AXIS_DEFAULT_MAX) # Reset Y for raw white counts
             elif self.button_handler.check_button(BTN_BACK): # B: Back to Live View
-                logger.info("Exiting Calibrate mode, returning to Live View.")
+                logger.info("Exiting Calibrate Menu to Live View.")
                 self._current_state = self.STATE_LIVE_VIEW
-        elif current_state_local == self.STATE_WHITE_REF_SETUP:
-            if self.button_handler.check_button(BTN_ENTER): # A: Save Stored White Ref
-                if self._stored_white_reference is not None:
-                     logger.info("Saving stored White Reference...")
-                     self._save_calib_data("WHITE", self._stored_white_reference,
-                                           self._white_ref_capture_timestamp, self._white_ref_integration_ms)
-                     self._stored_white_reference = None # Clear after saving
-                     self._current_state = self.STATE_LIVE_VIEW
-                else: logger.error("Cannot save White Ref: No reference stored or data missing.")
-            elif self.button_handler.check_button(BTN_BACK): # B: Cancel and Back to Live View
-                logger.info("Cancelling White Reference setup, returning to Live View.")
-                self._stored_white_reference = None # Discard
-                self._current_state = self.STATE_LIVE_VIEW
-        elif current_state_local == self.STATE_DARK_CAPTURE:
-            if self.button_handler.check_button(BTN_ENTER): # A: Capture and Save Dark
-                if spec_ready:
-                     logger.info("Capturing and saving Dark scan...")
-                     self._capture_and_save_calib("DARK") # Handles save internally
-                     self._current_state = self.STATE_LIVE_VIEW
-                else: logger.warning("Dark Capture ignored: Spectrometer not ready.")
-            elif self.button_handler.check_button(BTN_BACK): # B: Cancel and Back to Live View
-                logger.info("Cancelling Dark Capture setup, returning to Live View.")
-                self._current_state = self.STATE_LIVE_VIEW
+
+        elif current_state_local == self.STATE_DARK_CAPTURE_SETUP:
+            if self.button_handler.check_button(BTN_ENTER): # A: Freeze Dark
+                if spec_ready: self._perform_freeze_capture(self.FROZEN_TYPE_DARK)
+                else: logger.warning("Freeze Dark ignored: Spectrometer not ready.")
+            elif self.button_handler.check_button(BTN_BACK): # B: Back to Calibrate Menu
+                self._current_state = self.STATE_CALIBRATE
+            # No Y rescale for Dark setup by design
+
+        elif current_state_local == self.STATE_WHITE_CAPTURE_SETUP:
+            if self.button_handler.check_button(BTN_ENTER): # A: Freeze White
+                if spec_ready: self._perform_freeze_capture(self.FROZEN_TYPE_WHITE)
+                else: logger.warning("Freeze White ignored: Spectrometer not ready.")
+            elif self.button_handler.check_button(BTN_DOWN): # Y: Rescale Y-Axis for White Setup
+                if spec_ready: self._rescale_y_axis(relative=False) # Standard rescale for white setup
+                else: logger.warning("Rescale White Setup ignored: Spectrometer not ready.")
+            elif self.button_handler.check_button(BTN_BACK): # B: Back to Calibrate Menu
+                self._current_state = self.STATE_CALIBRATE
+
         elif current_state_local == self.STATE_FROZEN_VIEW:
-            if self.button_handler.check_button(BTN_ENTER):
-                 self._handle_save_ooi() # Handles state change back to LIVE_VIEW
-            elif self.button_handler.check_button(BTN_BACK):
-                 self._handle_discard_frozen() # Handles state change back to LIVE_VIEW
-        # Assertion: action_result must be str or None
+            assert self._frozen_capture_type is not None, "In FROZEN_VIEW but _frozen_capture_type is None."
+            if self.button_handler.check_button(BTN_ENTER): # A: Save Frozen Data
+                self._perform_save_frozen_data()
+                # State change to previous setup state or live view is handled by _perform_save_frozen_data
+            elif self.button_handler.check_button(BTN_BACK): # B: Discard Frozen Data
+                self._perform_discard_frozen_data()
+                # State change to previous setup state or live view is handled by _perform_discard_frozen_data
+        else:
+            logger.error(f"Unhandled input state in SpectrometerScreen: {current_state_local}")
+            self._current_state = self.STATE_LIVE_VIEW # Fallback to a known safe state
+
         assert isinstance(action_result, (str, type(None))), f"handle_input returned invalid type: {type(action_result)}"
         return action_result
 
-    def _capture_and_store_white_ref(self) -> bool:
-        """Captures current spectrum for white ref, stores it internally. Returns success."""
-        # Assertion: menu_system must be available
-        assert self.menu_system is not None, "MenuSystem is None in _capture_and_store_white_ref"
-        device_proxy = getattr(self.spectrometer, '_dev', None)
-        if not (self.spectrometer and device_proxy and hasattr(device_proxy, 'is_open') and device_proxy.is_open and self.wavelengths is not None):
-            logger.error("Cannot capture white ref: Spectrometer not ready or wavelengths missing.")
-            return False
-        if np is None:
-            logger.error("NumPy (np) is unavailable. Cannot process white reference.")
-            return False
-
-        logger.info("Attempting to capture White Reference spectrum...")
-        try:
-            current_integration_time_ms = self.menu_system.get_integration_time_ms()
-            # Assertion: Check integration time is valid
-            assert isinstance(current_integration_time_ms, int) and current_integration_time_ms > 0, \
-                   f"Invalid integration time from menu: {current_integration_time_ms}"
-
-            if current_integration_time_ms != self._last_integration_time_ms:
-                 integration_micros_scaled = int((current_integration_time_ms * 1000) * INTEGRATION_TIME_SCALE_FACTOR)
-                 logger.debug(f"WHITE_REF_STORE: Setting integration time to {integration_micros_scaled} µs (target {current_integration_time_ms} ms)")
-                 self.spectrometer.integration_time_micros(integration_micros_scaled)
-                 self._last_integration_time_ms = current_integration_time_ms
-
-            intensities = self.spectrometer.intensities(correct_dark_counts=True, correct_nonlinearity=True)
-            timestamp = self.menu_system.get_timestamp_datetime() # Get timestamp at time of capture
-
-            # Assertion: Check intensities and timestamp
-            assert intensities is not None, "Received None for intensities from spectrometer."
-            assert isinstance(timestamp, datetime.datetime), "Received invalid timestamp from menu_system."
-
-            if len(intensities) == len(self.wavelengths):
-                max_val = np.max(intensities)
-                # Get spectrum_max_value, default to float for comparison
-                spec_max_count = float(getattr(self.spectrometer, 'spectrum_max_value', 65535.0))
-                # Assertion: Ensure spec_max_count is a positive float/int
-                assert isinstance(spec_max_count, (float, int)) and spec_max_count > 0, \
-                       f"Invalid spectrum_max_value: {spec_max_count}"
-
-                if max_val >= spec_max_count * 0.98: # Check for saturation (98%)
-                    logger.error(f"White reference saturated (max intensity={max_val:.0f} vs limit={spec_max_count:.0f}). Reduce integration time and try again.")
-                    return False # Do not store saturated reference
-
-                self._stored_white_reference = np.array(intensities, dtype=float) # Ensure float for division
-                # Prevent division by zero or very small numbers if this white ref is used as denominator
-                min_value_for_division = 1e-9 # A small positive number
-                self._stored_white_reference[self._stored_white_reference <= min_value_for_division] = min_value_for_division
-
-                self._white_ref_capture_timestamp = timestamp
-                self._white_ref_integration_ms = current_integration_time_ms
-                logger.info(f"White Reference captured and stored internally (Integ: {current_integration_time_ms} ms).")
-                return True
-            else:
-                logger.error(f"Failed to capture valid intensities for white reference. Length mismatch: got {len(intensities)}, expected {len(self.wavelengths)}.")
-                return False
-        except sb.SeaBreezeError as e_sb_capture:
-            logger.error(f"SeaBreezeError capturing white reference: {e_sb_capture}", exc_info=True)
-        except Exception as e: # Catch any other unexpected error
-            logger.error(f"Unexpected error capturing initial white reference: {e}", exc_info=True)
-        self._stored_white_reference = None # Ensure it's None on any error
-        return False
-
-    def _capture_and_save_calib(self, spectra_type: str):
-        """Captures current spectrum and immediately saves it as DARK."""
-        # Assertion: menu_system must be available
-        assert self.menu_system is not None, "MenuSystem is None in _capture_and_save_calib"
-        if spectra_type != "DARK": # Currently only DARK is an immediate save calib type
-            logger.error(f"Invalid spectra_type '{spectra_type}' for _capture_and_save_calib. Expected 'DARK'.")
-            return
+    def _perform_freeze_capture(self, capture_type: str):
+        """Captures the current spectrum and freezes it for review."""
+        assert self.menu_system is not None, "MenuSystem is None in _perform_freeze_capture"
+        assert capture_type in [self.FROZEN_TYPE_OOI, self.FROZEN_TYPE_DARK, self.FROZEN_TYPE_WHITE], \
+               f"Invalid capture_type '{capture_type}' for freeze."
 
         device_proxy = getattr(self.spectrometer, '_dev', None)
         if not (self.spectrometer and device_proxy and hasattr(device_proxy, 'is_open') and device_proxy.is_open and self.wavelengths is not None):
-             logger.error(f"Cannot capture {spectra_type}: Spectrometer not ready or wavelengths missing.")
+             logger.error(f"Cannot freeze {capture_type}: Spectrometer not ready or wavelengths missing.")
              return
 
-        logger.info(f"Attempting to capture {spectra_type} scan...")
+        logger.info(f"Attempting to freeze spectrum for type: {capture_type}...")
         try:
             current_integration_time_ms = self.menu_system.get_integration_time_ms()
-            # Assertion: Check integration time
             assert isinstance(current_integration_time_ms, int) and current_integration_time_ms > 0, \
                    f"Invalid integration time from menu: {current_integration_time_ms}"
 
             if current_integration_time_ms != self._last_integration_time_ms:
                  integration_micros_scaled = int((current_integration_time_ms * 1000) * INTEGRATION_TIME_SCALE_FACTOR)
-                 logger.debug(f"CAPTURE_{spectra_type}: Setting integration time to {integration_micros_scaled} µs (target {current_integration_time_ms} ms)")
+                 logger.debug(f"FREEZE ({capture_type}): Setting integration time to {integration_micros_scaled} µs (target {current_integration_time_ms} ms)")
                  self.spectrometer.integration_time_micros(integration_micros_scaled)
                  self._last_integration_time_ms = current_integration_time_ms
 
-            intensities = self.spectrometer.intensities(correct_dark_counts=True, correct_nonlinearity=True)
-            timestamp = self.menu_system.get_timestamp_datetime() # Timestamp for the save
+            # For all freeze types (OOI, DARK, WHITE), we capture raw, corrected intensities.
+            # If OOI is Reflectance, the _save_data or _capture_and_plot will handle processing.
+            intensities_captured = self.spectrometer.intensities(correct_dark_counts=True, correct_nonlinearity=True)
+            assert intensities_captured is not None, "Received None for intensities from spectrometer."
 
-            # Assertion: Check intensities and timestamp
-            assert intensities is not None, "Received None for intensities from spectrometer for DARK scan."
-            assert isinstance(timestamp, datetime.datetime), "Received invalid timestamp from menu_system for DARK scan."
-
-            if len(intensities) == len(self.wavelengths):
-                save_success = self._save_data(
-                    intensities=intensities, wavelengths=self.wavelengths,
-                    timestamp=timestamp, integration_ms=current_integration_time_ms,
-                    spectra_type=spectra_type, save_plot=False # No plot for DARK calibration
-                )
-                if save_success:
-                    logger.info(f"{spectra_type} scan captured and saved successfully.")
-                else:
-                    logger.error(f"Failed to save {spectra_type} scan after capture.")
-            else:
-                logger.error(f"Failed capture for {spectra_type} scan. Length mismatch: got {len(intensities)}, expected {len(self.wavelengths)}.")
-        except sb.SeaBreezeError as e_sb_dark:
-            logger.error(f"SeaBreezeError capturing {spectra_type} scan: {e_sb_dark}", exc_info=True)
-        except Exception as e: # Catch any other unexpected error
-            logger.error(f"Unexpected error capturing/saving {spectra_type} scan: {e}", exc_info=True)
-
-    def _save_calib_data(self, spectra_type: str, intensities: np.ndarray,
-                         timestamp: datetime.datetime | None, integration_ms: int | None):
-        """Saves pre-captured calibration data (e.g., stored White Reference)."""
-        # Assertion: menu_system must be available (indirectly via _save_data)
-        assert self.menu_system is not None, "MenuSystem is None in _save_calib_data"
-        if spectra_type != "WHITE": # Currently only WHITE uses this path for pre-stored data
-            logger.error(f"Invalid spectra_type '{spectra_type}' for _save_calib_data. Expected 'WHITE'.")
-            return
-
-        # Assertions for required data components
-        assert intensities is not None, f"Cannot save {spectra_type}: Intensities are None."
-        assert self.wavelengths is not None, f"Cannot save {spectra_type}: Wavelengths are None."
-        assert timestamp is not None, f"Cannot save {spectra_type}: Timestamp is None."
-        assert integration_ms is not None, f"Cannot save {spectra_type}: Integration_ms is None."
-        assert isinstance(intensities, np.ndarray), "Intensities must be a numpy array."
-        assert isinstance(self.wavelengths, np.ndarray), "Wavelengths must be a numpy array."
-        assert isinstance(timestamp, datetime.datetime), "Timestamp must be a datetime object."
-        assert isinstance(integration_ms, int), "Integration_ms must be an integer."
-
-
-        logger.info(f"Attempting to save {spectra_type} reference...")
-        save_success = self._save_data(
-            intensities=intensities, wavelengths=self.wavelengths,
-            timestamp=timestamp, integration_ms=integration_ms,
-            spectra_type=spectra_type, save_plot=False # No plot for WHITE calibration
-        )
-        if save_success:
-            logger.info(f"{spectra_type} reference saved successfully.")
-        else:
-            logger.error(f"Failed to save {spectra_type} reference.")
-
-    def _handle_freeze_capture(self):
-        """Captures the current spectrum data (RAW or REFLECTANCE) and freezes the display state."""
-        # Assertion: menu_system must be available
-        assert self.menu_system is not None, "MenuSystem is None in _handle_freeze_capture"
-        device_proxy = getattr(self.spectrometer, '_dev', None)
-        if not (self.spectrometer and device_proxy and hasattr(device_proxy, 'is_open') and device_proxy.is_open and self.wavelengths is not None):
-             logger.error("Cannot freeze: Spectrometer not ready or wavelengths missing."); return
-
-        logger.info("Attempting to freeze current spectrum...")
-        try:
-            current_integration_time_ms = self.menu_system.get_integration_time_ms()
-            collection_mode = self.menu_system.get_collection_mode() # Get current mode
-
-            # Assertion: Check integration time and collection_mode
-            assert isinstance(current_integration_time_ms, int) and current_integration_time_ms > 0, \
-                   f"Invalid integration time from menu: {current_integration_time_ms}"
-            assert isinstance(collection_mode, str) and collection_mode in AVAILABLE_COLLECTION_MODES, \
-                   f"Invalid collection mode from menu: {collection_mode}"
-
-
-            if current_integration_time_ms != self._last_integration_time_ms:
-                 integration_micros_scaled = int((current_integration_time_ms * 1000) * INTEGRATION_TIME_SCALE_FACTOR)
-                 logger.debug(f"FREEZE_CAPTURE: Setting integration time to {integration_micros_scaled} µs (target {current_integration_time_ms} ms)")
-                 self.spectrometer.integration_time_micros(integration_micros_scaled)
-                 self._last_integration_time_ms = current_integration_time_ms
-
-            # Logic for acquiring intensities based on mode would go here if REFLECTANCE freeze was different.
-            # As per App Overview, "SAMPLE" save is based on original mode.
-            # The _capture_and_plot itself handles RAW vs REFLECTANCE for display.
-            # For _save_data, it expects the final processed intensities.
-            # Current implementation: freeze always stores raw, _capture_and_plot applies processing.
-            # This means a "frozen reflectance" would be calculated live if displayed, then saved from that calc.
-            # The current _handle_save_ooi saves _frozen_intensities, which are raw.
-            # This needs clarification if frozen REFLECTANCE should be stored differently.
-            # For now, assume freeze captures raw, and plot will show it as Raw or Reflectance.
-            # The save operation for "SAMPLE" in App Overview should save the *processed* form.
-
-            raw_intensities = self.spectrometer.intensities(correct_dark_counts=True, correct_nonlinearity=True)
-            # For Reflectance mode, the _frozen_intensities should ideally be the calculated reflectance.
-            # However, the current structure seems to freeze raw and then _capture_and_plot calculates reflectance if needed.
-            # This path means _frozen_intensities will always be raw-like.
-            # Let's stick to freezing raw counts, and _capture_and_plot + _handle_save_ooi handle mode.
-
-            if raw_intensities is not None and len(raw_intensities) == len(self.wavelengths):
-                self._frozen_intensities = raw_intensities # Store the raw intensities
+            if len(intensities_captured) == len(self.wavelengths):
+                self._clear_frozen_data() # Clear any previous frozen data first
+                self._frozen_intensities = intensities_captured
                 self._frozen_wavelengths = self.wavelengths
                 self._frozen_timestamp = self.menu_system.get_timestamp_datetime()
-                self._frozen_integration_time_ms = current_integration_time_ms
-                # Store the mode AT THE TIME OF FREEZE
-                self._frozen_collection_mode = collection_mode # NEW instance variable
+                self._frozen_integration_ms = current_integration_time_ms
+                self._frozen_capture_type = capture_type
+
+                if capture_type == self.FROZEN_TYPE_OOI:
+                    self._frozen_sample_collection_mode = self.menu_system.get_collection_mode()
+                    logger.info(f"Sample spectrum frozen (Mode: {self._frozen_sample_collection_mode}, Integ: {self._frozen_integration_ms} ms). Type: {self._frozen_capture_type}")
+                else: # DARK or WHITE
+                    logger.info(f"{capture_type} spectrum frozen (Integ: {self._frozen_integration_ms} ms). Type: {self._frozen_capture_type}")
 
                 self._current_state = self.STATE_FROZEN_VIEW
-                logger.info(f"Spectrum frozen (Mode: {self._frozen_collection_mode}, Integ: {self._frozen_integration_time_ms} ms)")
             else:
-                logger.error(f"Failed to capture valid intensities for freeze. Length mismatch or None intensities.")
+                logger.error(f"Failed to capture valid intensities for {capture_type} freeze. Length mismatch.")
         except sb.SeaBreezeError as e_sb_freeze:
-            logger.error(f"SeaBreezeError during freeze capture: {e_sb_freeze}", exc_info=True)
-        except Exception as e: # Catch any other unexpected error
-            logger.error(f"Unexpected error freezing spectrum: {e}", exc_info=True)
+            logger.error(f"SeaBreezeError during {capture_type} freeze capture: {e_sb_freeze}", exc_info=True)
+        except Exception as e:
+            logger.error(f"Unexpected error freezing {capture_type} spectrum: {e}", exc_info=True)
 
-    def _handle_save_ooi(self):
-        """Saves the currently frozen spectrum data (RAW or REFLECTANCE), then returns to live view."""
-        # Assertions for frozen data components
-        assert self._frozen_intensities is not None, "Cannot save: _frozen_intensities is None."
-        assert self._frozen_wavelengths is not None, "Cannot save: _frozen_wavelengths is None."
-        assert self._frozen_timestamp is not None, "Cannot save: _frozen_timestamp is None."
-        assert self._frozen_integration_time_ms is not None, "Cannot save: _frozen_integration_time_ms is None."
-        # _frozen_collection_mode should also be set by _handle_freeze_capture
-        assert hasattr(self, '_frozen_collection_mode') and self._frozen_collection_mode in AVAILABLE_COLLECTION_MODES, \
-               "Cannot save: _frozen_collection_mode is not set or invalid."
+    def _perform_save_frozen_data(self):
+        """Saves the currently frozen spectrum data, then returns to the appropriate previous state."""
+        assert self._frozen_capture_type is not None, "Cannot save, _frozen_capture_type is None."
+        assert self._frozen_intensities is not None, "Cannot save, _frozen_intensities is None."
+        assert self._frozen_wavelengths is not None, "Cannot save, _frozen_wavelengths is None."
+        assert self._frozen_timestamp is not None, "Cannot save, _frozen_timestamp is None."
+        assert self._frozen_integration_ms is not None, "Cannot save, _frozen_integration_ms is None."
 
-        logger.info(f"Attempting to save frozen spectrum (Mode: {self._frozen_collection_mode})...")
+        spectra_type_for_csv = ""
+        intensities_to_save = self._frozen_intensities
 
-        intensities_to_save = self._frozen_intensities # Start with raw frozen
-        spectra_type_for_csv = self._frozen_collection_mode.upper() # e.g., "RAW", "REFLECTANCE"
+        if self._frozen_capture_type == self.FROZEN_TYPE_OOI:
+            assert self._frozen_sample_collection_mode is not None, "_frozen_sample_collection_mode is None for OOI save."
+            spectra_type_for_csv = self._frozen_sample_collection_mode.upper()
+            logger.info(f"Preparing to save frozen OOI sample as type: {spectra_type_for_csv}")
+            if self._frozen_sample_collection_mode == MODE_REFLECTANCE:
+                logger.warning(f"Saving OOI as REFLECTANCE: This example saves the frozen raw-like data under REFLECTANCE type. Full on-the-fly calculation from stored references is not implemented here.")
+        elif self._frozen_capture_type == self.FROZEN_TYPE_DARK:
+            spectra_type_for_csv = "DARK"
+        elif self._frozen_capture_type == self.FROZEN_TYPE_WHITE:
+            spectra_type_for_csv = "WHITE"
+        else:
+            logger.error(f"Unknown _frozen_capture_type: {self._frozen_capture_type}. Cannot determine spectra_type for CSV.")
+            self._perform_discard_frozen_data() # Discard and return to appropriate state
+            return
 
-        if self._frozen_collection_mode == MODE_REFLECTANCE:
-            # Calculate reflectance from the frozen raw data, dark, and white.
-            # This requires valid dark_ref and white_ref.
-            # The App Overview implies Target_raw, Dark_raw, White_raw are acquired with specific seabreeze params.
-            # This part needs careful implementation if full reflectance calculation is done here from frozen raw.
-            # For simplicity and based on current _capture_and_plot, we assume _frozen_intensities IS ALREADY the
-            # data that was being displayed (i.e. if reflectance was live, _capture_and_plot might have
-            # returned that, and _handle_freeze_capture should have stored *that*).
-            # Re-evaluating: _handle_freeze_capture stores raw.
-            # So if we save REFLECTANCE, we need to calculate it here.
-            # This implies _capture_and_store_dark_ref() and valid white_ref are needed.
-            # The current `_capture_and_plot` already calculates reflectance if in white_ref_setup.
-            # This is getting complex. The App Overview: "Saves captured data to daily CSV logs ...
-            # spectra_type (RAW, REFLECTANCE, DARK, WHITE)".
-            # And for REFLECTANCE: "Live display and saved data are calculated as (Target_raw - Dark_raw) / (White_raw - Dark_raw)."
-            #
-            # Let's assume if _frozen_collection_mode is REFLECTANCE, _frozen_intensities *should* be reflectance.
-            # This means _handle_freeze_capture should capture processed data if mode is REFLECTANCE.
-            # This is a larger change.
-            # For now, the simplest path that matches "saves what was frozen":
-            # If _frozen_collection_mode is "Reflectance", we need to be sure _frozen_intensities *is* reflectance.
-            # The current _capture_and_plot does the calculation for display.
-            # If _handle_freeze_capture stores the output of _capture_and_plot, that would work.
-            # Let's assume _frozen_intensities IS the data to save for the given _frozen_collection_mode.
-            # This means if REFLECTANCE was active, _capture_and_plot must have produced it,
-            # and _handle_freeze_capture stored it. This seems like a gap.
-            #
-            # Sticking to a simpler interpretation for now:
-            # The "SAMPLE" save should reflect the mode. If mode was REFLECTANCE, and we have valid
-            # white and dark references, we should calculate it.
-            # This implies _frozen_intensities is always RAW-like counts.
-            logger.warning("Saving frozen REFLECTANCE is not fully implemented with on-the-fly calculation from raw frozen data + stored refs. Saving raw-like data labeled as REFLECTANCE if that was the mode.")
-            # To correctly save Reflectance, we'd need:
-            # 1. A stored dark reference (similar to white reference).
-            # 2. Calculation: (self._frozen_intensities - dark_ref) / (self._stored_white_reference - dark_ref)
-            # This is not currently in place for _handle_save_ooi.
-            # The CSV type will be "REFLECTANCE" but data will be the raw counts if this isn't changed.
-            # This is consistent with saving what was literally frozen if "Reflectance" was not calculated *before* freezing.
-            pass # intensities_to_save remains self._frozen_intensities
-
+        logger.info(f"Attempting to save frozen data as {spectra_type_for_csv}...")
         save_success = self._save_data(
             intensities=intensities_to_save,
             wavelengths=self._frozen_wavelengths,
             timestamp=self._frozen_timestamp,
-            integration_ms=self._frozen_integration_time_ms,
-            spectra_type=spectra_type_for_csv, # Use the mode at time of freeze
-            save_plot=True
+            integration_ms=self._frozen_integration_ms,
+            spectra_type=spectra_type_for_csv,
+            save_plot=(self._frozen_capture_type == self.FROZEN_TYPE_OOI)
         )
 
         if save_success:
-            logger.info(f"Frozen {self._frozen_collection_mode} spectrum saved successfully.")
+            logger.info(f"Frozen {self._frozen_capture_type} (saved as {spectra_type_for_csv}) spectrum saved successfully.")
         else:
-            logger.error(f"Failed to save frozen {self._frozen_collection_mode} spectrum.")
+            logger.error(f"Failed to save frozen {self._frozen_capture_type} (intended as {spectra_type_for_csv}) spectrum.")
 
-        self._handle_discard_frozen() # Clears frozen state and returns to live view
+        if self._frozen_capture_type == self.FROZEN_TYPE_OOI:
+            self._current_state = self.STATE_LIVE_VIEW
+        elif self._frozen_capture_type == self.FROZEN_TYPE_DARK:
+            # After saving DARK, go back to main LIVE VIEW
+            self._current_state = self.STATE_LIVE_VIEW
+            logger.info("Dark reference saved. Returning to main live view.")
+        elif self._frozen_capture_type == self.FROZEN_TYPE_WHITE:
+            # After saving WHITE, go back to main LIVE VIEW
+            self._current_state = self.STATE_LIVE_VIEW
+            logger.info("White reference saved. Returning to main live view.")
+        else: # Should not be reached due to earlier check, but as a safeguard
+            logger.error(f"Unexpected frozen_capture_type '{self._frozen_capture_type}' after save. Defaulting to LIVE_VIEW.")
+            self._current_state = self.STATE_LIVE_VIEW
 
 
-    def _handle_discard_frozen(self):
-        """Discards the currently frozen spectrum data and returns to live view."""
-        logger.info("Discarding frozen spectrum.")
-        self._frozen_intensities = None
-        self._frozen_wavelengths = None
-        self._frozen_timestamp = None
-        self._frozen_integration_time_ms = None
-        if hasattr(self, '_frozen_collection_mode'): # Clear if it exists
-            delattr(self, '_frozen_collection_mode')
-        self._current_state = self.STATE_LIVE_VIEW
-        logger.info("Returned to live view after discarding/saving frozen data.")
+        self._clear_frozen_data()
+        logger.info(f"Returned to state: {self._current_state} after saving frozen data.")
 
+    def _perform_discard_frozen_data(self):
+        """Discards the currently frozen spectrum data and returns to the appropriate previous state."""
+        assert self._frozen_capture_type is not None, "Cannot discard, _frozen_capture_type is None."
+        logger.info(f"Discarding frozen {self._frozen_capture_type} spectrum.")
+
+        # <<< MODIFIED State Transition Logic for DISCARDING >>>
+        if self._frozen_capture_type == self.FROZEN_TYPE_OOI:
+            self._current_state = self.STATE_LIVE_VIEW
+        elif self._frozen_capture_type == self.FROZEN_TYPE_DARK:
+            # After discarding DARK, go back to DARK SETUP screen
+            self._current_state = self.STATE_DARK_CAPTURE_SETUP
+            logger.info("Frozen Dark reference discarded. Returning to Dark Capture Setup.")
+        elif self._frozen_capture_type == self.FROZEN_TYPE_WHITE:
+            # After discarding WHITE, go back to WHITE SETUP screen
+            self._current_state = self.STATE_WHITE_CAPTURE_SETUP
+            logger.info("Frozen White reference discarded. Returning to White Capture Setup.")
+        else:
+            logger.error(f"Unknown _frozen_capture_type during discard: {self._frozen_capture_type}. Returning to LIVE_VIEW.")
+            self._current_state = self.STATE_LIVE_VIEW
+
+        self._clear_frozen_data()
+        logger.info(f"Returned to state: {self._current_state} after discarding frozen data.")
 
     def _save_data(self, intensities: np.ndarray, wavelengths: np.ndarray,
                    timestamp: datetime.datetime, integration_ms: int,
@@ -2273,104 +2084,84 @@ class SpectrometerScreen:
         assert self.menu_system is not None, "MenuSystem is None in _save_data."
 
         # --- Create Daily Folder ---
-        # Folder: ~/pysb-app/spectra_data/YYYY-MM-DD/
-        # Use timestamp's date for folder name to ensure data goes into correct day's log
         daily_folder_path = os.path.join(DATA_DIR, timestamp.strftime("%Y-%m-%d"))
         try:
             os.makedirs(daily_folder_path, exist_ok=True)
         except OSError as e:
             logger.error(f"Could not create daily data directory {daily_folder_path}: {e}")
-            return False # Cannot proceed without directory
-        except Exception as e_mkdir: # Catch any other unexpected error
+            return False
+        except Exception as e_mkdir:
             logger.error(f"Unexpected error creating daily directory {daily_folder_path}: {e_mkdir}")
             return False
 
         # --- Prepare CSV ---
-        # CSV Filename: YYYY-MM-DD_spectra_log.csv (using global CSV_BASE_FILENAME)
         csv_filename_dated = f"{timestamp.strftime('%Y-%m-%d')}_{CSV_BASE_FILENAME}"
         csv_filepath = os.path.join(daily_folder_path, csv_filename_dated)
-        # Assertion for path components
         assert isinstance(csv_filepath, str), "Generated CSV filepath is not a string."
 
-        timestamp_str_utc = timestamp.strftime("%Y-%m-%dT%H:%M:%SZ") # ISO 8601 like format for CSV
+        timestamp_str_utc = timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
         lens_type_str = self.menu_system.get_lens_type()
-        # Assertion for lens_type
-        assert isinstance(lens_type_str, str) and lens_type_str in LENS_TYPES, \
-               f"Invalid lens type '{lens_type_str}' from menu_system."
+        assert isinstance(lens_type_str, str) and lens_type_str in MenuSystem.LENS_TYPES, \
+               f"Invalid lens type '{lens_type_str}' from menu_system. Valid types: {MenuSystem.LENS_TYPES}"
 
         logger.debug(f"Saving data (Type: {spectra_type}, Lens: {lens_type_str}) to {csv_filepath}")
         try:
-            # Check if file exists and has content to determine if header is needed
-            # This check should be as close to the open() as possible to minimize race conditions,
-            # though for this app, it's unlikely to be an issue.
             write_header = not (os.path.isfile(csv_filepath) and os.path.getsize(csv_filepath) > 0)
-
             with open(csv_filepath, 'a', newline='') as csvfile:
                 csvwriter = csv.writer(csvfile)
                 if write_header:
                     header = ["timestamp_utc", "spectra_type", "lens_type", "integration_time_ms"] + \
-                             [f"{wl:.2f}" for wl in wavelengths] # Wavelengths as part of header
+                             [f"{wl:.2f}" for wl in wavelengths]
                     csvwriter.writerow(header)
-
-                # Data row includes actual intensity values
                 data_row = [timestamp_str_utc, spectra_type, lens_type_str, integration_ms] + \
-                           [f"{inten:.4f}" for inten in intensities] # Format intensities
+                           [f"{inten:.4f}" for inten in intensities]
                 csvwriter.writerow(data_row)
 
-            # --- Increment scans_today_count after successful CSV write ---
             self._scans_today_count += 1
             logger.info(f"Scan count for today incremented to: {self._scans_today_count}")
 
-
-            # --- Optionally Save Plot ---
             if save_plot:
-                if plt is None or Image is None: # Check for plotting libraries
+                if plt is None or Image is None:
                     logger.warning("Plot save skipped: Matplotlib or Pillow unavailable.")
                 else:
-                    plot_timestamp_str_local = timestamp.strftime("%Y-%m-%d-%H%M%S") # Local time for filename
+                    plot_timestamp_str_local = timestamp.strftime("%Y-%m-%d-%H%M%S")
                     plot_filename_base = f"spectrum_{spectra_type}_{lens_type_str}_{plot_timestamp_str_local}"
                     plot_filepath_png = os.path.join(daily_folder_path, f"{plot_filename_base}.png")
                     logger.debug(f"Attempting to save plot: {plot_filepath_png}")
-
-                    save_fig_temp, save_ax_temp = None, None # Initialize for finally block
+                    save_fig_temp, save_ax_temp = None, None
                     try:
-                        # Create a new figure for saving to avoid issues with the live plot figure
-                        save_fig_temp, save_ax_temp = plt.subplots(figsize=(8, 6)) # Standard size for saved plots
+                        save_fig_temp, save_ax_temp = plt.subplots(figsize=(8, 6))
                         if not save_fig_temp or not save_ax_temp:
                             raise RuntimeError("Failed to create temporary figure/axes for saving plot.")
-
                         save_ax_temp.plot(wavelengths, intensities)
                         title_str = (f"Spectrum ({spectra_type}) - {plot_timestamp_str_local}\n"
                                      f"Lens: {lens_type_str}, Integ: {integration_ms} ms, Scans Today: {self._scans_today_count}")
                         save_ax_temp.set_title(title_str, fontsize=10)
                         save_ax_temp.set_xlabel("Wavelength (nm)")
-                        save_ax_temp.set_ylabel("Intensity") # Or "Reflectance" if applicable
+                        save_ax_temp.set_ylabel("Intensity")
                         save_ax_temp.grid(True, linestyle="--", alpha=0.7)
                         save_fig_temp.tight_layout()
                         save_fig_temp.savefig(plot_filepath_png, dpi=150)
                         logger.info(f"Plot image saved: {plot_filepath_png}")
-                    except Exception as e_plot_save: # Catch specific plot saving errors
+                    except Exception as e_plot_save:
                         logger.error(f"Error saving plot image to {plot_filepath_png}: {e_plot_save}", exc_info=True)
                     finally:
-                        # Ensure temporary figure is closed
                         if save_fig_temp and plt and plt.fignum_exists(save_fig_temp.number):
                             plt.close(save_fig_temp)
             else:
                 logger.debug(f"Plot saving skipped for spectra_type: {spectra_type}")
-
             logger.info(f"Data successfully saved for type: {spectra_type} (Lens: {lens_type_str}).")
             return True
         except csv.Error as e_csv:
             logger.error(f"CSVError saving data to {csv_filepath}: {e_csv}", exc_info=True)
         except IOError as e_io:
             logger.error(f"IOError saving data to {csv_filepath}: {e_io}", exc_info=True)
-        except Exception as e: # Catch any other unexpected error during save
+        except Exception as e:
             logger.error(f"Unexpected error saving data to {csv_filepath}: {e}", exc_info=True)
         return False
 
-    def _rescale_y_axis(self, relative: bool = False):
-        """Captures spectrum, calculates new Y max, updates state. Handles relative display scaling."""
-        # Assertion: menu_system must be available
+    def _rescale_y_axis(self, relative: bool = False): # 'relative' param is currently not used by callers
+        """Captures spectrum, calculates new Y max for raw count display."""
         assert self.menu_system is not None, "MenuSystem is None in _rescale_y_axis"
         if np is None:
             logger.error("NumPy (np) is unavailable. Cannot rescale Y-axis.")
@@ -2381,10 +2172,9 @@ class SpectrometerScreen:
              logger.warning("Spectrometer not ready for Y-axis rescale.")
              return
 
-        logger.info(f"Attempting to rescale Y-axis (relative display scaling={relative})...")
+        logger.info(f"Attempting to rescale Y-axis for raw count display...")
         try:
             current_integration_time_ms = self.menu_system.get_integration_time_ms()
-            # Assertion: Check integration time
             assert isinstance(current_integration_time_ms, int) and current_integration_time_ms > 0, \
                    f"Invalid integration time from menu: {current_integration_time_ms}"
 
@@ -2395,62 +2185,59 @@ class SpectrometerScreen:
                  self._last_integration_time_ms = current_integration_time_ms
 
             intensities = self.spectrometer.intensities(correct_dark_counts=True, correct_nonlinearity=True)
-            # Assertion: Check intensities
             assert intensities is not None, "Received None for intensities from spectrometer for rescale."
 
-            if len(intensities) > 0: # Ensure there's data to process
-                 data_to_scale = intensities # Default to raw intensities
-                 if relative: # This 'relative' is for display scaling in WHITE_REF_SETUP mode
-                      if self._stored_white_reference is not None and len(intensities) == len(self._stored_white_reference):
-                           # Ensure white ref is not zero where intensities are non-zero to avoid inf
-                           safe_white_ref = np.where(self._stored_white_reference == 0, 1e-9, self._stored_white_reference)
-                           data_to_scale = intensities / safe_white_ref
-                      else:
-                           logger.warning("Cannot rescale Y-axis relatively for display: White reference missing or invalid length. Using raw scale.")
-                           # data_to_scale remains raw intensities
-
-                 max_val = np.max(data_to_scale)
-                 # Choose min ceiling based on whether data is raw counts or relative (0-1.x typical)
-                 min_ceiling = Y_AXIS_MIN_CEILING_RELATIVE if relative else Y_AXIS_MIN_CEILING
-                 new_y_max = max(float(min_ceiling), float(max_val * Y_AXIS_RESCALE_FACTOR))
-                 self._current_y_max = new_y_max # Store as float
-                 logger.info(f"Y-axis max rescaled to: {self._current_y_max:.2f} (based on max_val: {max_val:.2f}, relative scaling: {relative})")
+            if len(intensities) > 0:
+                 max_val = np.max(intensities) # Rescale based on raw intensities
+                 new_y_max = max(float(Y_AXIS_MIN_CEILING), float(max_val * Y_AXIS_RESCALE_FACTOR))
+                 self._current_y_max = new_y_max
+                 logger.info(f"Y-axis max rescaled to: {self._current_y_max:.2f} (based on max_val: {max_val:.2f})")
             else:
                  logger.warning("Failed Y-axis rescaling: No valid intensities captured.")
         except sb.SeaBreezeError as e_sb_rescale:
             logger.error(f"SeaBreezeError during Y-axis rescale: {e_sb_rescale}", exc_info=True)
-        except usb.core.USBError as e_usb: # pyusb can raise this
+        except usb.core.USBError as e_usb:
             logger.error(f"USB error during Y-axis rescale: {e_usb}", exc_info=True)
         except AttributeError as e_attr:
             logger.error(f"Attribute error during Y-axis rescale: {e_attr}", exc_info=True)
-        except Exception as e: # Catch any other unexpected error
+        except Exception as e:
             logger.error(f"Unexpected error rescaling Y-axis: {e}", exc_info=True)
 
-
     def _capture_and_plot(self) -> pygame.Surface | None:
-        """Captures/uses data, applies smoothing, calculates relative if needed, plots to an in-memory Pygame surface."""
-        # Assertions for essential components
-        assert self.plot_fig and self.plot_ax and self.plot_line, "Plotting components (fig, ax, line) not initialized."
+        """Captures/uses data, applies smoothing, plots to an in-memory Pygame surface."""
+        assert self.plot_fig and self.plot_ax and self.plot_line, "Plotting components not initialized."
         assert Image is not None, "Pillow (Image) is not available for plot rendering."
         assert self.menu_system is not None, "MenuSystem is None in _capture_and_plot."
 
-        # Check numpy availability for processing, log warning if missing but proceed where possible
-        if np is None and self._current_state in [self.STATE_LIVE_VIEW, self.STATE_WHITE_REF_SETUP, self.STATE_DARK_CAPTURE, self.STATE_CALIBRATE]:
-             logger.warning("NumPy (np) is unavailable. Smoothing and relative calculations for live plot will be skipped.")
+        if np is None and self._current_state not in [self.STATE_FROZEN_VIEW]: # NumPy needed for live smoothing
+             logger.warning("NumPy (np) is unavailable. Live smoothing will be skipped.")
 
         plot_wavelengths_local: np.ndarray | None = None
         plot_intensities_to_display: np.ndarray | None = None
-        y_axis_label_str = "Intensity" # Default Y-axis label
-
-        device_proxy = getattr(self.spectrometer, '_dev', None) # Check device proxy status
+        y_axis_label_str = "Intensity"
+        device_proxy = getattr(self.spectrometer, '_dev', None)
+        current_internal_state = self._current_state
 
         try:
-            current_internal_state = self._current_state # Cache state for consistent decisions
-            # --- Get Live Data if in a live state ---
-            if current_internal_state in [self.STATE_LIVE_VIEW, self.STATE_CALIBRATE, self.STATE_WHITE_REF_SETUP, self.STATE_DARK_CAPTURE]:
+            if current_internal_state == self.STATE_FROZEN_VIEW:
+                if not (self._frozen_intensities is not None and self._frozen_wavelengths is not None):
+                     logger.error("Frozen data or wavelengths missing for plot. Discarding.")
+                     self._perform_discard_frozen_data() # Clears and sets state
+                     return None
+                plot_wavelengths_local = self._frozen_wavelengths
+                plot_intensities_to_display = self._frozen_intensities # This is always raw-like data
+                
+                # Determine label for frozen view based on what was frozen
+                frozen_type_label = self._frozen_capture_type or "UNKNOWN"
+                if self._frozen_capture_type == self.FROZEN_TYPE_OOI:
+                    frozen_type_label = self._frozen_sample_collection_mode or "SAMPLE"
+                y_axis_label_str = f"Intensity ({frozen_type_label.upper()} Frozen)"
+
+            elif current_internal_state in [self.STATE_LIVE_VIEW, self.STATE_DARK_CAPTURE_SETUP, self.STATE_WHITE_CAPTURE_SETUP, self.STATE_CALIBRATE]:
+                # All these states show a live, raw (potentially smoothed) spectrum
                 if not (self.spectrometer and device_proxy and hasattr(device_proxy, 'is_open') and device_proxy.is_open and self.wavelengths is not None):
-                     logger.debug(f"Spectrometer not ready or wavelengths missing for live plot in state: {current_internal_state}.")
-                     return None # Not ready for live data
+                     logger.debug(f"Spectrometer not ready for live plot in state: {current_internal_state}.")
+                     return None
 
                 current_integration_time_ms = self.menu_system.get_integration_time_ms()
                 if current_integration_time_ms != self._last_integration_time_ms:
@@ -2460,200 +2247,161 @@ class SpectrometerScreen:
 
                 raw_intensities_capture = self.spectrometer.intensities(correct_dark_counts=True, correct_nonlinearity=True)
                 if raw_intensities_capture is None or len(raw_intensities_capture) != len(self.wavelengths):
-                     logger.warning(f"Failed live capture for plot or length mismatch in state {current_internal_state}.")
+                     logger.warning(f"Failed live capture or length mismatch in state {current_internal_state}.")
                      return None
-                plot_wavelengths_local = self.wavelengths # Use instance wavelengths
+                plot_wavelengths_local = self.wavelengths
+                
+                # Determine Y-axis label based on actual collection mode for LIVE_VIEW
+                if current_internal_state == self.STATE_LIVE_VIEW:
+                    collection_mode = self.menu_system.get_collection_mode()
+                    if collection_mode == MODE_REFLECTANCE:
+                        # Here, if we were to display actual live reflectance, we'd calculate it.
+                        # The current structure is to always show raw-like counts for simplicity in plot.
+                        # The *saved* data for REFLECTANCE OOI would be calculated at save time if implemented.
+                        y_axis_label_str = "Reflectance (Calculated)" # Placeholder if calc was done
+                        # For now, still plot raw for live reflectance view, label indicates aspiration.
+                        # plot_intensities_to_display = calculate_live_reflectance(...)
+                        plot_intensities_to_display = raw_intensities_capture # Actually plotting raw
+                        y_axis_label_str = "Intensity (Reflect)" # More accurate to what's plotted
+                    else: # MODE_RAW
+                        y_axis_label_str = "Intensity (Counts)"
+                        plot_intensities_to_display = raw_intensities_capture
+                else: # DARK_SETUP, WHITE_SETUP, CALIBRATE_MENU
+                    y_axis_label_str = "Intensity (Counts)"
+                    plot_intensities_to_display = raw_intensities_capture
 
-                # --- Process intensities based on state ---
-                if current_internal_state == self.STATE_WHITE_REF_SETUP: # Displaying relative to stored white
-                     y_axis_label_str = "Relative Reflectance"
-                     if self._stored_white_reference is not None and np is not None and len(raw_intensities_capture) == len(self._stored_white_reference):
-                          # Ensure safe division
-                          safe_white_ref = np.where(self._stored_white_reference == 0, 1e-9, self._stored_white_reference)
-                          plot_intensities_to_display = raw_intensities_capture / safe_white_ref
-                     else:
-                          logger.warning("White reference invalid or NumPy unavailable for relative plot, showing raw counts instead.")
-                          plot_intensities_to_display = raw_intensities_capture # Fallback to raw
-                else: # STATE_LIVE_VIEW, STATE_CALIBRATE, STATE_DARK_CAPTURE (all show raw-like counts)
-                     y_axis_label_str = "Intensity (Counts)"
-                     # Apply smoothing if configured and NumPy available
-                     if np is not None and USE_LIVE_SMOOTHING and LIVE_SMOOTHING_WINDOW_SIZE > 1 and isinstance(raw_intensities_capture, np.ndarray):
-                         try:
-                             window_s = LIVE_SMOOTHING_WINDOW_SIZE
-                             if window_s % 2 == 0: window_s += 1 # Ensure odd
-                             if window_s > len(raw_intensities_capture): window_s = len(raw_intensities_capture) # Clamp
-
-                             if window_s < 3 : # Min practical window for convolve
-                                 plot_intensities_to_display = raw_intensities_capture
-                             else:
-                                 # Using a simple moving average
-                                 weights = np.ones(window_s) / float(window_s)
-                                 plot_intensities_to_display = np.convolve(raw_intensities_capture, weights, mode='same')
-                         except Exception as smooth_err:
-                             logger.error(f"Error during live smoothing: {smooth_err}. Using raw data for plot.")
-                             plot_intensities_to_display = raw_intensities_capture
-                     else: # No smoothing or NumPy unavailable
-                         plot_intensities_to_display = raw_intensities_capture
-
-            elif current_internal_state == self.STATE_FROZEN_VIEW: # Use frozen data
-                if not (self._frozen_intensities is not None and self._frozen_wavelengths is not None):
-                     logger.error("Frozen data or wavelengths missing for plot. Discarding frozen state.")
-                     self._handle_discard_frozen() # Clear inconsistent frozen state
-                     return None
-                plot_wavelengths_local = self._frozen_wavelengths
-                plot_intensities_to_display = self._frozen_intensities # This is raw data frozen
-                # If frozen mode was Reflectance, we'd ideally show that.
-                # This current path always shows the raw frozen data, labeled by mode.
-                frozen_mode_label = getattr(self, '_frozen_collection_mode', 'RAW').upper()
-                y_axis_label_str = f"Intensity ({frozen_mode_label} Frozen)"
-            else: # Should not happen with defined states
+                # Apply smoothing if configured, NumPy available, and data is ndarray
+                if np is not None and USE_LIVE_SMOOTHING and LIVE_SMOOTHING_WINDOW_SIZE > 1 and isinstance(plot_intensities_to_display, np.ndarray):
+                    try:
+                        window_s = LIVE_SMOOTHING_WINDOW_SIZE
+                        if window_s % 2 == 0: window_s += 1
+                        if window_s > len(plot_intensities_to_display): window_s = len(plot_intensities_to_display)
+                        if window_s >= 3 :
+                            weights = np.ones(window_s) / float(window_s)
+                            plot_intensities_to_display = np.convolve(plot_intensities_to_display, weights, mode='same')
+                    except Exception as smooth_err:
+                        logger.error(f"Error during live smoothing: {smooth_err}. Using unsmoothed data.")
+            else:
                  logger.error(f"Unknown plot state: {current_internal_state}. Cannot capture/plot.")
                  return None
 
-            # --- Ensure data is available for plotting ---
             if plot_wavelengths_local is None or plot_intensities_to_display is None:
                 logger.debug("No data available to plot (wavelengths or intensities are None).")
                 return None
 
-            # --- Update Plot Data & Axes ---
             self.plot_line.set_data(plot_wavelengths_local, plot_intensities_to_display)
-            # Determine Y-axis limit for current view
-            current_y_limit_for_plot = self._current_y_max
-            if current_internal_state == self.STATE_WHITE_REF_SETUP: # Specific Y-axis scaling for relative display
-                 current_y_limit_for_plot = max(Y_AXIS_MIN_CEILING_RELATIVE, self._current_y_max) # Ensure min ceiling
-            self.plot_ax.set_ylabel(y_axis_label_str, fontsize=9, color='white') # Updated font size
-            self.plot_ax.set_ylim(0, current_y_limit_for_plot)
+            self.plot_ax.set_ylabel(y_axis_label_str, fontsize=9, color='white')
+            self.plot_ax.set_ylim(0, self._current_y_max) # Always use current Y max
             self.plot_ax.set_xlim(min(plot_wavelengths_local), max(plot_wavelengths_local))
 
-            # --- Render Plot to In-Memory Buffer & Convert to Pygame Surface ---
-            plot_buffer = None # Initialize for finally block
+            plot_buffer = None
             try:
                  plot_buffer = io.BytesIO()
-                 # Use figure's DPI for saving to buffer to match on-screen appearance
                  self.plot_fig.savefig(plot_buffer, format='png', dpi=self.plot_fig.get_dpi(), bbox_inches='tight', pad_inches=0.05)
-                 plot_buffer.seek(0) # Rewind buffer to the beginning
-                 if plot_buffer.getbuffer().nbytes == 0: # Check if buffer is empty
-                     raise RuntimeError("Plot buffer is empty after savefig. Plotting may have failed silently.")
-                 # Load image from buffer into a Pygame surface
+                 plot_buffer.seek(0)
+                 if plot_buffer.getbuffer().nbytes == 0:
+                     raise RuntimeError("Plot buffer is empty after savefig.")
                  plot_surface = pygame.image.load(plot_buffer, "png")
-                 if plot_surface is None: # Check if load itself failed
-                     raise RuntimeError("pygame.image.load returned None when loading plot from buffer.")
+                 if plot_surface is None:
+                     raise RuntimeError("pygame.image.load returned None from buffer.")
                  return plot_surface
-            except RuntimeError as e_render_rt: # Catch specific runtime errors
-                 logger.error(f"Runtime error rendering plot to Pygame surface: {e_render_rt}", exc_info=True)
+            except RuntimeError as e_render_rt:
+                 logger.error(f"Runtime error rendering plot to Pygame surface: {e_render_rt}", exc_info=False) # Less verbose for frequent errors
                  return None
-            except Exception as render_err: # Catch any other unexpected errors
+            except Exception as render_err:
                  logger.error(f"Unexpected error rendering plot to Pygame surface: {render_err}", exc_info=True)
                  return None
             finally:
-                if plot_buffer: # Ensure buffer is closed
-                    plot_buffer.close()
+                if plot_buffer: plot_buffer.close()
 
-        # --- Exception Handling for Outer Try Block ---
-        except sb.SeaBreezeError as e_sb_plot: # Catch SeaBreeze errors during capture
-            logger.error(f"SeaBreezeError in _capture_and_plot: {e_sb_plot}", exc_info=True)
+        except sb.SeaBreezeError as e_sb_plot:
+            logger.error(f"SeaBreezeError in _capture_and_plot: {e_sb_plot}", exc_info=False)
             return None
-        except usb.core.USBError as e_usb_plot: # Catch USB errors
-            logger.error(f"USBError in _capture_and_plot: {e_usb_plot}", exc_info=True)
+        except usb.core.USBError as e_usb_plot:
+            logger.error(f"USBError in _capture_and_plot: {e_usb_plot}", exc_info=False)
             return None
-        except AttributeError as e_attr_plot: # Catch attribute errors (e.g., on None objects)
+        except AttributeError as e_attr_plot:
             logger.error(f"AttributeError in _capture_and_plot: {e_attr_plot}", exc_info=True)
             return None
-        except Exception as e_general_plot: # Catch any other unexpected errors
+        except Exception as e_general_plot:
             logger.error(f"General unhandled error in _capture_and_plot: {e_general_plot}", exc_info=True)
             return None
 
     def _draw_overlays(self):
-        """Draws status text overlays on the screen, including integ time and scan count on the same line."""
-        if not self.overlay_font:
-            logger.warning("Overlay font not available, cannot draw overlays.")
-            return
-        if self.menu_system is None:
-            logger.error("MenuSystem not available to SpectrometerScreen, cannot draw overlays correctly.")
-            return
-        if self.screen is None:
-            logger.error("Screen object is None in _draw_overlays.")
-            return
+        """Draws status text overlays on the screen."""
+        if not self.overlay_font: logger.warning("Overlay font not available."); return
+        if self.menu_system is None: logger.error("MenuSystem not available."); return
+        if self.screen is None: logger.error("Screen object is None."); return
 
-        display_integration_time_ms = DEFAULT_INTEGRATION_TIME_MS # Fallback
+        display_integration_time_ms = DEFAULT_INTEGRATION_TIME_MS
+        current_internal_state_local = self._current_state # Cache
+
         try:
-             current_internal_state_local = self._current_state
-             if current_internal_state_local == self.STATE_FROZEN_VIEW and self._frozen_integration_time_ms is not None:
-                  display_integration_time_ms = self._frozen_integration_time_ms
-             elif current_internal_state_local != self.STATE_FROZEN_VIEW:
+             if current_internal_state_local == self.STATE_FROZEN_VIEW and self._frozen_integration_ms is not None:
+                  display_integration_time_ms = self._frozen_integration_ms
+             elif current_internal_state_local != self.STATE_FROZEN_VIEW : # All other live/setup states
                   display_integration_time_ms = self.menu_system.get_integration_time_ms()
         except Exception as e_integ_get:
             logger.warning(f"Could not get integration time for overlay: {e_integ_get}")
 
         try:
-            # --- Top-Left Overlays: Integration Time and Scan Count ---
-            top_left_y_pos = 5
-            current_x_pos = 5
-            text_spacing = 10 # Horizontal space between "Integ" and "Scans" text
+            top_left_y_pos = 5; current_x_pos = 5; text_spacing = 10
 
-            # 1. Integration Time
             integ_text_str = f"Integ: {display_integration_time_ms} ms"
             integ_surf = self.overlay_font.render(integ_text_str, True, YELLOW)
-            assert isinstance(integ_surf, pygame.Surface), "Integration time overlay render failed"
+            assert isinstance(integ_surf, pygame.Surface), "Integ text render failed"
             self.screen.blit(integ_surf, (current_x_pos, top_left_y_pos))
-            current_x_pos += integ_surf.get_width() + text_spacing # Update X for next item
+            current_x_pos += integ_surf.get_width() + text_spacing
 
-            # 2. Scans Today Count
             scans_text_str = f"Scans: {self._scans_today_count}"
             scans_surf = self.overlay_font.render(scans_text_str, True, YELLOW)
-            assert isinstance(scans_surf, pygame.Surface), "Scans today overlay render failed"
-            # Blit scans_surf at the updated current_x_pos and same top_left_y_pos
+            assert isinstance(scans_surf, pygame.Surface), "Scans text render failed"
             self.screen.blit(scans_surf, (current_x_pos, top_left_y_pos))
-            # current_x_pos += scans_surf.get_width() + text_spacing # If more items were to follow on this line
 
-            # --- Mode/State Display (Top Right) ---
-            current_internal_state_for_display = self._current_state
-            state_text_to_render = ""
-            state_color = YELLOW # Default
-
-            if current_internal_state_for_display == self.STATE_LIVE_VIEW:
+            state_text_to_render = ""; state_color = YELLOW
+            if current_internal_state_local == self.STATE_LIVE_VIEW:
                 collection_mode_str = self.menu_system.get_collection_mode()
                 state_text_to_render = f"Mode: {collection_mode_str.upper()}"
-            elif current_internal_state_for_display == self.STATE_FROZEN_VIEW:
-                frozen_mode_label = getattr(self, '_frozen_collection_mode', 'FROZEN').upper()
-                state_text_to_render = f"Mode: {frozen_mode_label} (F)"
+            elif current_internal_state_local == self.STATE_FROZEN_VIEW:
+                frozen_type_disp = self._frozen_capture_type or "FROZEN"
+                if self._frozen_capture_type == self.FROZEN_TYPE_OOI:
+                    frozen_type_disp = self._frozen_sample_collection_mode or "SAMPLE"
+                state_text_to_render = f"Mode: {frozen_type_disp.upper()} (FROZEN)"
                 state_color = BLUE
-            elif current_internal_state_for_display == self.STATE_CALIBRATE:
-                state_text_to_render = "Mode: CALIBRATE"
+            elif current_internal_state_local == self.STATE_CALIBRATE:
+                state_text_to_render = "CALIBRATION MENU"
                 state_color = GREEN
-            elif current_internal_state_for_display == self.STATE_WHITE_REF_SETUP:
+            elif current_internal_state_local == self.STATE_DARK_CAPTURE_SETUP:
+                state_text_to_render = "Mode: DARK SETUP"
+                state_color = RED
+            elif current_internal_state_local == self.STATE_WHITE_CAPTURE_SETUP:
                 state_text_to_render = "Mode: WHITE SETUP"
                 state_color = CYAN
-            elif current_internal_state_for_display == self.STATE_DARK_CAPTURE:
-                state_text_to_render = "Mode: DARK CAPTURE"
-                state_color = RED
             else:
-                state_text_to_render = f"Mode: {current_internal_state_for_display.upper()} (UNKNOWN)"
-                logger.warning(f"Overlay: Unhandled state '{current_internal_state_for_display}' for mode text.")
+                state_text_to_render = f"Mode: {current_internal_state_local.upper()} (ERROR)"
+                logger.error(f"Overlay: Unhandled state '{current_internal_state_local}' for mode text.")
 
-            assert isinstance(state_text_to_render, str) and state_text_to_render, \
-                   f"state_text_to_render is invalid ('{state_text_to_render}') for state '{current_internal_state_for_display}'"
+            assert isinstance(state_text_to_render, str) and state_text_to_render, "State text invalid"
             state_surf = self.overlay_font.render(state_text_to_render, True, state_color)
-            assert isinstance(state_surf, pygame.Surface), "Mode/State overlay render failed"
-            state_rect = state_surf.get_rect(right=SCREEN_WIDTH - 5, top=top_left_y_pos) # Use same Y as top-left
+            assert isinstance(state_surf, pygame.Surface), "State text render failed"
+            state_rect = state_surf.get_rect(right=SCREEN_WIDTH - 5, top=top_left_y_pos)
             self.screen.blit(state_surf, state_rect)
 
-            # --- Contextual Hints Display (Bottom Center) ---
             hint_text_str = ""
-            if current_internal_state_for_display == self.STATE_LIVE_VIEW:
-                hint_text_str = "A:Freeze | X:Calib | Y:Rescale | B:Menu"
-            elif current_internal_state_for_display == self.STATE_FROZEN_VIEW:
-                hint_text_str = "A:Save | B:Discard"
-            elif current_internal_state_for_display == self.STATE_CALIBRATE:
-                hint_text_str = "A:White Setup | X:Dark Setup | B:Back"
-            elif current_internal_state_for_display == self.STATE_WHITE_REF_SETUP:
-                hint_text_str = "Aim@White -> A:Save Ref | B:Cancel"
-            elif current_internal_state_for_display == self.STATE_DARK_CAPTURE:
-                hint_text_str = "Cap On -> A:Save Dark | B:Cancel"
+            if current_internal_state_local == self.STATE_LIVE_VIEW:
+                hint_text_str = "A:Freeze | X:Calib Menu | Y:Rescale | B:Main Menu"
+            elif current_internal_state_local == self.STATE_FROZEN_VIEW:
+                hint_text_str = "A:Save Frozen | B:Discard Frozen"
+            elif current_internal_state_local == self.STATE_CALIBRATE:
+                hint_text_str = "A:White Setup | X:Dark Setup | B:Back (Live)"
+            elif current_internal_state_local == self.STATE_DARK_CAPTURE_SETUP:
+                hint_text_str = "A:Freeze Dark | B:Back (Calib Menu)"
+            elif current_internal_state_local == self.STATE_WHITE_CAPTURE_SETUP:
+                hint_text_str = "A:Freeze White | Y:Rescale | B:Back (Calib Menu)"
 
             if hint_text_str:
                 hint_surf = self.overlay_font.render(hint_text_str, True, YELLOW)
-                assert isinstance(hint_surf, pygame.Surface), "Hint overlay render failed"
+                assert isinstance(hint_surf, pygame.Surface), "Hint text render failed"
                 hint_rect = hint_surf.get_rect(centerx=SCREEN_WIDTH // 2, bottom=SCREEN_HEIGHT - 5)
                 self.screen.blit(hint_surf, hint_rect)
 
@@ -2664,143 +2412,82 @@ class SpectrometerScreen:
         except Exception as e:
             logger.error(f"Unexpected error rendering overlays: {e}", exc_info=True)
 
-            # --- Contextual Hints Display (Bottom Center) ---
-            hint_text_str = ""
-            # Use current_internal_state_for_display for consistency
-            if current_internal_state_for_display == self.STATE_LIVE_VIEW:
-                hint_text_str = "A:Freeze | X:Calib | Y:Rescale | B:Menu"
-            elif current_internal_state_for_display == self.STATE_FROZEN_VIEW:
-                hint_text_str = "A:Save | B:Discard"
-            elif current_internal_state_for_display == self.STATE_CALIBRATE:
-                hint_text_str = "A:White Setup | X:Dark Setup | B:Back"
-            elif current_internal_state_for_display == self.STATE_WHITE_REF_SETUP:
-                hint_text_str = "Aim@White -> A:Save Ref | B:Cancel"
-            elif current_internal_state_for_display == self.STATE_DARK_CAPTURE:
-                hint_text_str = "Cap On -> A:Save Dark | B:Cancel"
-
-            if hint_text_str:
-                hint_surf = self.overlay_font.render(hint_text_str, True, YELLOW)
-                assert isinstance(hint_surf, pygame.Surface), "Hint overlay render failed"
-                hint_rect = hint_surf.get_rect(centerx=SCREEN_WIDTH // 2, bottom=SCREEN_HEIGHT - 5)
-                self.screen.blit(hint_surf, hint_rect)
-
-        except pygame.error as e_render: # Catch Pygame-specific errors during render
-             logger.error(f"Pygame error rendering overlays: {e_render}", exc_info=True)
-        except AssertionError as e_assert: # Catch assertion errors from render checks
-            logger.error(f"AssertionError rendering overlays: {e_assert}", exc_info=True)
-        except Exception as e: # Catch any other unexpected errors
-            logger.error(f"Unexpected error rendering overlays: {e}", exc_info=True)
-
     def draw(self):
         """Draws the spectrometer screen based on the current state."""
-        if self.screen is None:
-            logger.error("Screen object is None in SpectrometerScreen.draw. Cannot draw.")
-            return
+        if self.screen is None: logger.error("Screen object is None in SpectrometerScreen.draw."); return
 
         device_proxy = getattr(self.spectrometer, '_dev', None)
-        # Determine if spectrometer is operational for plotting live data
         spectrometer_can_plot_live = (
-            USE_SPECTROMETER and
-            self.spectrometer is not None and
-            device_proxy is not None and
-            hasattr(device_proxy, 'is_open') and
-            device_proxy.is_open
+            USE_SPECTROMETER and self.spectrometer is not None and
+            device_proxy and hasattr(device_proxy, 'is_open') and device_proxy.is_open
         )
-        self.screen.fill(BLACK) # Clear screen at the start of every draw call
+        self.screen.fill(BLACK)
 
-        # --- Draw Plot or Error/Status Message ---
-        # Show "Not Ready" only if trying to plot live and spectrometer isn't ready
         if not spectrometer_can_plot_live and self._current_state != self.STATE_FROZEN_VIEW:
              if self.overlay_font:
                  err_text_str = "Spectrometer Not Ready"
                  if not USE_SPECTROMETER: err_text_str = "Spectrometer Disabled"
-                 elif self.spectrometer is None: err_text_str = "Spectrometer Not Found"
-                 elif not device_proxy or not hasattr(device_proxy, 'is_open'): err_text_str = "Spectrometer Backend Err"
-                 elif not device_proxy.is_open : err_text_str = "Spectrometer Connect Err"
-                 else: err_text_str = "Spectrometer Init Issue" # General fallback
-
+                 elif self.spectrometer is None: err_text_str = "Not Found"
+                 elif not device_proxy or not hasattr(device_proxy, 'is_open'): err_text_str = "Backend Err"
+                 elif not device_proxy.is_open : err_text_str = "Connect Err"
+                 else: err_text_str = "Init Issue"
                  err_surf = self.overlay_font.render(err_text_str, True, RED)
                  assert isinstance(err_surf, pygame.Surface), "Error text render failed"
                  err_rect = err_surf.get_rect(center=self.screen.get_rect().center)
                  self.screen.blit(err_surf, err_rect)
-        else: # Spectrometer is ready for live plotting OR we are in frozen view (can always plot frozen data)
-            plot_surface = self._capture_and_plot() # Handles current state for plotting
+        else:
+            plot_surface = self._capture_and_plot()
             if plot_surface:
-                 # Position plot with a top margin for overlays
-                 # Ensure plot_surface is valid before get_rect
-                 assert isinstance(plot_surface, pygame.Surface), "plot_surface from _capture_and_plot is not a Surface."
-                 plot_rect = plot_surface.get_rect(centerx=SCREEN_WIDTH // 2, top=25) # Increased top for scans text
-                 plot_rect.clamp_ip(self.screen.get_rect()) # Ensure it fits
+                 assert isinstance(plot_surface, pygame.Surface), "plot_surface invalid"
+                 plot_rect = plot_surface.get_rect(centerx=SCREEN_WIDTH // 2, top=25)
+                 plot_rect.clamp_ip(self.screen.get_rect())
                  self.screen.blit(plot_surface, plot_rect)
-            else: # Plotting failed or no data, show a placeholder
+            else:
                  if self.overlay_font:
                      status_text_str = "Plot Error"
                      if self._current_state != self.STATE_FROZEN_VIEW and spectrometer_can_plot_live:
-                         status_text_str = "Capturing..." # If live and spec ready but plot failed
+                         status_text_str = "Capturing..."
                      elif self._current_state != self.STATE_FROZEN_VIEW and not spectrometer_can_plot_live:
-                         # This case should ideally be caught by the "Spectrometer Not Ready" block above,
-                         # but as a fallback if logic flow is complex.
                          status_text_str = "Device Issue"
-
                      status_surf = self.overlay_font.render(status_text_str, True, GRAY)
                      assert isinstance(status_surf, pygame.Surface), "Status text render failed"
                      status_rect = status_surf.get_rect(center=self.screen.get_rect().center)
                      self.screen.blit(status_surf, status_rect)
-
-        # --- Draw Overlays (Hints, Status) ---
-        self._draw_overlays() # This will draw integ time, scans today, mode, and hints
-        update_hardware_display(self.screen, self.display_hat) # Update physical screen
-
+        self._draw_overlays()
+        update_hardware_display(self.screen, self.display_hat)
 
     def run_loop(self) -> str:
-        """Runs the main loop for the Spectrometer screen, handling input, drawing, and timing."""
+        """Runs the main loop for the Spectrometer screen."""
         logger.info(f"Starting Spectrometer screen loop (Initial State: {self._current_state}).")
-        # Assertion: menu_system must be available for integration time
         assert self.menu_system is not None, "MenuSystem is None at start of SpectrometerScreen.run_loop"
 
-        # Loop bound by self.is_active and global g_shutdown_flag
         while self.is_active and not g_shutdown_flag.is_set():
-            action = self.handle_input() # Handles Pygame events and button presses
+            action = self.handle_input()
             if action == "QUIT":
                 logger.info("SpectrometerScreen.handle_input signaled QUIT.")
-                self.deactivate() # Ensure screen is marked inactive
-                return "QUIT" # Propagate QUIT to main loop
+                self.deactivate(); return "QUIT"
             if action == "BACK_TO_MENU":
                 logger.info("SpectrometerScreen.handle_input signaled BACK_TO_MENU.")
-                self.deactivate() # Ensure screen is marked inactive
-                return "BACK"   # Signal main loop to switch to menu
+                self.deactivate(); return "BACK"
 
-            self.draw() # Draw the current state of the spectrometer screen
-
-            # Calculate wait time, potentially dynamic based on integration time
-            wait_time_ms = int(SPECTRO_LOOP_DELAY_S * 1000) # Default wait
+            self.draw()
+            wait_time_ms = int(SPECTRO_LOOP_DELAY_S * 1000)
             try:
-                # Only adjust wait time if in a live capture state
-                if self._current_state in [self.STATE_LIVE_VIEW, self.STATE_CALIBRATE,
-                                           self.STATE_WHITE_REF_SETUP, self.STATE_DARK_CAPTURE]:
+                if self._current_state not in [self.STATE_FROZEN_VIEW, self.STATE_CALIBRATE]: # Dynamic wait for live/setup
                      current_integ_ms_for_wait = self.menu_system.get_integration_time_ms()
-                     # Assertion: Check integration time for wait calculation
                      assert isinstance(current_integ_ms_for_wait, int) and current_integ_ms_for_wait >= 0, \
                             f"Invalid integration time for wait calc: {current_integ_ms_for_wait}"
-
                      if current_integ_ms_for_wait > 0:
-                         # Add a buffer to integration time for processing, plotting, etc.
                          target_wait_s = (current_integ_ms_for_wait / 1000.0) + SPECTRO_REFRESH_OVERHEAD_S
-                         # Ensure wait is not less than the base loop delay
                          wait_time_ms = int(max(SPECTRO_LOOP_DELAY_S, target_wait_s) * 1000)
-            except Exception as e_wait_calc: # Catch any error during wait calculation
+            except Exception as e_wait_calc:
                 logger.warning(f"Error calculating dynamic wait time: {e_wait_calc}. Using default.")
-                # wait_time_ms remains default
-
-            # Assertion: Ensure wait_time_ms is a non-negative integer
             assert isinstance(wait_time_ms, int) and wait_time_ms >= 0, f"Invalid wait_time_ms: {wait_time_ms}"
-            pygame.time.wait(wait_time_ms) # Pause for the calculated duration
+            pygame.time.wait(wait_time_ms)
 
-        # Loop exited, ensure deactivation if not already done
-        if self.is_active: # If exited due to g_shutdown_flag while still active
-            self.deactivate()
+        if self.is_active: self.deactivate()
         logger.info("Spectrometer screen loop finished.")
-        return "QUIT" if g_shutdown_flag.is_set() else "BACK" # Default to BACK if not explicit QUIT
+        return "QUIT" if g_shutdown_flag.is_set() else "BACK"
 
     def cleanup(self):
         """Cleans up spectrometer connection and plotting resources."""
@@ -2816,11 +2503,10 @@ class SpectrometerScreen:
                      logger.debug("Spectrometer already closed, invalid, or proxy not found during cleanup.")
             except sb.SeaBreezeError as e_sb_close:
                 logger.error(f"SeaBreezeError closing spectrometer: {e_sb_close}", exc_info=True)
-            except Exception as e: # Catch any other unexpected error
+            except Exception as e:
                 logger.error(f"Unexpected error closing spectrometer: {e}", exc_info=True)
-        self.spectrometer = None # Ensure it's None after cleanup attempt
+        self.spectrometer = None
 
-        # Clean up Matplotlib figure
         if self.plot_fig and plt and plt.fignum_exists(self.plot_fig.number):
             try:
                 plt.close(self.plot_fig)
@@ -2829,8 +2515,6 @@ class SpectrometerScreen:
                 logger.error(f"Error closing Matplotlib plot figure: {e_plot_close}", exc_info=True)
         self.plot_fig = self.plot_ax = self.plot_line = None
         logger.info("SpectrometerScreen cleanup complete.")
-        
-
 # --- Splash Screen Function ---
 def show_splash_screen(screen: pygame.Surface, display_hat_obj, duration_s: float):
     """
@@ -3025,7 +2709,6 @@ def show_disclaimer_screen(
 
     if not acknowledged: logger.warning("Exited disclaimer wait due to shutdown signal.")
     else: logger.info("Disclaimer screen finished.")
-
 
 # --- Signal Handling ---
 def setup_signal_handlers(button_handler: ButtonHandler, network_info: NetworkInfo):
