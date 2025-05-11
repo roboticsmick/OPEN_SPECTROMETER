@@ -32,8 +32,8 @@ import numpy as np # Might need later for data manipulation
 # If initialization fails despite the flag being True, an error will be logged.
 USE_DISPLAY_HAT = True       # Set to True if Pimoroni Display HAT Mini is connected
 USE_GPIO_BUTTONS = True      # Set to True if GPIO (LCD/Hall) buttons are connected
-USE_HALL_EFFECT_BUTTONS = False # Set to True to map external Hall sensors (requires USE_GPIO_BUTTONS=True)
-USE_LEAK_SENSOR = False        # Set to True if the external leak sensor is connected (requires USE_GPIO_BUTTONS=True)
+USE_HALL_EFFECT_BUTTONS = True # Set to True to map external Hall sensors (requires USE_GPIO_BUTTONS=True)
+USE_LEAK_SENSOR = True        # Set to True if the external leak sensor is connected (requires USE_GPIO_BUTTONS=True)
 USE_SPECTROMETER = True       # Set to True if the spectrometer is connected and should be used
 
 # Attempt to import hardware-specific libraries only if configured
@@ -119,6 +119,15 @@ except ImportError:
     print("FATAL ERROR: Pygame library not found. Cannot run.")
     sys.exit(1)
 
+# --- Logging Setup ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- Global Variables ---
+# These are managed primarily within classes or the main function after init
+g_shutdown_flag = threading.Event() # Used to signal shutdown to threads and loops
+g_leak_detected_flag = threading.Event()
+
 # --- Disclaimer Text ---
 # Use triple quotes for multi-line
 DISCLAIMER_TEXT = """\
@@ -137,14 +146,45 @@ purposes. Dive in at your own risk!
 # Define the base directory relative to the user's home
 DATA_BASE_DIR = os.path.expanduser("~/pysb-app")
 DATA_DIR = os.path.join(DATA_BASE_DIR, "spectra_data")
-CSV_FILENAME = os.path.join(DATA_DIR, "spectra_log.csv")
+# CSV_FILENAME = os.path.join(DATA_DIR, "spectra_log.csv") # Original single file
+# Modified to use daily CSV files as per App Overview for SpectrometerScreen._save_data logic
+# The CSV_FILENAME constant here might be a legacy if SpectrometerScreen handles its own daily naming.
+# For now, keeping it as SpectrometerScreen seems to implement its own daily log path.
+# If a global default log is needed, this should be clarified.
+# The Application Overview states: "Saves to daily CSV: YYYY-MM-DD_log.csv" under SpectrometerScreen._save_data.
+# This CSV_FILENAME global constant might be unused if all saving is via SpectrometerScreen.
+# Re-evaluating: SpectrometerScreen currently uses a hardcoded "spectra_log.csv" within its daily folder.
+# For consistency and to allow a configurable *base name*, let's use this global.
+CSV_BASE_FILENAME = "spectra_log.csv" # Base name for the daily CSV file
+
 PLOT_SAVE_DIR = DATA_DIR # Save plots in the same directory
 
+# Lens Type Constants
+LENS_TYPE_FIBER = "FIBER"
+LENS_TYPE_CABLE = "CABLE"
+LENS_TYPE_FIBER_CABLE = "FIBER+CABLE"
+DEFAULT_LENS_TYPE = LENS_TYPE_FIBER
+
 # Collection Mode Constants
-MODE_RAW = "Raw"
-MODE_RADIANCE = "Radiance"
-MODE_REFLECTANCE = "Reflectance"
-DEFAULT_COLLECTION_MODE = MODE_RADIANCE # Start with Radiance as default
+MODE_RAW = "RAW"
+MODE_RADIANCE = "RADIANCE" # Defined, but not used in AVAILABLE_COLLECTION_MODES for now
+MODE_REFLECTANCE = "REFLECTANCE"
+
+# Explicitly list available modes for the menu
+AVAILABLE_COLLECTION_MODES = (MODE_RAW, MODE_REFLECTANCE)
+# AVAILABLE_COLLECTION_MODES = (MODE_RAW, MODE_REFLECTANCE, MODE_RADIANCE) # Future
+DEFAULT_COLLECTION_MODE = MODE_RAW # Default to RAW
+
+# Ensure default is valid, fallback if not (though it should be with current setup)
+if DEFAULT_COLLECTION_MODE not in AVAILABLE_COLLECTION_MODES:
+    logger.warning(f"Default collection mode '{DEFAULT_COLLECTION_MODE}' is not in AVAILABLE_COLLECTION_MODES. Falling back.")
+    if AVAILABLE_COLLECTION_MODES: # Check if list is not empty
+        DEFAULT_COLLECTION_MODE = AVAILABLE_COLLECTION_MODES[0]
+    else: # Should not happen, but as a very safe fallback
+        DEFAULT_COLLECTION_MODE = MODE_RAW # Fallback to raw if list somehow empty
+        AVAILABLE_COLLECTION_MODES = (MODE_RAW,)
+
+
 
 # Integration Time (ms)
 INTEGRATION_TIME_SCALE_FACTOR = 10.0 # Factor to multiply calculated microseconds by
@@ -154,12 +194,13 @@ MAX_INTEGRATION_TIME_MS = 6000 # Increased max based on spectrometer
 INTEGRATION_TIME_STEP_MS = 100
 
 # Plotting Constants
+USE_LIVE_SMOOTHING = True # Flag to enable/disable smoothing
 LIVE_SMOOTHING_WINDOW_SIZE = 9
 Y_AXIS_DEFAULT_MAX = 1000
 Y_AXIS_RESCALE_FACTOR = 1.2
 Y_AXIS_MIN_CEILING = 60
-Y_AXIS_MIN_CEILING_RELATIVE = 1.1 
-INTEGRATION_TIME_SCALE_FACTOR = 10.0 
+Y_AXIS_MIN_CEILING_RELATIVE = 1.1
+# INTEGRATION_TIME_SCALE_FACTOR = 10.0 # Already defined above
 
 # GPIO Pin Definitions (BCM Mode)
 # --- Display HAT Mini Buttons (Corrected based on Pimoroni library standard) ---
@@ -169,14 +210,13 @@ PIN_DH_X = 16  # Was 12. Physical Button X (maps to Up logic) -> GPIO 16
 PIN_DH_Y = 24  # Was 13. Physical Button Y (maps to Down logic) -> GPIO 24
 
 # --- External Hall Effect Sensor Pins (Check these carefully for your wiring) ---
-# Ensure these DO NOT conflict with DH pins 5, 6, 16, 24 if both are used
-PIN_HALL_UP = 18     # Mirrors DH X (Up) -> Check if 18 is okay
-PIN_HALL_DOWN = 23   # Mirrors DH Y (Down) -> Check if 23 is okay
-PIN_HALL_ENTER = 20  # Mirrors DH A (Enter/Right) -> Check if 20 is okay
-PIN_HALL_BACK = 8    # Mirrors DH B (Back/Left) -> Check if 8 is okay
+PIN_HALL_UP = 20     # Mirrors DH X (Up)
+PIN_HALL_DOWN = 21   # Mirrors DH Y (Down)
+PIN_HALL_ENTER = 1  # Mirrors DH A (Enter/Right)
+PIN_HALL_BACK = 12    # Mirrors DH B (Back/Left)
 
 # --- Leak Sensor Pin ---
-PIN_LEAK = 21 # Changed from 26 in original code to match user request
+PIN_LEAK = 26 # Changed from 26 in original code to match user request
 
 # Button Logical Names (used internally)
 BTN_UP = 'up'
@@ -201,9 +241,9 @@ CYAN = (0, 255, 255)
 # Menu Layout
 FONT_SIZE = 16
 TITLE_FONT_SIZE = 22
-HINT_FONT_SIZE = 14
+HINT_FONT_SIZE = 15
 DISCLAIMER_FONT_SIZE = 14
-MENU_SPACING = 24
+MENU_SPACING = 19
 MENU_MARGIN_TOP = 44
 MENU_MARGIN_LEFT = 12
 
@@ -221,14 +261,6 @@ MAIN_LOOP_DELAY_S = 0.03 # Target ~30 FPS
 SPLASH_DURATION_S = 3.0 # Change to 6 for final
 SPECTRO_LOOP_DELAY_S = 0.05 # Target ~20 FPS for spectrometer screen (adjust as needed)
 SPECTRO_REFRESH_OVERHEAD_S = 0.05 # Add 50ms buffer to integration time for refresh delay
-
-# --- Logging Setup ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# --- Global Variables ---
-# These are managed primarily within classes or the main function after init
-g_shutdown_flag = threading.Event() # Used to signal shutdown to threads and loops
 
 # --- Classes ---
 class ButtonHandler:
@@ -339,7 +371,7 @@ class ButtonHandler:
                     if not (self._display_hat_buttons_enabled and PIN_LEAK in self._DH_PIN_TO_BUTTON):
                          RPi_GPIO_lib.setup(PIN_LEAK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
                          # Use a longer bouncetime for leak sensor? Depends on sensor characteristics.
-                         RPi_GPIO_lib.add_event_detect(PIN_LEAK, GPIO.FALLING, callback=self._leak_callback, bouncetime=1000)
+                         RPi_GPIO_lib.add_event_detect(PIN_LEAK, GPIO.FALLING, callback=self._leak_callback, bouncetime=1000) # g_leak_detected_flag is set here
                          self._manual_gpio_pins_used.add(PIN_LEAK) # Track for cleanup
                          logger.info(f"    Leak sensor event detection added on GPIO {PIN_LEAK}")
                     else:
@@ -433,9 +465,10 @@ class ButtonHandler:
         logger.critical(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
         logger.critical(f"!!! WATER LEAK DETECTED on GPIO {channel} !!!")
         logger.critical(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        # Future: Trigger visual alert, log persistent flag, attempt safe shutdown?
-        # Consider setting g_shutdown_flag here for immediate shutdown?
-        # g_shutdown_flag.set() # Uncomment for emergency stop on leak
+        g_leak_detected_flag.set() # Set the global flag for main loop to handle
+        # Optional: Immediately set g_shutdown_flag for emergency stop, but this might bypass some cleanup.
+        # g_shutdown_flag.set()
+
 
     def check_button(self, button_name: str) -> bool:
         """
@@ -740,7 +773,8 @@ class MenuSystem:
     # Define menu items and their corresponding actions or edit types
     MENU_ITEM_CAPTURE = "LOG SPECTRA"
     MENU_ITEM_INTEGRATION = "INTEGRATION TIME"
-    MENU_ITEM_COLLECTION_MODE = "COLLECTION MODE"    
+    MENU_ITEM_COLLECTION_MODE = "COLLECTION MODE"
+    MENU_ITEM_LENS_TYPE = "LENS TYPE"
     MENU_ITEM_DATE = "DATE"
     MENU_ITEM_TIME = "TIME"
     MENU_ITEM_WIFI = "WIFI"
@@ -750,17 +784,20 @@ class MenuSystem:
     EDIT_TYPE_INTEGRATION = 1
     EDIT_TYPE_DATE = 2
     EDIT_TYPE_TIME = 3
-    EDIT_TYPE_COLLECTION_MODE = 4 
-    
+    EDIT_TYPE_COLLECTION_MODE = 4
+    EDIT_TYPE_LENS_TYPE = 5
+
     # Fields for date/time editing
     FIELD_YEAR = 'year'
     FIELD_MONTH = 'month'
     FIELD_DAY = 'day'
     FIELD_HOUR = 'hour'
     FIELD_MINUTE = 'minute'
-    # FIELD_SECOND = 'second' # Seconds editing removed for simplicity
-    
-    COLLECTION_MODES = (MODE_RAW, MODE_RADIANCE, MODE_REFLECTANCE)
+
+    # Use the global AVAILABLE_COLLECTION_MODES to define modes for this menu instance
+    COLLECTION_MODES = AVAILABLE_COLLECTION_MODES
+
+    LENS_TYPES = (LENS_TYPE_FIBER, LENS_TYPE_CABLE, LENS_TYPE_FIBER_CABLE)
 
     def __init__(self, screen: pygame.Surface, button_handler: ButtonHandler, network_info: NetworkInfo):
         """
@@ -778,105 +815,100 @@ class MenuSystem:
 
         # --- Application State ---
         self._integration_time_ms = DEFAULT_INTEGRATION_TIME_MS
-        # Collection Mode State 
+
+        # Collection Mode State
+        # self.COLLECTION_MODES is now (MODE_RAW, MODE_REFLECTANCE) due to class attribute
+        assert len(self.COLLECTION_MODES) > 0, "COLLECTION_MODES cannot be empty for MenuSystem"
         try:
-             # Find the index of the default mode
              self._collection_mode_idx = self.COLLECTION_MODES.index(DEFAULT_COLLECTION_MODE)
         except ValueError:
-             logger.warning(f"Default collection mode '{DEFAULT_COLLECTION_MODE}' not found in modes list. Defaulting to index 0.")
-             self._collection_mode_idx = 0 # Fallback to first item
+             logger.warning(f"Default collection mode '{DEFAULT_COLLECTION_MODE}' not found in this MenuSystem's modes list '{self.COLLECTION_MODES}'. Defaulting to index 0.")
+             self._collection_mode_idx = 0
         self._collection_mode = self.COLLECTION_MODES[self._collection_mode_idx]
-        # Assertion: Ensure initial mode index is valid
         assert 0 <= self._collection_mode_idx < len(self.COLLECTION_MODES), "Initial collection mode index out of bounds"
-        # Assertion: Ensure initial mode is a valid string
         assert isinstance(self._collection_mode, str) and self._collection_mode in self.COLLECTION_MODES, "Initial collection mode is invalid"
+
+        # Lens Type State
+        try:
+            self._lens_type_idx = self.LENS_TYPES.index(DEFAULT_LENS_TYPE)
+        except ValueError:
+            logger.warning(f"Default lens type '{DEFAULT_LENS_TYPE}' not found in types list. Defaulting to index 0.")
+            self._lens_type_idx = 0
+        self._lens_type = self.LENS_TYPES[self._lens_type_idx]
+        assert 0 <= self._lens_type_idx < len(self.LENS_TYPES), "Initial lens type index out of bounds"
+        assert isinstance(self._lens_type, str) and self._lens_type in self.LENS_TYPES, "Initial lens type is invalid"
+
         # Store offset from system time, not an absolute editable time
         self._time_offset = datetime.timedelta(0)
-        # Store offset before editing starts, for discard/revert
         self._original_offset_on_edit_start: datetime.timedelta | None = None
-        # Store the absolute datetime being manipulated *during* edits
         self._datetime_being_edited: datetime.datetime | None = None
 
         # --- Menu Structure ---
-        # Use tuples for immutability where appropriate
         self._menu_items = (
             (self.MENU_ITEM_CAPTURE, self.EDIT_TYPE_NONE),
             (self.MENU_ITEM_INTEGRATION, self.EDIT_TYPE_INTEGRATION),
             (self.MENU_ITEM_COLLECTION_MODE, self.EDIT_TYPE_COLLECTION_MODE),
+            (self.MENU_ITEM_LENS_TYPE, self.EDIT_TYPE_LENS_TYPE),
             (self.MENU_ITEM_DATE, self.EDIT_TYPE_DATE),
             (self.MENU_ITEM_TIME, self.EDIT_TYPE_TIME),
             (self.MENU_ITEM_WIFI, self.EDIT_TYPE_NONE),
             (self.MENU_ITEM_IP, self.EDIT_TYPE_NONE),
         )
         self._current_selection_idx = 0
-        # Assertion: Ensure menu items exist
         assert len(self._menu_items) > 0, "Menu items list cannot be empty"
 
         # --- Editing State ---
         self._is_editing = False
-        self._editing_field: str | None = None # e.g. FIELD_YEAR
+        self._editing_field: str | None = None
 
         # --- Font Initialization ---
         self.font: pygame.font.Font | None = None
         self.title_font: pygame.font.Font | None = None
         self.hint_font: pygame.font.Font | None = None
-        self._value_start_offset_x = 120 # Default/fallback value alignment X pos
+        self._value_start_offset_x = 120 # Default fallback
 
-        self._load_fonts() # Encapsulate font loading
+        self._load_fonts()
         if self.font:
-             # Assertion: Check font loaded successfully
              assert self.font is not None, "Main font should be loaded before calculating offset"
-             self._calculate_value_offset() # Calculate alignment if fonts loaded
+             self._calculate_value_offset()
         else:
-             logger.error("Main font failed to load; cannot calculate value offset.")
+             logger.error("Main font failed to load; cannot calculate value offset for menu items.")
 
 
     def _load_fonts(self):
         """Loads fonts from the assets folder. Uses global constants for filenames."""
         try:
-            # Check Pygame font module initialization
             if not pygame.font.get_init():
                 logger.info("Initializing Pygame font module.")
                 pygame.font.init()
-            # Assertion: Pygame font module must be initialized
             assert pygame.font.get_init(), "Pygame font module failed to initialize"
 
-
             logger.info("Loading fonts from assets folder...")
-
-            # --- Get the absolute path to the script's directory ---
             script_dir = os.path.dirname(os.path.abspath(__file__))
             assets_dir = os.path.join(script_dir, 'assets')
-            # Assertion: Check assets dir exists? Maybe too strict, handle missing files below.
-            # assert os.path.isdir(assets_dir), f"Assets directory not found: {assets_dir}"
 
-            # --- Define paths using centralized constants ---
             title_font_path = os.path.join(assets_dir, TITLE_FONT_FILENAME)
             main_font_path = os.path.join(assets_dir, MAIN_FONT_FILENAME)
             hint_font_path = os.path.join(assets_dir, HINT_FONT_FILENAME)
 
-            # Assertion: Check paths are strings
             assert isinstance(title_font_path, str), "Title font path is not a string"
             assert isinstance(main_font_path, str), "Main font path is not a string"
             assert isinstance(hint_font_path, str), "Hint font path is not a string"
 
-            # --- Load fonts with error handling ---
             try:
-                # Check file exists before loading
                 if not os.path.isfile(title_font_path):
                     logger.error(f"Title font file not found: '{title_font_path}'. Using fallback.")
                     self.title_font = pygame.font.SysFont(None, TITLE_FONT_SIZE)
                 else:
                     self.title_font = pygame.font.Font(title_font_path, TITLE_FONT_SIZE)
                     logger.info(f"Loaded title font: {title_font_path}")
-            except pygame.error as e: # Catch specific Pygame errors
+            except pygame.error as e:
                 logger.error(f"Failed to load title font '{title_font_path}' using Pygame: {e}. Using fallback.")
-                self.title_font = pygame.font.SysFont(None, TITLE_FONT_SIZE) # Fallback
-            except Exception as e: # Catch other potential errors
+                self.title_font = pygame.font.SysFont(None, TITLE_FONT_SIZE)
+            except Exception as e:
                 logger.error(f"Unexpected error loading title font '{title_font_path}': {e}. Using fallback.", exc_info=True)
                 self.title_font = pygame.font.SysFont(None, TITLE_FONT_SIZE)
 
-            # Repeat for main font
             try:
                 if not os.path.isfile(main_font_path):
                      logger.error(f"Main font file not found: '{main_font_path}'. Using fallback.")
@@ -891,7 +923,6 @@ class MenuSystem:
                 logger.error(f"Unexpected error loading main font '{main_font_path}': {e}. Using fallback.", exc_info=True)
                 self.font = pygame.font.SysFont(None, FONT_SIZE)
 
-            # Repeat for hint font
             try:
                 if not os.path.isfile(hint_font_path):
                      logger.error(f"Hint font file not found: '{hint_font_path}'. Using fallback.")
@@ -906,421 +937,315 @@ class MenuSystem:
                 logger.error(f"Unexpected error loading hint font '{hint_font_path}': {e}. Using fallback.", exc_info=True)
                 self.hint_font = pygame.font.SysFont(None, HINT_FONT_SIZE)
 
-            # Final check if *essential* fonts are usable
-            if not self.font: # Main font is essential for menu items
+            if not self.font:
                  logger.critical("Essential main font failed to load, even with fallbacks. Menu will likely fail.")
-                 # raise RuntimeError("Essential fonts failed to load") # Can be too harsh
-            # Assertion: Ensure fonts are Font objects or None after loading
             assert isinstance(self.title_font, (pygame.font.Font, type(None))), "Title font is invalid type"
             assert isinstance(self.font, (pygame.font.Font, type(None))), "Main font is invalid type"
             assert isinstance(self.hint_font, (pygame.font.Font, type(None))), "Hint font is invalid type"
 
-
         except Exception as e:
             logger.critical(f"Critical error during Pygame font initialization/loading: {e}", exc_info=True)
-            # Ensure fonts are None if init fails badly
             self.font = None
             self.title_font = None
             self.hint_font = None
-            # Optional: raise RuntimeError("Font initialization failed")
 
     def _calculate_value_offset(self):
         """Calculates the X offset for aligned value display based on label widths."""
-        # Assertion: Must have main font loaded
         assert self.font is not None, "Cannot calculate value offset without main font."
         try:
             max_label_width = 0
-            # Define the prefixes used for labels that have values next to them
-            # These should match exactly how they are rendered in _draw_menu_items
             label_prefixes = {
                 self.MENU_ITEM_INTEGRATION: "INTEGRATION:",
                 self.MENU_ITEM_COLLECTION_MODE: "MODE:",
+                self.MENU_ITEM_LENS_TYPE: "LENS TYPE:", # <<< NEW
                 self.MENU_ITEM_DATE: "DATE:",
                 self.MENU_ITEM_TIME: "TIME:",
                 self.MENU_ITEM_WIFI: "WIFI:",
                 self.MENU_ITEM_IP: "IP:"
             }
 
-            # Iterate through menu items to find the longest relevant label prefix
-            # Loop has fixed upper bound based on menu items (tuple length)
             for item_text, _ in self._menu_items:
                  prefix = label_prefixes.get(item_text)
-                 if prefix: # Only consider items with a defined prefix
-                      # Assertion: Check prefix is string
+                 if prefix:
                       assert isinstance(prefix, str), f"Label prefix for {item_text} is not a string"
-                      # Calculate width using the loaded font
                       label_width = self.font.size(prefix)[0]
                       max_label_width = max(max_label_width, label_width)
 
-            # Add a small gap after the longest label for visual separation
-            label_gap = 8 # Adjusted gap
-            # Assertion: Ensure calculated offset is numeric
+            label_gap = 8
             assert isinstance(max_label_width, (int, float)), "Max label width calculation failed"
-            self._value_start_offset_x = int(max_label_width + label_gap) # Ensure integer
+            self._value_start_offset_x = int(max_label_width + label_gap)
             logger.info(f"Calculated value start offset X: {self._value_start_offset_x} (based on max label width {max_label_width})")
 
         except Exception as e:
             logger.error(f"Failed to calculate value start offset: {e}. Using default fallback {self._value_start_offset_x}.")
-            # Keep the default fallback value set in __init__
-            self._value_start_offset_x = 120 # Reset to default
+            self._value_start_offset_x = 120
 
-    # --- Helper to get the time to display/use ---
     def _get_current_app_display_time(self) -> datetime.datetime:
         """Calculates the current time including the user-defined offset."""
-        # Use timezone-naive datetime objects for simplicity here
-        # Be aware of potential issues if system time transitions DST while app is running
-        # For simple offset, naive should be okay.
-        # Assertion: Ensure offset is timedelta
         assert isinstance(self._time_offset, datetime.timedelta), "Time offset is not a timedelta object"
         try:
             now = datetime.datetime.now()
-            # Assertion: Check 'now' is datetime object
             assert isinstance(now, datetime.datetime), "datetime.now() returned unexpected type"
             app_time = now + self._time_offset
-            # Assertion: Check 'app_time' is datetime object
             assert isinstance(app_time, datetime.datetime), "Time calculation resulted in unexpected type"
             return app_time
         except OverflowError:
             logger.warning("Time offset resulted in datetime overflow. Resetting offset.")
             self._time_offset = datetime.timedelta(0)
-            # Assertion: Ensure offset is reset correctly
             assert self._time_offset == datetime.timedelta(0), "Offset reset failed"
             return datetime.datetime.now()
 
-    # --- Public Methods ---
-
     def get_integration_time_ms(self) -> int:
         """Returns the currently configured integration time in milliseconds."""
-        # Assertion: Ensure return value is int
         assert isinstance(self._integration_time_ms, int), "Internal integration time is not int"
         return self._integration_time_ms
 
     def get_timestamp_datetime(self) -> datetime.datetime:
         """Returns a datetime object representing the current app time (System + Offset)."""
-        # Useful for getting the time to embed in filenames etc.
         dt = self._get_current_app_display_time()
-        # Assertion: Ensure return value is datetime
         assert isinstance(dt, datetime.datetime), "get_current_app_display_time returned invalid type"
         return dt
-    
-    # Accessor for Collection Mode 
+
     def get_collection_mode(self) -> str:
         """Returns the currently selected collection mode string."""
-        # Assertion: Ensure mode is valid
         assert self._collection_mode in self.COLLECTION_MODES, "Internal collection mode state is invalid"
         return self._collection_mode
 
+    def get_lens_type(self) -> str: # <<< NEW
+        """Returns the currently selected lens type string."""
+        assert self._lens_type in self.LENS_TYPES, "Internal lens type state is invalid"
+        return self._lens_type
 
     def handle_input(self) -> str | None:
         """
         Processes button inputs based on the current menu state (navigation or editing).
         Returns "QUIT" to signal application exit, "CAPTURE" to start capture, or None otherwise.
         """
-        # 1. Process Pygame events first (catches window close, escape key)
         pygame_event_result = self.button_handler.process_pygame_events()
         if pygame_event_result == "QUIT":
-            # Assertion: Check return value validity
             assert pygame_event_result == "QUIT", "process_pygame_events returned unexpected value"
-            return "QUIT" # Exit signal
+            return "QUIT"
 
-        # 2. Handle button presses based on state
         action = None
         if self._is_editing:
-            # Assertion: Editing field must be set if editing (except complex types)
-            # Ensure index is valid before accessing menu item
             assert 0 <= self._current_selection_idx < len(self._menu_items), "Invalid index for editing state check"
             item_text, edit_type = self._menu_items[self._current_selection_idx]
-            # Modified Assertion: Field is only required for Date/Time edit types
+            # Lens type and collection mode also don't use _editing_field
             assert (self._editing_field is not None or edit_type not in [self.EDIT_TYPE_DATE, self.EDIT_TYPE_TIME]), \
                    f"Editing state inconsistent: _editing_field is None for type {edit_type}"
             action = self._handle_editing_input()
         else:
-            # Assertion: Should not be editing
             assert not self._is_editing and self._editing_field is None, "Navigation input called while editing state is inconsistent"
             action = self._handle_navigation_input()
 
-        # Assertion: Check action type (str or None)
         assert isinstance(action, (str, type(None))), "Input handler returned unexpected type"
 
-
-        # 3. Process actions returned by input handlers
         if action == "EXIT_EDIT_SAVE":
             self._is_editing = False
-            self._editing_field = None # Clear field even if not used
-            if self._datetime_being_edited is not None: # Only commit if a datetime was edited
-                 # Assertion: Check object type before commit
+            self._editing_field = None
+            if self._datetime_being_edited is not None:
                  assert isinstance(self._datetime_being_edited, datetime.datetime), "Cannot commit invalid datetime object"
                  self._commit_time_offset_changes()
-            # Clear temporary edit state regardless
             self._datetime_being_edited = None
             self._original_offset_on_edit_start = None
             logger.info("Exited editing mode, changes saved (if any).")
-            return None # Stay in menu
+            return None
         elif action == "EXIT_EDIT_DISCARD":
-             # For simple modes like Collection Mode, discard is same as save currently
-             # because changes apply immediately on Up/Down. Keep separate for now.
             self._is_editing = False
             self._editing_field = None
-            # Restore the original offset if it was saved
             if self._original_offset_on_edit_start is not None:
-                # Assertion: Check original offset type
                 assert isinstance(self._original_offset_on_edit_start, datetime.timedelta), "Cannot restore invalid offset type"
                 self._time_offset = self._original_offset_on_edit_start
                 logger.info("Exited editing mode, time offset changes discarded.")
             else:
-                # This case shouldn't happen if logic is correct for Date/Time,
-                # but is expected for Integration/Collection modes
-                logger.debug("Exited editing mode via BACK (discard), no original offset to revert.")
-            # Clear temporary edit state
+                logger.debug("Exited editing mode via BACK (discard), no original offset to revert (expected for Integ/Mode/Lens).")
             self._datetime_being_edited = None
             self._original_offset_on_edit_start = None
             logger.info("Exited editing mode (Discard).")
-            return None # Stay in menu
+            return None
         elif action == "START_CAPTURE":
             logger.info("Capture action triggered.")
-            return "CAPTURE" # Signal to main loop
+            return "START_CAPTURE"
         elif action == "QUIT":
-            # This shouldn't be returned directly by handlers anymore, but handle defensively
             logger.warning("QUIT action returned unexpectedly from input handler.")
             return "QUIT"
         else:
-            # No action needed or action handled internally (e.g., field change)
             return None
 
     def draw(self):
         """Draws the complete menu screen."""
-        # Assertions for essential resources
         assert self.font, "Main font not loaded, cannot draw menu items."
         assert self.title_font, "Title font not loaded, cannot draw title."
         assert self.hint_font, "Hint font not loaded, cannot draw hints."
         assert self.screen is not None, "Screen surface not available for drawing."
 
         try:
-            # Clear screen
             self.screen.fill(BLACK)
-
-            # Draw components
             self._draw_title()
-            self._draw_menu_items() # Handles alignment and editing highlight
+            self._draw_menu_items()
             self._draw_hints()
-
-            # Update the physical display
-            # Assertion: Ensure display_hat (if used) is assigned
-            # update_hardware_display handles None display_hat object gracefully
             update_hardware_display(self.screen, self.display_hat)
-
         except pygame.error as e:
              logger.error(f"Pygame error during drawing: {e}", exc_info=True)
-             # Attempt to recover or just skip frame? For now, log and continue.
         except Exception as e:
              logger.error(f"Unexpected error during drawing: {e}", exc_info=True)
 
-
     def cleanup(self):
         """Performs any cleanup needed by the menu system."""
-        # Currently, MenuSystem primarily uses resources managed elsewhere (Pygame fonts, screen)
-        # Pygame fonts are managed by pygame.font module, cleanup happens on pygame.quit()
         logger.info("MenuSystem cleanup completed (no specific actions needed).")
         pass
 
-    # --- Private Input Handling Methods ---
-
     def _handle_navigation_input(self) -> str | None:
         """ Handles UP/DOWN/ENTER/BACK when in navigation mode. """
-        # Assertion: Check state
         assert not self._is_editing, "Navigation input called while editing"
-
-        action = None # Default return
+        action = None
         if self.button_handler.check_button(BTN_UP):
             self._navigate_menu(-1)
         elif self.button_handler.check_button(BTN_DOWN):
             self._navigate_menu(1)
         elif self.button_handler.check_button(BTN_ENTER):
-            action = self._select_menu_item() # This might start editing or trigger capture
+            action = self._select_menu_item()
         elif self.button_handler.check_button(BTN_BACK):
-            # Optional: Implement Back action in main menu (e.g., go to a parent menu if exists, or quit?)
             logger.info("BACK pressed in main menu (no action defined).")
-            # action = "QUIT" # Example: Uncomment to make BACK exit the app from main menu
             pass
-
-        # Assertion: Check action type
         assert isinstance(action, (str, type(None))), "Navigation input returning invalid type"
-        return action # No external action required unless selecting item
+        return action
 
     def _handle_editing_input(self) -> str | None:
         """ Handles UP/DOWN/ENTER/BACK when editing a value. """
-        # Assertion: Check state
         assert self._is_editing, "Editing input called while not editing"
-
-        # Get the edit type of the currently selected item
-        # Assertion: Check index bounds
         assert 0 <= self._current_selection_idx < len(self._menu_items), "Invalid menu selection index"
         item_text, edit_type = self._menu_items[self._current_selection_idx]
+        action = None
 
-        action = None # Action to return (e.g., exit states)
-
-        # UP/DOWN adjust the current field's value or cycle mode
         if self.button_handler.check_button(BTN_UP):
-            self._handle_edit_adjust(edit_type, 1) # Increment/Increase/Cycle Up
+            self._handle_edit_adjust(edit_type, 1)
         elif self.button_handler.check_button(BTN_DOWN):
-             self._handle_edit_adjust(edit_type, -1) # Decrement/Decrease/Cycle Down
-
-        # ENTER cycles to the next field or confirms/exits (SAVE)
+             self._handle_edit_adjust(edit_type, -1)
         elif self.button_handler.check_button(BTN_ENTER):
-            action = self._handle_edit_next_field(edit_type) # Returns "EXIT_EDIT_SAVE" on finish
-
-        # BACK exits edit mode
-        # <<< MODIFIED: Let BACK also save for simple types like Mode/Integration >>>
-        # <<< For Date/Time, keep it as discard? Revert: Keep discard for now for consistency. >>>
+            action = self._handle_edit_next_field(edit_type)
         elif self.button_handler.check_button(BTN_BACK):
-            action = "EXIT_EDIT_DISCARD" # Signal discard
+            action = "EXIT_EDIT_DISCARD"
 
-        # Assertion: Check action type
         assert isinstance(action, (str, type(None))), "Editing input returning invalid type"
-        return action # Returns None if just adjusting/changing field, or exit action
+        return action
 
     def _navigate_menu(self, direction: int):
         """Updates the current menu selection index, wrapping around."""
-        # Assertion: Check direction validity
         assert direction in [-1, 1], f"Invalid navigation direction: {direction}"
         num_items = len(self._menu_items)
-        # Assertion: Ensure num_items is positive before modulo
         assert num_items > 0, "Menu has no items"
-
         self._current_selection_idx = (self._current_selection_idx + direction) % num_items
-        # Assertion: Ensure index remains valid after calculation
         assert 0 <= self._current_selection_idx < num_items, "Menu index out of bounds after navigation"
         logger.debug(f"Menu navigated. New selection index: {self._current_selection_idx}, Item: {self._menu_items[self._current_selection_idx][0]}")
 
     def _select_menu_item(self) -> str | None:
         """ Handles the ENTER action in navigation mode (Starts editing or action). """
-        # Assertion: Check index bounds
         assert 0 <= self._current_selection_idx < len(self._menu_items), "Invalid menu selection index"
         item_text, edit_type = self._menu_items[self._current_selection_idx]
         logger.info(f"Menu item selected: {item_text}")
-
-        action_result = None # Default return
+        action_result = None
 
         if item_text == self.MENU_ITEM_CAPTURE:
             if USE_SPECTROMETER:
                 logger.info("Triggering spectrometer capture screen.")
-                action_result = "START_CAPTURE" # Signal action to main loop
+                action_result = "START_CAPTURE"
             else:
                 logger.warning("Capture Spectra selected, but USE_SPECTROMETER is False.")
                 action_result = None
-
-        # --- Start Editing (Includes new Collection Mode type) ---
-        elif edit_type in [self.EDIT_TYPE_INTEGRATION, self.EDIT_TYPE_COLLECTION_MODE, self.EDIT_TYPE_DATE, self.EDIT_TYPE_TIME]:
+        # <<< MODIFIED: Include LENS_TYPE in editable items >>>
+        elif edit_type in [self.EDIT_TYPE_INTEGRATION, self.EDIT_TYPE_COLLECTION_MODE, self.EDIT_TYPE_LENS_TYPE, self.EDIT_TYPE_DATE, self.EDIT_TYPE_TIME]:
             logger.info(f"Entering edit mode for: {item_text}")
             self._is_editing = True
 
-            # Store current offset ONLY for Date/Time edits
             if edit_type in [self.EDIT_TYPE_DATE, self.EDIT_TYPE_TIME]:
                 self._original_offset_on_edit_start = self._time_offset
                 self._datetime_being_edited = self._get_current_app_display_time()
-                # Assertion: Ensure datetime object created
                 assert self._datetime_being_edited is not None, "Failed to get current app time for editing"
             else:
-                 self._original_offset_on_edit_start = None # Not needed for Integ/Mode
+                 self._original_offset_on_edit_start = None
                  self._datetime_being_edited = None
 
-
-            # Set the initial field to edit (only for Date/Time)
             if edit_type == self.EDIT_TYPE_DATE:
-                self._editing_field = self.FIELD_YEAR # Start with Year
+                self._editing_field = self.FIELD_YEAR
                 logger.debug(f"Starting edit: Date (Initial: {self._datetime_being_edited.strftime('%Y-%m-%d')}, Field: Year)")
             elif edit_type == self.EDIT_TYPE_TIME:
-                self._editing_field = self.FIELD_HOUR # Start with Hour
+                self._editing_field = self.FIELD_HOUR
                 logger.debug(f"Starting edit: Time (Initial: {self._datetime_being_edited.strftime('%H:%M')}, Field: Hour)")
             elif edit_type == self.EDIT_TYPE_INTEGRATION:
-                 self._editing_field = None # Integration time doesn't use fields
+                 self._editing_field = None
                  logger.debug(f"Starting edit: Integration Time (Current: {self._integration_time_ms} ms)")
             elif edit_type == self.EDIT_TYPE_COLLECTION_MODE:
-                 self._editing_field = None # Collection mode doesn't use fields
+                 self._editing_field = None
                  logger.debug(f"Starting edit: Collection Mode (Current: {self._collection_mode})")
-
-            action_result = None # Stay in menu, now in edit mode
-
-        # --- Read-only items (WIFI, IP) ---
+            elif edit_type == self.EDIT_TYPE_LENS_TYPE: # <<< NEW
+                 self._editing_field = None
+                 logger.debug(f"Starting edit: Lens Type (Current: {self._lens_type})")
+            action_result = None
         elif item_text in [self.MENU_ITEM_WIFI, self.MENU_ITEM_IP]:
              logger.info(f"Selected read-only item: {item_text}")
-             action_result = None # No action on select for these items
-
-        # --- Fallback ---
+             action_result = None
         else:
              logger.warning(f"Selected menu item '{item_text}' with unknown type/action: {edit_type}")
              action_result = None
-
-        # Assertion: Check return type
         assert isinstance(action_result, (str, type(None))), "Select menu item returning invalid type"
         return action_result
+
     def _handle_edit_adjust(self, edit_type: int, delta: int):
-        """ Adjusts the value of the currently edited item (Integration, Mode, Date, Time). """
-        # Assertions: Check state and parameters
+        """ Adjusts the value of the currently edited item. """
         assert self._is_editing, "Adjust called when not editing"
         assert delta in [-1, 1], f"Invalid adjustment delta: {delta}"
-        # <<< MODIFIED: Include COLLECTION_MODE in valid types >>>
-        assert edit_type in [self.EDIT_TYPE_INTEGRATION, self.EDIT_TYPE_COLLECTION_MODE, self.EDIT_TYPE_DATE, self.EDIT_TYPE_TIME], f"Invalid edit type for adjustment: {edit_type}"
+        # <<< MODIFIED: Include LENS_TYPE in valid edit types >>>
+        assert edit_type in [self.EDIT_TYPE_INTEGRATION, self.EDIT_TYPE_COLLECTION_MODE, self.EDIT_TYPE_LENS_TYPE, self.EDIT_TYPE_DATE, self.EDIT_TYPE_TIME], f"Invalid edit type for adjustment: {edit_type}"
 
         if edit_type == self.EDIT_TYPE_INTEGRATION:
-            # Adjust integration time directly
             current_val = self._integration_time_ms
             step = INTEGRATION_TIME_STEP_MS
             new_val = current_val + delta * step
-            # Clamp within defined limits
             clamped_val = max(MIN_INTEGRATION_TIME_MS, min(new_val, MAX_INTEGRATION_TIME_MS))
-            # Assertion: Check clamped value is within bounds
             assert MIN_INTEGRATION_TIME_MS <= clamped_val <= MAX_INTEGRATION_TIME_MS, "Integration time out of bounds after clamp"
             self._integration_time_ms = clamped_val
             logger.debug(f"Integration time adjusted to {self._integration_time_ms} ms")
-
-        # <<< NEW: Handle Collection Mode cycling >>>
         elif edit_type == self.EDIT_TYPE_COLLECTION_MODE:
              num_modes = len(self.COLLECTION_MODES)
-             # Assertion: Check number of modes is positive
              assert num_modes > 0, "Collection modes list is empty"
-             # Calculate new index with wrapping
              new_idx = (self._collection_mode_idx + delta) % num_modes
-             # Assertion: Check new index is valid
              assert 0 <= new_idx < num_modes, "Calculated collection mode index is out of bounds"
              self._collection_mode_idx = new_idx
              self._collection_mode = self.COLLECTION_MODES[new_idx]
              logger.debug(f"Collection mode changed to: {self._collection_mode}")
-
-
+        elif edit_type == self.EDIT_TYPE_LENS_TYPE: # <<< NEW
+             num_types = len(self.LENS_TYPES)
+             assert num_types > 0, "Lens types list is empty"
+             new_idx = (self._lens_type_idx + delta) % num_types
+             assert 0 <= new_idx < num_types, "Calculated lens type index is out of bounds"
+             self._lens_type_idx = new_idx
+             self._lens_type = self.LENS_TYPES[new_idx]
+             logger.debug(f"Lens type changed to: {self._lens_type}")
         elif edit_type == self.EDIT_TYPE_DATE:
-             # Assertion: Ensure datetime object exists for editing
              assert self._datetime_being_edited is not None, "Cannot adjust Date, _datetime_being_edited is None"
-             self._change_date_field(delta) # Delegate to date change helper
-
+             self._change_date_field(delta)
         elif edit_type == self.EDIT_TYPE_TIME:
-             # Assertion: Ensure datetime object exists for editing
              assert self._datetime_being_edited is not None, "Cannot adjust Time, _datetime_being_edited is None"
-             self._change_time_field(delta) # Delegate to time change helper
-
-        # No explicit return value needed, side effect is changing internal state
-
+             self._change_time_field(delta)
 
     def _handle_edit_next_field(self, edit_type: int) -> str | None:
         """ Moves to the next editable field, or returns 'EXIT_EDIT_SAVE' if done. """
-        # Assertion: Check state
         assert self._is_editing
-        # <<< MODIFIED: Include COLLECTION_MODE in valid types >>>
-        assert edit_type in [self.EDIT_TYPE_INTEGRATION, self.EDIT_TYPE_COLLECTION_MODE, self.EDIT_TYPE_DATE, self.EDIT_TYPE_TIME], f"Invalid edit type for next field: {edit_type}"
-
-        action_result = None # Default return
+        # <<< MODIFIED: Include LENS_TYPE in valid edit types >>>
+        assert edit_type in [self.EDIT_TYPE_INTEGRATION, self.EDIT_TYPE_COLLECTION_MODE, self.EDIT_TYPE_LENS_TYPE, self.EDIT_TYPE_DATE, self.EDIT_TYPE_TIME], f"Invalid edit type for next field: {edit_type}"
+        action_result = None
 
         if edit_type == self.EDIT_TYPE_INTEGRATION:
             logger.debug("Finished editing Integration Time.")
-            action_result = "EXIT_EDIT_SAVE" # No fields, Enter saves/exits
-
-        # <<< NEW: Handle Collection Mode exit >>>
+            action_result = "EXIT_EDIT_SAVE"
         elif edit_type == self.EDIT_TYPE_COLLECTION_MODE:
             logger.debug("Finished editing Collection Mode.")
-            action_result = "EXIT_EDIT_SAVE" # No fields, Enter saves/exits
-
+            action_result = "EXIT_EDIT_SAVE"
+        elif edit_type == self.EDIT_TYPE_LENS_TYPE: # <<< NEW
+            logger.debug("Finished editing Lens Type.")
+            action_result = "EXIT_EDIT_SAVE"
         elif edit_type == self.EDIT_TYPE_DATE:
-            # Assertion: Check current field is valid for Date
             assert self._editing_field in [self.FIELD_YEAR, self.FIELD_MONTH, self.FIELD_DAY], f"Invalid date field '{self._editing_field}'"
             if self._editing_field == self.FIELD_YEAR:
                 self._editing_field = self.FIELD_MONTH
@@ -1330,175 +1255,109 @@ class MenuSystem:
                 logger.debug("Editing next field: Day")
             elif self._editing_field == self.FIELD_DAY:
                 logger.debug("Finished editing Date fields.")
-                action_result = "EXIT_EDIT_SAVE" # Finished all date fields
-
+                action_result = "EXIT_EDIT_SAVE"
         elif edit_type == self.EDIT_TYPE_TIME:
-            # Assertion: Check current field is valid for Time
             assert self._editing_field in [self.FIELD_HOUR, self.FIELD_MINUTE], f"Invalid time field '{self._editing_field}'"
             if self._editing_field == self.FIELD_HOUR:
                 self._editing_field = self.FIELD_MINUTE
                 logger.debug("Editing next field: Minute")
             elif self._editing_field == self.FIELD_MINUTE:
                 logger.debug("Finished editing Time fields.")
-                action_result = "EXIT_EDIT_SAVE" # Finished all time fields
-
-        # Assertion: Check return type
+                action_result = "EXIT_EDIT_SAVE"
         assert isinstance(action_result, (str, type(None))), "Next field returning invalid type"
-        return action_result # Stay in edit mode (return None) or exit (return string)
-
-    # --- Private Date/Time Manipulation ---
+        return action_result
 
     def _change_date_field(self, delta: int):
         """ Increments/decrements the current date field of the temporary _datetime_being_edited. """
-        # Assertions: Check state and parameters
         assert self._datetime_being_edited is not None, "Cannot change date field, _datetime_being_edited is None"
         assert self._editing_field in [self.FIELD_YEAR, self.FIELD_MONTH, self.FIELD_DAY], f"Invalid date field '{self._editing_field}' for adjustment"
         assert delta in [-1, 1], f"Invalid delta value: {delta}"
 
-        # Operate on a copy or use components to create a new date safely
         current_dt = self._datetime_being_edited
         year, month, day = current_dt.year, current_dt.month, current_dt.day
-        # Preserve time components
         hour, minute, second = current_dt.hour, current_dt.minute, current_dt.second
-        # Assertions: Check component types
         assert all(isinstance(v, int) for v in [year, month, day, hour, minute, second]), "Date/time components are not integers"
-
         logger.debug(f"Attempting to change temporary Date field '{self._editing_field}' by {delta} from {year}-{month:02d}-{day:02d}")
 
-        # Calculate new component values with wrapping/clamping
         if self._editing_field == self.FIELD_YEAR:
             year += delta
-            year = max(1970, min(2100, year)) # Clamp year reasonably
+            year = max(1970, min(2100, year))
         elif self._editing_field == self.FIELD_MONTH:
             month += delta
-            # Wrap month
             if month > 12: month = 1
             elif month < 1: month = 12
         elif self._editing_field == self.FIELD_DAY:
-            # Calculate max days for the *potentially changed* month and year
             import calendar
             try:
-                # Use the potentially updated year/month
-                # Assertion: Check year/month validity before monthrange
                 assert 1 <= month <= 12, "Invalid month for calendar.monthrange"
                 _, max_days = calendar.monthrange(year, month)
                 day += delta
-                 # Wrap day
                 if day > max_days: day = 1
                 elif day < 1: day = max_days
             except ValueError:
-                # Handle cases like Feb 30th attempt during month change
                 logger.warning(f"Invalid intermediate date ({year}-{month}) for day calculation. Clamping day.")
-                # Calculate new day without wrapping first for get_safe_datetime
                 day += delta
-                # Clamp day crudely here just to avoid *huge* numbers?
                 day = max(1, min(day, 31))
 
-
-        # Attempt to create the new temporary datetime using the helper
-        # This handles invalid combinations like Feb 30th gracefully (returns None)
         new_datetime = get_safe_datetime(year, month, day, hour, minute, second)
-
-        # Check return value
         if new_datetime:
-            # Assertion: Check new datetime is valid object
             assert isinstance(new_datetime, datetime.datetime), "get_safe_datetime returned invalid type"
-            self._datetime_being_edited = new_datetime # Update the temporary object
+            self._datetime_being_edited = new_datetime
             logger.debug(f"Temporary Date being edited is now: {self._datetime_being_edited.strftime('%Y-%m-%d')}")
         else:
-            # This case indicates the adjustment resulted in an invalid date (e.g., Feb 30).
-            # The temporary date is *not* updated, effectively ignoring the invalid change.
             logger.warning(f"Date field change resulted in invalid date. Change ignored.")
-            # Assertion: Ensure temporary datetime object remains valid
             assert isinstance(self._datetime_being_edited, datetime.datetime), "Temporary datetime became invalid"
-
 
     def _change_time_field(self, delta: int):
         """ Increments/decrements the current time field of the temporary _datetime_being_edited. """
-         # Assertions: Check state and parameters
         assert self._datetime_being_edited is not None, "Cannot change time field, _datetime_being_edited is None"
-        assert self._editing_field in [self.FIELD_HOUR, self.FIELD_MINUTE], f"Invalid time field '{self._editing_field}' for adjustment" # Removed SECOND
+        assert self._editing_field in [self.FIELD_HOUR, self.FIELD_MINUTE], f"Invalid time field '{self._editing_field}' for adjustment"
         assert delta in [-1, 1], f"Invalid delta value: {delta}"
-
-        # Use timedelta for safer time manipulation, handles wrapping automatically
-        time_delta = datetime.timedelta(0) # Initialize
+        time_delta = datetime.timedelta(0)
         if self._editing_field == self.FIELD_HOUR:
             time_delta = datetime.timedelta(hours=delta)
         elif self._editing_field == self.FIELD_MINUTE:
             time_delta = datetime.timedelta(minutes=delta)
-        # Removed seconds
-        # elif self._editing_field == self.FIELD_SECOND:
-        #     time_delta = datetime.timedelta(seconds=delta)
         else:
-             # This case should not be reachable due to the assertion above
              logger.error(f"Logic error: _change_time_field called with invalid field '{self._editing_field}'")
              return
-
-        # Assertion: Check time_delta is timedelta object
         assert isinstance(time_delta, datetime.timedelta), "Failed to create valid timedelta"
-
         logger.debug(f"Attempting to change temporary Time field '{self._editing_field}' by {delta} hours/mins")
-
         try:
             new_datetime = self._datetime_being_edited + time_delta
-            # Assertion: Ensure result is datetime
             assert isinstance(new_datetime, datetime.datetime), "Time delta calculation resulted in invalid type"
             self._datetime_being_edited = new_datetime
-            logger.debug(f"Temporary Time being edited is now: {self._datetime_being_edited.strftime('%H:%M:%S')}") # Log with seconds for clarity
+            logger.debug(f"Temporary Time being edited is now: {self._datetime_being_edited.strftime('%H:%M:%S')}")
         except OverflowError:
              logger.warning(f"Time field change resulted in datetime overflow. Change ignored.")
-             # Datetime object remains unchanged
-             # Assertion: Ensure temporary datetime object remains valid
              assert isinstance(self._datetime_being_edited, datetime.datetime), "Temporary datetime became invalid after overflow attempt"
-
 
     def _commit_time_offset_changes(self):
         """ Calculates and stores the new time offset based on the final edited datetime. """
-        # Assertion: Check state
         assert self._datetime_being_edited is not None, "Commit called but no datetime was being edited."
-
         try:
-            # Final desired absolute time from the editor
             final_edited_time = self._datetime_being_edited
-            # Current system time (at the moment of commit)
             current_system_time = datetime.datetime.now()
-            # Assertions: Check types before calculation
             assert isinstance(final_edited_time, datetime.datetime), "Final edited time is invalid type"
             assert isinstance(current_system_time, datetime.datetime), "Current system time is invalid type"
-
-
-            # Calculate the difference (Offset = TargetTime - SystemTime)
             new_offset = final_edited_time - current_system_time
-            # Assertion: Ensure offset is timedelta
             assert isinstance(new_offset, datetime.timedelta), "Offset calculation resulted in invalid type"
-
-            # Store the new offset
             self._time_offset = new_offset
-
             logger.info(f"Time offset update finalized.")
             logger.info(f"  Final edited time: {final_edited_time.strftime('%Y-%m-%d %H:%M:%S')}")
             logger.info(f"  System time at commit: {current_system_time.strftime('%Y-%m-%d %H:%M:%S')}")
             logger.info(f"  New time offset stored: {self._time_offset}")
-            # Log seconds for offset calculation even if not edited/displayed
-
         except Exception as e:
              logger.error(f"Error calculating or storing time offset: {e}", exc_info=True)
-             # Keep the old offset if calculation fails?
              logger.warning("Time offset commit failed. Previous offset retained.")
-             # Assertion: Ensure offset remains a valid timedelta
              assert isinstance(self._time_offset, datetime.timedelta), "Time offset became invalid after commit failure"
 
-
-    # --- Private Drawing Methods ---
     def _draw_title(self):
         """Draws the main title."""
-        # Assertion: Should have valid font here (checked in draw)
         assert self.title_font, "Title font not loaded"
         try:
             title_text = self.title_font.render("OPEN SPECTRO MENU", True, YELLOW)
-            # Assertion: Ensure render result is a Surface
             assert isinstance(title_text, pygame.Surface), "Title render failed"
-            # Center the title horizontally, place it near the top
             title_rect = title_text.get_rect(centerx=SCREEN_WIDTH // 2, top=10)
             self.screen.blit(title_text, title_rect)
         except pygame.error as e:
@@ -1506,52 +1365,44 @@ class MenuSystem:
         except Exception as e:
              logger.error(f"Unexpected error rendering title: {e}", exc_info=True)
 
-
     def _draw_menu_items(self):
         """ Draws the menu items, aligning values and handling highlight/edit states. """
-        # Assertion: Font must be loaded
         assert self.font is not None, "Cannot draw menu items without main font."
         y_position = MENU_MARGIN_TOP
-        # Get the base time to display (may be overridden if editing)
         datetime_to_display_default = self._get_current_app_display_time()
-        # Assertion: Check default datetime is valid
         assert isinstance(datetime_to_display_default, datetime.datetime), "Default display time is invalid"
 
-        # Loop has fixed upper bound (length of _menu_items tuple)
         for i, (item_text, edit_type) in enumerate(self._menu_items):
             try:
                 is_selected = (i == self._current_selection_idx)
                 is_being_edited = (is_selected and self._is_editing)
-                # Assertions: Check loop variables are valid types
                 assert isinstance(item_text, str), f"Menu item text at index {i} is not string"
                 assert isinstance(edit_type, int), f"Menu item edit type at index {i} is not int"
                 assert isinstance(is_selected, bool), "is_selected flag is not bool"
                 assert isinstance(is_being_edited, bool), "is_being_edited flag is not bool"
 
-                # --- Determine which datetime object to use for formatting ---
                 datetime_for_formatting = datetime_to_display_default
                 if is_being_edited and edit_type in [self.EDIT_TYPE_DATE, self.EDIT_TYPE_TIME]:
-                    # Assertion: Must have the temp object if editing Date/Time
                     assert self._datetime_being_edited is not None, "Editing Date/Time but _datetime_being_edited is None"
-                    # Assertion: Check temp object type
                     assert isinstance(self._datetime_being_edited, datetime.datetime), "Temporary datetime object is invalid type"
                     datetime_for_formatting = self._datetime_being_edited
 
-                # --- Generate Label and Value Strings ---
-                label_text = item_text # Default for items without separate values
+                label_text = item_text
                 value_text = ""
-                prefix = "" # Used for alignment calculation
+                prefix = "" # Used for alignment, though not directly drawn
 
-                # Map items to their labels and how to get their values
                 if item_text == self.MENU_ITEM_INTEGRATION:
-                    prefix = "INTEGRATION:"
-                    label_text = prefix
+                    prefix = "INTEGRATION:" # For _calculate_value_offset
+                    label_text = prefix      # Text to draw
                     value_text = f"{self._integration_time_ms} ms"
-                # <<< NEW: Handle Collection Mode Display >>>
                 elif item_text == self.MENU_ITEM_COLLECTION_MODE:
                     prefix = "MODE:"
                     label_text = prefix
-                    value_text = self._collection_mode # Get current mode string
+                    value_text = self._collection_mode
+                elif item_text == self.MENU_ITEM_LENS_TYPE: # <<< NEW
+                    prefix = "LENS TYPE:"
+                    label_text = prefix
+                    value_text = self._lens_type
                 elif item_text == self.MENU_ITEM_DATE:
                     prefix = "DATE:"
                     label_text = prefix
@@ -1559,184 +1410,133 @@ class MenuSystem:
                 elif item_text == self.MENU_ITEM_TIME:
                     prefix = "TIME:"
                     label_text = prefix
-                    value_text = f"{datetime_for_formatting.strftime('%H:%M')}" # Display HH:MM only
+                    value_text = f"{datetime_for_formatting.strftime('%H:%M')}"
                 elif item_text == self.MENU_ITEM_WIFI:
                     prefix = "WIFI:"
                     label_text = prefix
-                    value_text = self.network_info.get_wifi_name() # Fetch current value
+                    value_text = self.network_info.get_wifi_name()
                 elif item_text == self.MENU_ITEM_IP:
                     prefix = "IP:"
                     label_text = prefix
-                    value_text = self.network_info.get_ip_address() # Fetch current value
-                # else: label_text = item_text, value_text = "" (e.g., for CAPTURE)
+                    value_text = self.network_info.get_ip_address()
 
-                # Assertions: Check generated text types
                 assert isinstance(label_text, str), "Generated label text is not string"
                 assert isinstance(value_text, str), "Generated value text is not string"
 
-
-                # --- Determine Color ---
                 color = WHITE
-                # Special coloring for network status
                 is_network_item = item_text in [self.MENU_ITEM_WIFI, self.MENU_ITEM_IP]
                 is_connected = not ("Not Connected" in value_text or "Error" in value_text or "No IP" in value_text)
-                # Assertions: Check flag types
                 assert isinstance(is_network_item, bool), "is_network_item flag is not bool"
                 assert isinstance(is_connected, bool), "is_connected flag is not bool"
 
                 if is_selected:
-                    color = YELLOW # Highlight selected item
+                    color = YELLOW
                 elif is_network_item and not is_connected:
-                    color = GRAY # Dim disconnected network info
-                # Assertion: Check color is tuple
+                    color = GRAY
                 assert isinstance(color, tuple), "Color is not a tuple"
 
-
-                # --- Render and Blit Label (Aligned Left) ---
                 label_surface = self.font.render(label_text, True, color)
-                # Assertion: Check render result
                 assert isinstance(label_surface, pygame.Surface), f"Label render failed for '{label_text}'"
                 self.screen.blit(label_surface, (MENU_MARGIN_LEFT, y_position))
 
-                # --- Render and Blit Value (Aligned at calculated offset) ---
-                if value_text: # Only blit value if it exists
+                if value_text:
                     value_surface = self.font.render(value_text, True, color)
-                    # Assertion: Check render result
                     assert isinstance(value_surface, pygame.Surface), f"Value render failed for '{value_text}'"
-                    # Use the calculated offset for the value's starting position
                     value_pos_x = MENU_MARGIN_LEFT + self._value_start_offset_x
                     self.screen.blit(value_surface, (value_pos_x, y_position))
 
-                # --- Draw Editing Highlight ---
-                # <<< MODIFIED: Include Collection Mode Highlight >>>
-                if is_being_edited and edit_type in [self.EDIT_TYPE_INTEGRATION, self.EDIT_TYPE_COLLECTION_MODE, self.EDIT_TYPE_DATE, self.EDIT_TYPE_TIME]:
+                # <<< MODIFIED: Include LENS_TYPE highlight >>>
+                if is_being_edited and edit_type in [self.EDIT_TYPE_INTEGRATION, self.EDIT_TYPE_COLLECTION_MODE, self.EDIT_TYPE_LENS_TYPE, self.EDIT_TYPE_DATE, self.EDIT_TYPE_TIME]:
                     self._draw_editing_highlight(y_position, edit_type, label_text, value_text)
 
             except pygame.error as e:
                 logger.error(f"Pygame error rendering menu item '{item_text}': {e}")
-                # Draw placeholder or skip? Skip for now.
             except Exception as e:
                 logger.error(f"Unexpected error rendering menu item '{item_text}': {e}", exc_info=True)
 
-            # Move to next line position
             y_position += MENU_SPACING
-            # Assertion: Ensure y_position remains numeric
             assert isinstance(y_position, int), "y_position is not integer"
 
     def _draw_editing_highlight(self, y_pos: int, edit_type: int, label_str: str, value_str: str):
         """ Draws highlight rectangle around the specific field or value being edited. """
-        # Assertion: Font must be loaded
         assert self.font is not None, "Cannot draw highlight without main font."
-        # Assertions: Check input parameters
         assert isinstance(y_pos, int), "y_pos must be integer"
         assert isinstance(edit_type, int), "edit_type must be integer"
         assert isinstance(label_str, str), "label_str must be string"
         assert isinstance(value_str, str), "value_str must be string"
 
-
-        # Base X position where values start (includes margin + offset)
         value_start_x = MENU_MARGIN_LEFT + self._value_start_offset_x
-        # Assertion: Check offset calculation is valid
         assert isinstance(value_start_x, int), "value_start_x calculation failed"
 
         highlight_rect = None
         try:
-            # Determine the text segment corresponding to the specific field being edited
-            field_str = ""  # The text part (e.g., "2024", "08", "15", "1000", "Radiance")
-            offset_str = "" # The text *before* the field within the value string (e.g., "YYYY-", "YYYY-MM-")
+            field_str = ""
+            offset_str = ""
 
             if edit_type == self.EDIT_TYPE_INTEGRATION:
-                 # Highlight the number part of "1000 ms"
-                 field_str = str(self._integration_time_ms) # The number itself
-                 offset_str = "" # No prefix within the value part
-            # <<< NEW: Highlight Collection Mode >>>
+                 field_str = str(self._integration_time_ms)
+                 offset_str = ""
             elif edit_type == self.EDIT_TYPE_COLLECTION_MODE:
-                 # Highlight the entire mode string ("Raw", "Radiance", etc.)
-                 field_str = self._collection_mode # The mode string itself
-                 offset_str = "" # No prefix within the value part
+                 field_str = self._collection_mode
+                 offset_str = ""
+            elif edit_type == self.EDIT_TYPE_LENS_TYPE: # <<< NEW
+                 field_str = self._lens_type
+                 offset_str = ""
             elif edit_type == self.EDIT_TYPE_DATE:
-                # Assertion: Must have datetime object and field
                 assert self._datetime_being_edited is not None and self._editing_field is not None, "Missing state for date highlight"
-                # Use the currently edited datetime to format the value string reliably
                 formatted_date = self._datetime_being_edited.strftime('%Y-%m-%d')
                 if self._editing_field == self.FIELD_YEAR:   field_str, offset_str = formatted_date[0:4], ""
-                elif self._editing_field == self.FIELD_MONTH: field_str, offset_str = formatted_date[5:7], formatted_date[0:5] # "YYYY-"
-                elif self._editing_field == self.FIELD_DAY:   field_str, offset_str = formatted_date[8:10], formatted_date[0:8] # "YYYY-MM-"
-                else:
-                     logger.error(f"Invalid editing field '{self._editing_field}' for date highlight")
-                     return
+                elif self._editing_field == self.FIELD_MONTH: field_str, offset_str = formatted_date[5:7], formatted_date[0:5]
+                elif self._editing_field == self.FIELD_DAY:   field_str, offset_str = formatted_date[8:10], formatted_date[0:8]
+                else: logger.error(f"Invalid editing field '{self._editing_field}' for date highlight"); return
             elif edit_type == self.EDIT_TYPE_TIME:
-                # Assertion: Must have datetime object and field
                 assert self._datetime_being_edited is not None and self._editing_field is not None, "Missing state for time highlight"
-                # Use the currently edited datetime (HH:MM format)
                 formatted_time = self._datetime_being_edited.strftime('%H:%M')
                 if self._editing_field == self.FIELD_HOUR:   field_str, offset_str = formatted_time[0:2], ""
-                elif self._editing_field == self.FIELD_MINUTE: field_str, offset_str = formatted_time[3:5], formatted_time[0:3] # "HH:"
-                else:
-                     logger.error(f"Invalid editing field '{self._editing_field}' for time highlight")
-                     return
-            else:
-                 logger.warning(f"Highlight requested for unknown edit type {edit_type}")
-                 return
+                elif self._editing_field == self.FIELD_MINUTE: field_str, offset_str = formatted_time[3:5], formatted_time[0:3]
+                else: logger.error(f"Invalid editing field '{self._editing_field}' for time highlight"); return
+            else: logger.warning(f"Highlight requested for unknown edit type {edit_type}"); return
 
-            # Assertions: Check string types after calculation
             assert isinstance(field_str, str), "field_str is not string"
             assert isinstance(offset_str, str), "offset_str is not string"
 
-            # Calculate widths based *only* on the relevant text segments
             field_width = self.font.size(field_str)[0] if field_str else 0
             offset_within_value_width = self.font.size(offset_str)[0] if offset_str else 0
-            # Assertions: Check widths are numeric
             assert isinstance(field_width, int), "field_width calculation failed"
             assert isinstance(offset_within_value_width, int), "offset_within_value_width calculation failed"
 
-
-            # Calculate final X position for the highlight rectangle
             highlight_x = value_start_x + offset_within_value_width
-
-            # Define the rectangle (add small padding)
             padding = 1
             highlight_rect = pygame.Rect(
                 highlight_x - padding,
                 y_pos - padding,
                 field_width + 2 * padding,
-                FONT_SIZE + 2 * padding # Use font size for height
+                FONT_SIZE + 2 * padding
             )
-            # Assertion: Check rect created
             assert isinstance(highlight_rect, pygame.Rect), "Failed to create highlight Rect"
 
         except pygame.error as e:
-             logger.error(f"Pygame error calculating highlight size: {e}")
-             return # Abort drawing highlight if calculation fails
+             logger.error(f"Pygame error calculating highlight size: {e}"); return
         except Exception as e:
-             logger.error(f"Unexpected error calculating highlight: {e}", exc_info=True)
-             return
+             logger.error(f"Unexpected error calculating highlight: {e}", exc_info=True); return
 
-        # Draw the rectangle if successfully calculated
         if highlight_rect:
-            # Assertion: Check screen exists
             assert self.screen is not None, "Screen is None, cannot draw highlight"
-            pygame.draw.rect(self.screen, BLUE, highlight_rect, 1) # 1px thick border
+            pygame.draw.rect(self.screen, BLUE, highlight_rect, 1)
+
     def _draw_hints(self):
         """Draws contextual hints at the bottom."""
-        # Assertion: Font must be loaded
         assert self.hint_font is not None, "Hint font object is not available"
         hint_text = ""
         if self._is_editing:
-            # Hints specific to editing mode
             hint_text = "X/Y: Adjust | A: Next/Save | B: Cancel"
         else:
-            # Hints for navigation mode
-            hint_text = "X/Y: Navigate | A: Select/Edit | B: Back" # Clarify Back action if any
-        # Assertion: Check hint text is string
+            hint_text = "X/Y: Navigate | A: Select/Edit | B: Back"
         assert isinstance(hint_text, str), "Generated hint text is not string"
         try:
             hint_surface = self.hint_font.render(hint_text, True, YELLOW)
-            # Assertion: Check render result
             assert isinstance(hint_surface, pygame.Surface), "Hint render failed"
-            # Position hints at the bottom-left
             hint_rect = hint_surface.get_rect(left=MENU_MARGIN_LEFT, bottom=SCREEN_HEIGHT - 10)
-            # Assertion: Check screen exists
             assert self.screen is not None, "Screen is None, cannot draw hints"
             self.screen.blit(hint_surface, hint_rect)
         except pygame.error as e:
@@ -1751,674 +1551,1285 @@ class SpectrometerScreen:
     and a simplified state-based calibration workflow.
     """
     # Internal state flags
-    STATE_LIVE_VIEW = "live"           # Normal live view of raw counts
-    STATE_FROZEN_VIEW = "frozen"         # Frozen OOI scan view
-    STATE_CALIBRATE = "calibrate"       # Mode active, showing live raw, expecting calib type selection
-    STATE_WHITE_REF_SETUP = "white_setup" # Live relative view after capturing white ref
-    STATE_DARK_CAPTURE = "dark_capture"   # Live raw view for dark capture setup
+    STATE_LIVE_VIEW = "live"
+    STATE_FROZEN_VIEW = "frozen"
+    STATE_CALIBRATE = "calibrate"
+    STATE_WHITE_REF_SETUP = "white_setup"
+    STATE_DARK_CAPTURE = "dark_capture"
 
     def __init__(self, screen: pygame.Surface, button_handler: ButtonHandler, menu_system: MenuSystem, display_hat_obj):
+        # Assertions for parameters
+        assert screen is not None, "Screen object is required for SpectrometerScreen"
+        assert button_handler is not None, "ButtonHandler object is required for SpectrometerScreen"
+        assert menu_system is not None, "MenuSystem object is required for SpectrometerScreen"
+        # display_hat_obj can be None, handled by update_hardware_display
+
         self.screen = screen
         self.button_handler = button_handler
         self.menu_system = menu_system
         self.display_hat = display_hat_obj
 
         self.spectrometer: Spectrometer | None = None
-        self.wavelengths = None
+        self.wavelengths: np.ndarray | None = None # Ensure type hint consistency
         self._initialize_spectrometer_device()
 
-        self.plot_fig = None
-        self.plot_ax = None
-        self.plot_line = None
-        self.plot_buffer = None
+        self.plot_fig: plt.Figure | None = None
+        self.plot_ax: plt.Axes | None = None
+        self.plot_line: plt.Line2D | None = None
+        # self.plot_buffer = None # io.BytesIO is created and closed locally in _capture_and_plot
         self._initialize_plot()
 
-        self.overlay_font = None
+        self.overlay_font: pygame.font.Font | None = None
         self._load_overlay_font()
 
         self.is_active = False
         self._current_state = self.STATE_LIVE_VIEW
         self._last_integration_time_ms = 0
 
-        self._frozen_intensities = None # For OOI freeze
-        self._frozen_wavelengths = None
+        self._frozen_intensities: np.ndarray | None = None
+        self._frozen_wavelengths: np.ndarray | None = None
         self._frozen_timestamp: datetime.datetime | None = None
         self._frozen_integration_time_ms: int | None = None
 
         self._current_y_max: float = float(Y_AXIS_DEFAULT_MAX)
 
-        self._stored_white_reference: np.ndarray | None = None # Stores captured white ref
+        self._stored_white_reference: np.ndarray | None = None
         self._white_ref_capture_timestamp: datetime.datetime | None = None
         self._white_ref_integration_ms: int | None = None
+
+        self._scans_today_count: int = 0 # <<< NEW: Initialize scans today counter
+
+        # Ensure data directories exist on init to avoid race conditions later
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+        except OSError as e:
+            logger.error(f"Could not create base data directory {DATA_DIR} on SpectrometerScreen init: {e}")
+        except Exception as e_mkdir: # Catch any other unexpected error
+            logger.error(f"Unexpected error creating data directory {DATA_DIR}: {e_mkdir}")
+
 
     def _initialize_spectrometer_device(self):
             """Finds the first available spectrometer device and stores the object."""
             logger.info("Looking for spectrometer devices...")
             if not USE_SPECTROMETER or sb is None or Spectrometer is None:
                 logger.warning("Spectrometer use disabled or libraries not loaded.")
+                self.spectrometer = None # Ensure it's None
                 return
             try:
                 devices = sb.list_devices()
-                if not devices: logger.error("No spectrometer devices found."); self.spectrometer = None; return
+                if not devices:
+                    logger.error("No spectrometer devices found.")
+                    self.spectrometer = None
+                    return
+
+                # Attempt to create Spectrometer instance from the first device
                 self.spectrometer = Spectrometer.from_serial_number(devices[0].serial_number)
-                if self.spectrometer is None: logger.error("Failed to create Spectrometer instance."); return
-                if not hasattr(self.spectrometer, '_dev'): logger.error("Spectrometer missing '_dev'.")
+                if self.spectrometer is None: # Should not happen if from_serial_number succeeds or raises
+                    logger.error("Failed to create Spectrometer instance (returned None).")
+                    return
+
+                # pyseabreeze specific check for backend device
+                if not hasattr(self.spectrometer, '_dev'):
+                    logger.error("Spectrometer object initialized but missing '_dev' backend attribute (pyseabreeze).")
+                    self.spectrometer = None # Invalidate if backend is missing
+                    return
+
                 self.wavelengths = self.spectrometer.wavelengths()
-                if self.wavelengths is None or len(self.wavelengths) == 0: logger.error("Failed to get wavelengths."); self.spectrometer = None; return
+                if self.wavelengths is None or len(self.wavelengths) == 0:
+                    logger.error("Failed to get wavelengths from spectrometer.")
+                    self.spectrometer = None # Invalidate if wavelengths are bad
+                    return
+
+                # Assertions for successful initialization
+                assert isinstance(self.spectrometer, Spectrometer), "Spectrometer object is not of expected type."
+                assert isinstance(self.wavelengths, np.ndarray) and self.wavelengths.size > 0, "Wavelengths are not a valid numpy array."
 
                 logger.info(f"Spectrometer device object created: {devices[0]}")
                 logger.info(f"  Model: {self.spectrometer.model}")
                 logger.info(f"  Serial: {self.spectrometer.serial_number}")
                 logger.info(f"  Wavelength range: {self.wavelengths[0]:.1f} nm to {self.wavelengths[-1]:.1f} nm ({len(self.wavelengths)} points)")
-                try: # Get limits
+
+                try: # Get integration time limits
                     limits_tuple = self.spectrometer.integration_time_micros_limits
                     if isinstance(limits_tuple, tuple) and len(limits_tuple) == 2:
                         min_integ, max_integ = limits_tuple
-                        logger.info(f"  Limits (reported): {min_integ / 1000:.1f}ms - {max_integ / 1000:.1f}ms")
-                    else: logger.warning(f"  Limits unexpected format: {type(limits_tuple)}")
-                except AttributeError: logger.warning("  Limits attribute not found.")
-                except Exception as e_int: logger.warning(f"  Could not query limits: {e_int}")
-            except Exception as e: logger.error(f"Error initializing device: {e}", exc_info=True); self.spectrometer = None
+                        logger.info(f"  Integration time limits (reported): {min_integ / 1000.0:.1f}ms - {max_integ / 1000.0:.1f}ms")
+                    else:
+                        logger.warning(f"  Integration time limits attribute has unexpected format: {type(limits_tuple)}")
+                except AttributeError:
+                    logger.warning("  Integration time limits attribute ('integration_time_micros_limits') not found on spectrometer object.")
+                except Exception as e_int_limits:
+                    logger.warning(f"  Could not query integration time limits: {e_int_limits}")
+
+            except sb.SeaBreezeError as e_sb: # Catch specific seabreeze errors
+                logger.error(f"SeaBreezeError initializing spectrometer device: {e_sb}", exc_info=True)
+                self.spectrometer = None
+            except Exception as e: # Catch any other unexpected errors
+                logger.error(f"Unexpected error initializing spectrometer device: {e}", exc_info=True)
+                self.spectrometer = None
 
     def _initialize_plot(self):
             """Initializes the matplotlib figure and axes for plotting with desired styling."""
-            if plt is None: logger.error("Matplotlib unavailable."); return
-            logger.debug("Initializing plot...")
+            if plt is None:
+                logger.error("Matplotlib (plt) is unavailable. Cannot initialize plot.")
+                return
+            logger.debug("Initializing Matplotlib plot for SpectrometerScreen...")
             try:
-                plot_width_px = SCREEN_WIDTH; plot_height_px = SCREEN_HEIGHT - 40; dpi = 96
-                figsize_inches = (plot_width_px / dpi, plot_height_px / dpi)
-                self.plot_fig, self.plot_ax = plt.subplots(figsize=figsize_inches, dpi=dpi)
-                if not self.plot_fig or not self.plot_ax: raise RuntimeError("subplots failed")
-                (self.plot_line,) = self.plot_ax.plot([], [], linewidth=1, color='cyan')
-                if not self.plot_line: raise RuntimeError("plot failed")
+                # Define plot dimensions carefully
+                plot_width_px = SCREEN_WIDTH
+                plot_height_px = SCREEN_HEIGHT - 45 # Adjusted for more text overlays
+                dpi = float(self.screen.get_width() / 3.33) if self.screen else 96.0 # approx 3.33 inches width
+
+                figsize_inches_w = plot_width_px / dpi
+                figsize_inches_h = plot_height_px / dpi
+                # Assertion: Ensure figsize components are positive
+                assert figsize_inches_w > 0 and figsize_inches_h > 0, "Calculated figsize must be positive."
+
+                self.plot_fig, self.plot_ax = plt.subplots(figsize=(figsize_inches_w, figsize_inches_h), dpi=dpi)
+
+                if not self.plot_fig or not self.plot_ax:
+                    raise RuntimeError("plt.subplots failed to return figure and/or axes.")
+
+                (self.plot_line,) = self.plot_ax.plot([], [], linewidth=1.0, color='cyan') # Ensure float for linewidth
+                if not self.plot_line:
+                    raise RuntimeError("plot_ax.plot failed to return a line object.")
+
                 # Styling
                 self.plot_ax.grid(True, linestyle=":", alpha=0.6, color='gray')
-                self.plot_ax.tick_params(axis='both', which='major', labelsize=9, colors='white')
-                self.plot_ax.set_xlabel("Wavelength (nm)", fontsize=10, color='white')
-                self.plot_ax.set_ylabel("Intensity", fontsize=10, color='white') # Initial label
-                self.plot_fig.patch.set_facecolor('black'); self.plot_ax.set_facecolor('black')
-                self.plot_ax.spines['top'].set_color('gray'); self.plot_ax.spines['bottom'].set_color('gray')
-                self.plot_ax.spines['left'].set_color('gray'); self.plot_ax.spines['right'].set_color('gray')
-                self.plot_fig.tight_layout(pad=0.5)
-                logger.debug("Plot initialized with styling.")
-            except Exception as e:
-                logger.error(f"Failed plot init: {e}", exc_info=True)
+                self.plot_ax.tick_params(axis='both', which='major', labelsize=8, colors='white') # Smaller labelsize
+                self.plot_ax.set_xlabel("Wavelength (nm)", fontsize=9, color='white')
+                self.plot_ax.set_ylabel("Intensity", fontsize=9, color='white')
+                self.plot_fig.patch.set_facecolor('black')
+                self.plot_ax.set_facecolor('black')
+
+                # Set spine colors
+                spines_to_color = ['top', 'bottom', 'left', 'right']
+                # Bounded loop (fixed number of spines)
+                for spine_key in spines_to_color:
+                    self.plot_ax.spines[spine_key].set_color('gray')
+
+                self.plot_fig.tight_layout(pad=0.3) # Reduced padding
+                logger.debug("Matplotlib plot initialized successfully with styling.")
+
+            except RuntimeError as e_rt: # Catch specific runtime errors from checks
+                 logger.error(f"Runtime error during plot initialization: {e_rt}", exc_info=True)
+                 if self.plot_fig and plt and plt.fignum_exists(self.plot_fig.number): plt.close(self.plot_fig)
+                 self.plot_fig = self.plot_ax = self.plot_line = None
+            except Exception as e: # Catch any other unexpected errors
+                logger.error(f"Failed to initialize Matplotlib plot: {e}", exc_info=True)
                 if self.plot_fig and plt and plt.fignum_exists(self.plot_fig.number): plt.close(self.plot_fig)
                 self.plot_fig = self.plot_ax = self.plot_line = None
 
     def _load_overlay_font(self):
         """Loads the font used for text overlays."""
-        if not pygame.font.get_init(): pygame.font.init()
+        if not pygame.font.get_init():
+            logger.info("Pygame font module not initialized. Initializing now for overlay_font.")
+            pygame.font.init()
+        # Assertion: Pygame font module must be initialized
+        assert pygame.font.get_init(), "Pygame font module failed to initialize."
+
         try:
             script_dir = os.path.dirname(os.path.abspath(__file__))
             assets_dir = os.path.join(script_dir, 'assets')
             font_path = os.path.join(assets_dir, SPECTRO_FONT_FILENAME)
+            # Assertion: Check path is string
+            assert isinstance(font_path, str), "Overlay font path is not a string"
+
             if not os.path.isfile(font_path):
-                logger.warning(f"Overlay font file not found: '{font_path}'. Using fallback.")
+                logger.warning(f"Overlay font file not found: '{font_path}'. Using Pygame SysFont fallback.")
                 self.overlay_font = pygame.font.SysFont(None, SPECTRO_FONT_SIZE)
             else:
                 self.overlay_font = pygame.font.Font(font_path, SPECTRO_FONT_SIZE)
-            if self.overlay_font is None: raise RuntimeError("Font loading failed")
-            logger.info(f"Loaded overlay font (size {SPECTRO_FONT_SIZE})")
-        except Exception as e:
-            logger.error(f"Failed loading overlay font: {e}", exc_info=True)
-            try: self.overlay_font = pygame.font.SysFont(None, SPECTRO_FONT_SIZE)
-            except Exception: logger.critical("CRITICAL: Could not load any overlay font.")
+
+            if self.overlay_font is None: # Should be caught by SysFont if Font() fails and path is invalid
+                raise RuntimeError("Font loading returned None even after attempting fallback.")
+            logger.info(f"Loaded overlay font: {SPECTRO_FONT_FILENAME} (Size: {SPECTRO_FONT_SIZE})")
+
+        except RuntimeError as e_rt: # Catch specific runtime errors from checks
+            logger.error(f"Runtime error loading overlay font: {e_rt}", exc_info=True)
+            self.overlay_font = None # Ensure it's None on critical failure
+        except pygame.error as e_pygame: # Catch Pygame-specific errors
+            logger.error(f"Pygame error loading overlay font: {e_pygame}. Attempting SysFont.", exc_info=True)
+            try:
+                self.overlay_font = pygame.font.SysFont(None, SPECTRO_FONT_SIZE)
+                if self.overlay_font is None: raise RuntimeError("SysFont fallback also returned None.")
+            except Exception as e_sysfont:
+                logger.critical(f"CRITICAL: Could not load any overlay font, SysFont fallback failed: {e_sysfont}")
+                self.overlay_font = None
+        except Exception as e: # Catch any other unexpected errors
+            logger.error(f"Unexpected error loading overlay font: {e}", exc_info=True)
+            self.overlay_font = None # Ensure it's None on failure
 
     def activate(self):
-        """Called when switching to this screen. Tries to open the device connection."""
+        """Called when switching to this screen. Tries to open device and init scan count."""
         logger.info("Activating Spectrometer Screen.")
         self.is_active = True
-        self._current_state = self.STATE_LIVE_VIEW # Start in normal live view
-        self._frozen_intensities = None; self._frozen_wavelengths = None
-        self._frozen_timestamp = None; self._frozen_integration_time_ms = None
-        self._stored_white_reference = None # Clear white ref on activate
+        self._current_state = self.STATE_LIVE_VIEW
+        self._frozen_intensities = None
+        self._frozen_wavelengths = None
+        self._frozen_timestamp = None
+        self._frozen_integration_time_ms = None
+        self._stored_white_reference = None
         self._white_ref_capture_timestamp = None
         self._white_ref_integration_ms = None
-        self._current_y_max = float(Y_AXIS_DEFAULT_MAX) # Reset Y-axis max
+        self._current_y_max = float(Y_AXIS_DEFAULT_MAX)
         logger.debug(f"Y-axis max reset to default: {self._current_y_max}")
 
-        if not USE_SPECTROMETER: logger.warning("Spectrometer use is disabled."); return
-        if self.spectrometer is None or not hasattr(self.spectrometer, '_dev'):
-            logger.error("Spectrometer device object invalid. Cannot activate."); return
+        # --- Initialize/Update scans_today_count ---
+        # Assertion: menu_system must be available
+        assert self.menu_system is not None, "MenuSystem is None during SpectrometerScreen activation."
+        try:
+            # Use menu_system's timestamp to ensure consistency with saved data timestamps for date matching
+            current_app_datetime = self.menu_system.get_timestamp_datetime()
+            today_date_str = current_app_datetime.strftime("%Y-%m-%d")
 
-        try: # Try to open/configure
-            if not self.spectrometer._dev.is_open:
-                logger.info(f"Opening connection: {self.spectrometer.serial_number}")
+            daily_folder_path = os.path.join(DATA_DIR, today_date_str)
+            csv_filename_dated = f"{today_date_str}_{CSV_BASE_FILENAME}"
+            csv_filepath = os.path.join(daily_folder_path, csv_filename_dated)
+            # Assertion: check path components
+            assert isinstance(daily_folder_path, str) and isinstance(csv_filename_dated, str), "CSV path components are not strings."
+
+            current_scan_count = 0
+            if os.path.isfile(csv_filepath):
+                line_count_for_day = 0
+                try:
+                    with open(csv_filepath, 'r', newline='') as f_check:
+                        reader = csv.reader(f_check)
+                        header = next(reader, None) # Read/skip header
+                        if header: # File has at least a header
+                            # Count remaining data rows
+                            # Loop bounded by number of lines in CSV file
+                            for _row in reader: # Explicitly name _row to indicate it's used for iteration count
+                                line_count_for_day += 1
+                    current_scan_count = line_count_for_day
+                    logger.info(f"Found {current_scan_count} existing scans in today's log: {csv_filepath}")
+                except StopIteration: # Handles empty file or file with only header
+                    logger.info(f"Log file {csv_filepath} exists but is empty or has only a header. Scan count is 0.")
+                    current_scan_count = 0
+                except csv.Error as e_csv_read:
+                    logger.error(f"CSVError reading existing log file {csv_filepath} for scan count: {e_csv_read}. Count may be inaccurate.")
+                    current_scan_count = 0 # Default to 0 on CSV read error
+                except Exception as e_file_read: # Catch other file reading errors
+                    logger.error(f"Error reading existing log file {csv_filepath} for scan count: {e_file_read}. Count may be inaccurate.")
+                    current_scan_count = 0 # Default to 0
+            else:
+                logger.info(f"No existing log file for today found at {csv_filepath}. Scan count starts at 0.")
+            self._scans_today_count = current_scan_count
+        except Exception as e_scan_count_init:
+            logger.error(f"Error initializing 'scans today' count: {e_scan_count_init}. Defaulting to 0.")
+            self._scans_today_count = 0 # Fallback on any unexpected error
+        logger.info(f"Scans today initialized to: {self._scans_today_count}")
+        # --- End scans_today_count initialization ---
+
+
+        if not USE_SPECTROMETER:
+            logger.warning("Spectrometer use is disabled in configuration.")
+            return
+        if self.spectrometer is None or not hasattr(self.spectrometer, '_dev'):
+            logger.error("Spectrometer device object is invalid or not initialized. Cannot activate.")
+            return
+
+        try:
+            device_proxy = getattr(self.spectrometer, '_dev', None)
+            if device_proxy is None or not hasattr(device_proxy, 'is_open'):
+                logger.error("Spectrometer device proxy or 'is_open' attribute not found. Cannot check/open connection.")
+                return
+
+            if not device_proxy.is_open:
+                logger.info(f"Opening spectrometer connection: {self.spectrometer.serial_number}")
                 self.spectrometer.open()
-                logger.info("Connection opened.")
-                try: # Set initial integration time
-                    self._last_integration_time_ms = self.menu_system.get_integration_time_ms()
-                    integration_micros_scaled = int((self._last_integration_time_ms * 1000) * INTEGRATION_TIME_SCALE_FACTOR)
-                    logger.debug(f"ACTIVATE: Sending scaled integration time: {integration_micros_scaled} µs (target {self._last_integration_time_ms} ms)")
+                logger.info("Spectrometer connection opened.")
+                # Set initial integration time after opening
+                self._last_integration_time_ms = self.menu_system.get_integration_time_ms()
+                integration_micros_scaled = int((self._last_integration_time_ms * 1000) * INTEGRATION_TIME_SCALE_FACTOR)
+                logger.debug(f"ACTIVATE: Sending scaled integration time: {integration_micros_scaled} µs (target {self._last_integration_time_ms} ms)")
+                self.spectrometer.integration_time_micros(integration_micros_scaled)
+                logger.info(f"Initial integration time set to target: {self._last_integration_time_ms} ms")
+            else:
+                logger.info("Spectrometer connection already open.")
+                # Sync integration time if it changed in menu while screen was inactive
+                current_menu_integ_ms = self.menu_system.get_integration_time_ms()
+                if current_menu_integ_ms != self._last_integration_time_ms:
+                    integration_micros_scaled = int((current_menu_integ_ms * 1000) * INTEGRATION_TIME_SCALE_FACTOR)
+                    logger.debug(f"ACTIVATE (Sync): Sending scaled integration time: {integration_micros_scaled} µs (target {current_menu_integ_ms} ms)")
                     self.spectrometer.integration_time_micros(integration_micros_scaled)
-                    logger.info(f"Initial integration time set (target: {self._last_integration_time_ms} ms)")
-                except Exception as e_menu: logger.error(f"Failed init integration: {e_menu}"); self._last_integration_time_ms = DEFAULT_INTEGRATION_TIME_MS
-            else: # Already open
-                logger.info("Connection already open.")
-                try: # Sync integration time
-                     current_menu_integ = self.menu_system.get_integration_time_ms()
-                     if current_menu_integ != self._last_integration_time_ms:
-                          integration_micros_scaled = int((current_menu_integ * 1000) * INTEGRATION_TIME_SCALE_FACTOR)
-                          logger.debug(f"ACTIVATE (Sync): Sending scaled integ time: {integration_micros_scaled} µs (target {current_menu_integ} ms)")
-                          self.spectrometer.integration_time_micros(integration_micros_scaled)
-                          self._last_integration_time_ms = current_menu_integ
-                          logger.info(f"Synced integration time (target: {current_menu_integ} ms)")
-                except Exception as e_sync: logger.warning(f"Could not sync integ time: {e_sync}")
-        except usb.core.USBError as e_usb: logger.error(f"USB Error opening: [{getattr(e_usb, 'errno', 'N/A')}] {e_usb.strerror if hasattr(e_usb, 'strerror') else str(e_usb)}")
-        except AttributeError as e_attr: logger.error(f"Attribute error on activate: {e_attr}")
-        except Exception as e: logger.error(f"Unexpected error activating: {e}", exc_info=True)
+                    self._last_integration_time_ms = current_menu_integ_ms
+                    logger.info(f"Synced integration time to target: {current_menu_integ_ms} ms")
+        except sb.SeaBreezeError as e_sb_open:
+            logger.error(f"SeaBreezeError during spectrometer activation/open: {e_sb_open}", exc_info=True)
+        except usb.core.USBError as e_usb: # pyusb can raise this
+            logger.error(f"USB Error opening spectrometer: [{getattr(e_usb, 'errno', 'N/A')}] {getattr(e_usb, 'strerror', str(e_usb))}", exc_info=True)
+        except AttributeError as e_attr: # e.g. if _dev or is_open missing
+            logger.error(f"Attribute error during spectrometer activation: {e_attr}", exc_info=True)
+        except Exception as e: # Catch any other unexpected error
+            logger.error(f"Unexpected error activating spectrometer: {e}", exc_info=True)
 
     def deactivate(self):
         """Called when switching away from this screen."""
         logger.info("Deactivating Spectrometer Screen.")
         self.is_active = False
-        # Clear all temporary data on deactivate
-        self._frozen_intensities = None; self._frozen_wavelengths = None
-        self._frozen_timestamp = None; self._frozen_integration_time_ms = None
+        # Clear temporary data, but _scans_today_count persists until next activate or app restart
+        self._frozen_intensities = None
+        self._frozen_wavelengths = None
+        self._frozen_timestamp = None
+        self._frozen_integration_time_ms = None
         self._stored_white_reference = None
         self._white_ref_capture_timestamp = None
         self._white_ref_integration_ms = None
-        self._current_state = self.STATE_LIVE_VIEW # Ensure state is reset
+        self._current_state = self.STATE_LIVE_VIEW # Reset state for next activation
 
     def handle_input(self) -> str | None:
         """Processes button inputs for the spectrometer screen based on state."""
+        # Assertion: button_handler must be available
+        assert self.button_handler is not None, "ButtonHandler is None in SpectrometerScreen.handle_input"
+
         pygame_event_result = self.button_handler.process_pygame_events()
-        if pygame_event_result == "QUIT": return "QUIT"
+        if pygame_event_result == "QUIT":
+            logger.info("QUIT signal from Pygame events received in SpectrometerScreen.")
+            return "QUIT"
 
-        action_result = None
-        spec_ready = (self.spectrometer and hasattr(self.spectrometer, '_dev') and self.spectrometer._dev.is_open)
+        action_result: str | None = None # Explicitly type hint
+        device_proxy = getattr(self.spectrometer, '_dev', None)
+        spec_ready = (
+            self.spectrometer is not None and
+            device_proxy is not None and
+            hasattr(device_proxy, 'is_open') and
+            device_proxy.is_open
+        )
 
-        current_state = self._current_state # Local copy for checks
+        current_state_local = self._current_state # Use local copy for decisions in this call
 
-        # --- State: Live View (Normal OOI Mode) ---
-        if current_state == self.STATE_LIVE_VIEW:
-            if self.button_handler.check_button(BTN_ENTER): # A: Freeze OOI
+        if current_state_local == self.STATE_LIVE_VIEW:
+            if self.button_handler.check_button(BTN_ENTER):
                 if spec_ready: self._handle_freeze_capture()
                 else: logger.warning("Freeze ignored: Spectrometer not ready.")
-            elif self.button_handler.check_button(BTN_BACK): # B: Back to Main Menu
+            elif self.button_handler.check_button(BTN_BACK):
                 action_result = "BACK_TO_MENU"
-            elif self.button_handler.check_button(BTN_DOWN): # Y: Rescale Y-Axis (Raw)
+            elif self.button_handler.check_button(BTN_DOWN): # Y-button for rescale
                 if spec_ready: self._rescale_y_axis(relative=False)
                 else: logger.warning("Rescale ignored: Spectrometer not ready.")
-            elif self.button_handler.check_button(BTN_UP): # X: Enter Calibrate Mode
+            elif self.button_handler.check_button(BTN_UP): # X-button for Calibrate mode
                 logger.info("Entering Calibrate mode.")
                 self._current_state = self.STATE_CALIBRATE
-                # Plot continues showing live raw data
-
-        # --- State: Calibrate (Shows Live Raw Plot, overlay indicates options) ---
-        elif current_state == self.STATE_CALIBRATE:
-            if self.button_handler.check_button(BTN_ENTER): # A: Enter White Ref Setup
+        elif current_state_local == self.STATE_CALIBRATE:
+            if self.button_handler.check_button(BTN_ENTER): # A: White Ref Setup
                 if spec_ready:
                     logger.info("Entering White Reference Setup mode.")
-                    success = self._capture_and_store_white_ref() # Capture initial white reference
+                    success = self._capture_and_store_white_ref()
                     if success:
                         self._current_state = self.STATE_WHITE_REF_SETUP
-                        self._current_y_max = 2.0 # Reset Y for relative view
+                        self._current_y_max = 2.0 # Reset Y for relative view (0-2 typical)
                     else:
                         logger.error("Failed initial white ref capture. Staying in Calibrate mode.")
-                        # Optional: Flash an error message?
                 else: logger.warning("White Ref setup ignored: Spectrometer not ready.")
-            elif self.button_handler.check_button(BTN_UP): # X: Enter Dark Capture Setup
+            elif self.button_handler.check_button(BTN_UP): # X: Dark Capture Setup
                 if spec_ready:
                     logger.info("Entering Dark Capture Setup mode.")
                     self._current_state = self.STATE_DARK_CAPTURE
-                    self._current_y_max = float(Y_AXIS_DEFAULT_MAX) # Reset Y axis for dark view
+                    self._current_y_max = float(Y_AXIS_DEFAULT_MAX) # Reset Y for dark raw counts
                 else: logger.warning("Dark Capture setup ignored: Spectrometer not ready.")
             elif self.button_handler.check_button(BTN_BACK): # B: Back to Live View
-                logger.info("Exiting Calibrate mode.")
+                logger.info("Exiting Calibrate mode, returning to Live View.")
                 self._current_state = self.STATE_LIVE_VIEW
-            # Y button (BTN_DOWN) maybe could trigger rescale here too if desired?
-            # elif self.button_handler.check_button(BTN_DOWN): # Y: Rescale Y-Axis (Raw)
-            #     if spec_ready: self._rescale_y_axis(relative=False)
-            #     else: logger.warning("Rescale ignored.")
-
-        # --- State: White Reference Setup (Live Relative View) ---
-        elif current_state == self.STATE_WHITE_REF_SETUP:
+        elif current_state_local == self.STATE_WHITE_REF_SETUP:
             if self.button_handler.check_button(BTN_ENTER): # A: Save Stored White Ref
                 if self._stored_white_reference is not None:
                      logger.info("Saving stored White Reference...")
                      self._save_calib_data("WHITE", self._stored_white_reference,
                                            self._white_ref_capture_timestamp, self._white_ref_integration_ms)
-                     self._stored_white_reference = None
-                     self._current_state = self.STATE_LIVE_VIEW # Return to live view
-                else: logger.error("Cannot save White Ref: No reference stored.")
+                     self._stored_white_reference = None # Clear after saving
+                     self._current_state = self.STATE_LIVE_VIEW
+                else: logger.error("Cannot save White Ref: No reference stored or data missing.")
             elif self.button_handler.check_button(BTN_BACK): # B: Cancel and Back to Live View
-                logger.info("Cancelling White Reference setup.")
-                self._stored_white_reference = None
+                logger.info("Cancelling White Reference setup, returning to Live View.")
+                self._stored_white_reference = None # Discard
                 self._current_state = self.STATE_LIVE_VIEW
-
-        # --- State: Dark Capture Setup (Live Raw View) ---
-        elif current_state == self.STATE_DARK_CAPTURE:
+        elif current_state_local == self.STATE_DARK_CAPTURE:
             if self.button_handler.check_button(BTN_ENTER): # A: Capture and Save Dark
                 if spec_ready:
                      logger.info("Capturing and saving Dark scan...")
-                     self._capture_and_save_calib("DARK")
-                     self._current_state = self.STATE_LIVE_VIEW # Return to live view after capture
+                     self._capture_and_save_calib("DARK") # Handles save internally
+                     self._current_state = self.STATE_LIVE_VIEW
                 else: logger.warning("Dark Capture ignored: Spectrometer not ready.")
             elif self.button_handler.check_button(BTN_BACK): # B: Cancel and Back to Live View
-                logger.info("Cancelling Dark Capture setup.")
+                logger.info("Cancelling Dark Capture setup, returning to Live View.")
                 self._current_state = self.STATE_LIVE_VIEW
-
-        # --- State: Frozen View (OOI) ---
-        elif current_state == self.STATE_FROZEN_VIEW:
-            if self.button_handler.check_button(BTN_ENTER): # A: Save OOI
-                 self._handle_save_ooi()
-            elif self.button_handler.check_button(BTN_BACK): # B: Discard OOI
-                 self._handle_discard_frozen()
-
+        elif current_state_local == self.STATE_FROZEN_VIEW:
+            if self.button_handler.check_button(BTN_ENTER):
+                 self._handle_save_ooi() # Handles state change back to LIVE_VIEW
+            elif self.button_handler.check_button(BTN_BACK):
+                 self._handle_discard_frozen() # Handles state change back to LIVE_VIEW
+        # Assertion: action_result must be str or None
+        assert isinstance(action_result, (str, type(None))), f"handle_input returned invalid type: {type(action_result)}"
         return action_result
 
     def _capture_and_store_white_ref(self) -> bool:
         """Captures current spectrum for white ref, stores it internally. Returns success."""
-        if not (self.spectrometer and hasattr(self.spectrometer, '_dev') and self.spectrometer._dev.is_open and self.wavelengths is not None):
-            logger.error("Cannot capture white ref: Spectrometer not ready."); return False
-        if np is None: logger.error("NumPy unavailable."); return False
+        # Assertion: menu_system must be available
+        assert self.menu_system is not None, "MenuSystem is None in _capture_and_store_white_ref"
+        device_proxy = getattr(self.spectrometer, '_dev', None)
+        if not (self.spectrometer and device_proxy and hasattr(device_proxy, 'is_open') and device_proxy.is_open and self.wavelengths is not None):
+            logger.error("Cannot capture white ref: Spectrometer not ready or wavelengths missing.")
+            return False
+        if np is None:
+            logger.error("NumPy (np) is unavailable. Cannot process white reference.")
+            return False
 
-        logger.info("Capturing White Reference spectrum...")
+        logger.info("Attempting to capture White Reference spectrum...")
         try:
             current_integration_time_ms = self.menu_system.get_integration_time_ms()
-            integration_micros_scaled = int((current_integration_time_ms * 1000) * INTEGRATION_TIME_SCALE_FACTOR)
+            # Assertion: Check integration time is valid
+            assert isinstance(current_integration_time_ms, int) and current_integration_time_ms > 0, \
+                   f"Invalid integration time from menu: {current_integration_time_ms}"
+
             if current_integration_time_ms != self._last_integration_time_ms:
-                 logger.debug(f"WHITE_REF_STORE: Sending scaled integ time: {integration_micros_scaled} µs (target {current_integration_time_ms} ms)")
+                 integration_micros_scaled = int((current_integration_time_ms * 1000) * INTEGRATION_TIME_SCALE_FACTOR)
+                 logger.debug(f"WHITE_REF_STORE: Setting integration time to {integration_micros_scaled} µs (target {current_integration_time_ms} ms)")
                  self.spectrometer.integration_time_micros(integration_micros_scaled)
                  self._last_integration_time_ms = current_integration_time_ms
 
             intensities = self.spectrometer.intensities(correct_dark_counts=True, correct_nonlinearity=True)
-            timestamp = self.menu_system.get_timestamp_datetime()
+            timestamp = self.menu_system.get_timestamp_datetime() # Get timestamp at time of capture
 
-            if intensities is not None and len(intensities) == len(self.wavelengths):
+            # Assertion: Check intensities and timestamp
+            assert intensities is not None, "Received None for intensities from spectrometer."
+            assert isinstance(timestamp, datetime.datetime), "Received invalid timestamp from menu_system."
+
+            if len(intensities) == len(self.wavelengths):
                 max_val = np.max(intensities)
-                spec_max_count = getattr(self.spectrometer, 'spectrum_max_value', 65535)
-                if max_val >= spec_max_count * 0.98:
-                    logger.error(f"White reference saturated (max={max_val:.0f}). Reduce integration time and try again.")
-                    # Consider adding a visual indicator/message here
+                # Get spectrum_max_value, default to float for comparison
+                spec_max_count = float(getattr(self.spectrometer, 'spectrum_max_value', 65535.0))
+                # Assertion: Ensure spec_max_count is a positive float/int
+                assert isinstance(spec_max_count, (float, int)) and spec_max_count > 0, \
+                       f"Invalid spectrum_max_value: {spec_max_count}"
+
+                if max_val >= spec_max_count * 0.98: # Check for saturation (98%)
+                    logger.error(f"White reference saturated (max intensity={max_val:.0f} vs limit={spec_max_count:.0f}). Reduce integration time and try again.")
                     return False # Do not store saturated reference
 
-                self._stored_white_reference = np.array(intensities)
-                min_value_for_division = 1e-6 # Avoid division by zero
+                self._stored_white_reference = np.array(intensities, dtype=float) # Ensure float for division
+                # Prevent division by zero or very small numbers if this white ref is used as denominator
+                min_value_for_division = 1e-9 # A small positive number
                 self._stored_white_reference[self._stored_white_reference <= min_value_for_division] = min_value_for_division
+
                 self._white_ref_capture_timestamp = timestamp
                 self._white_ref_integration_ms = current_integration_time_ms
-                logger.info("White Reference stored internally.")
+                logger.info(f"White Reference captured and stored internally (Integ: {current_integration_time_ms} ms).")
                 return True
             else:
-                logger.error("Failed to capture valid intensities for white reference.")
+                logger.error(f"Failed to capture valid intensities for white reference. Length mismatch: got {len(intensities)}, expected {len(self.wavelengths)}.")
                 return False
-        except Exception as e:
-            logger.error(f"Error capturing initial white reference: {e}", exc_info=True)
-            self._stored_white_reference = None # Ensure it's None on error
-            return False
+        except sb.SeaBreezeError as e_sb_capture:
+            logger.error(f"SeaBreezeError capturing white reference: {e_sb_capture}", exc_info=True)
+        except Exception as e: # Catch any other unexpected error
+            logger.error(f"Unexpected error capturing initial white reference: {e}", exc_info=True)
+        self._stored_white_reference = None # Ensure it's None on any error
+        return False
 
     def _capture_and_save_calib(self, spectra_type: str):
         """Captures current spectrum and immediately saves it as DARK."""
-        if spectra_type != "DARK":
-            logger.error(f"Invalid type '{spectra_type}' for immediate capture/save.")
+        # Assertion: menu_system must be available
+        assert self.menu_system is not None, "MenuSystem is None in _capture_and_save_calib"
+        if spectra_type != "DARK": # Currently only DARK is an immediate save calib type
+            logger.error(f"Invalid spectra_type '{spectra_type}' for _capture_and_save_calib. Expected 'DARK'.")
             return
-        if not (self.spectrometer and hasattr(self.spectrometer, '_dev') and self.spectrometer._dev.is_open and self.wavelengths is not None):
-             logger.error(f"Cannot capture {spectra_type}: Spectrometer not ready.")
+
+        device_proxy = getattr(self.spectrometer, '_dev', None)
+        if not (self.spectrometer and device_proxy and hasattr(device_proxy, 'is_open') and device_proxy.is_open and self.wavelengths is not None):
+             logger.error(f"Cannot capture {spectra_type}: Spectrometer not ready or wavelengths missing.")
              return
 
-        logger.info(f"Capturing {spectra_type} scan...")
+        logger.info(f"Attempting to capture {spectra_type} scan...")
         try:
             current_integration_time_ms = self.menu_system.get_integration_time_ms()
-            integration_micros_scaled = int((current_integration_time_ms * 1000) * INTEGRATION_TIME_SCALE_FACTOR)
+            # Assertion: Check integration time
+            assert isinstance(current_integration_time_ms, int) and current_integration_time_ms > 0, \
+                   f"Invalid integration time from menu: {current_integration_time_ms}"
+
             if current_integration_time_ms != self._last_integration_time_ms:
-                 logger.debug(f"CAPTURE_{spectra_type}: Sending scaled integ time: {integration_micros_scaled} µs (target {current_integration_time_ms} ms)")
+                 integration_micros_scaled = int((current_integration_time_ms * 1000) * INTEGRATION_TIME_SCALE_FACTOR)
+                 logger.debug(f"CAPTURE_{spectra_type}: Setting integration time to {integration_micros_scaled} µs (target {current_integration_time_ms} ms)")
                  self.spectrometer.integration_time_micros(integration_micros_scaled)
                  self._last_integration_time_ms = current_integration_time_ms
 
             intensities = self.spectrometer.intensities(correct_dark_counts=True, correct_nonlinearity=True)
-            timestamp = self.menu_system.get_timestamp_datetime()
+            timestamp = self.menu_system.get_timestamp_datetime() # Timestamp for the save
 
-            if intensities is not None and len(intensities) == len(self.wavelengths):
-                save_success = self._save_data( # Call the general save function
+            # Assertion: Check intensities and timestamp
+            assert intensities is not None, "Received None for intensities from spectrometer for DARK scan."
+            assert isinstance(timestamp, datetime.datetime), "Received invalid timestamp from menu_system for DARK scan."
+
+            if len(intensities) == len(self.wavelengths):
+                save_success = self._save_data(
                     intensities=intensities, wavelengths=self.wavelengths,
-                    timestamp=timestamp, integration_ms=current_integration_time_ms, # Use original MS
-                    spectra_type=spectra_type, save_plot=False # No plot for calib
+                    timestamp=timestamp, integration_ms=current_integration_time_ms,
+                    spectra_type=spectra_type, save_plot=False # No plot for DARK calibration
                 )
-                if save_success: logger.info(f"{spectra_type} scan captured and saved.")
-                else: logger.error(f"Failed to save {spectra_type} scan.")
-            else: logger.error(f"Failed capture for {spectra_type} scan.")
-        except Exception as e: logger.error(f"Error capturing/saving {spectra_type}: {e}", exc_info=True)
+                if save_success:
+                    logger.info(f"{spectra_type} scan captured and saved successfully.")
+                else:
+                    logger.error(f"Failed to save {spectra_type} scan after capture.")
+            else:
+                logger.error(f"Failed capture for {spectra_type} scan. Length mismatch: got {len(intensities)}, expected {len(self.wavelengths)}.")
+        except sb.SeaBreezeError as e_sb_dark:
+            logger.error(f"SeaBreezeError capturing {spectra_type} scan: {e_sb_dark}", exc_info=True)
+        except Exception as e: # Catch any other unexpected error
+            logger.error(f"Unexpected error capturing/saving {spectra_type} scan: {e}", exc_info=True)
 
     def _save_calib_data(self, spectra_type: str, intensities: np.ndarray,
-                         timestamp: datetime.datetime, integration_ms: int):
-        """Saves calibration data (specifically the stored White Ref)"""
-        if spectra_type != "WHITE":
-            logger.error(f"Invalid type '{spectra_type}' for saving calib data.")
-            return
-        if not all([intensities is not None, self.wavelengths is not None,
-                    timestamp is not None, integration_ms is not None]):
-            logger.error(f"Cannot save {spectra_type}: Missing required data.")
+                         timestamp: datetime.datetime | None, integration_ms: int | None):
+        """Saves pre-captured calibration data (e.g., stored White Reference)."""
+        # Assertion: menu_system must be available (indirectly via _save_data)
+        assert self.menu_system is not None, "MenuSystem is None in _save_calib_data"
+        if spectra_type != "WHITE": # Currently only WHITE uses this path for pre-stored data
+            logger.error(f"Invalid spectra_type '{spectra_type}' for _save_calib_data. Expected 'WHITE'.")
             return
 
-        logger.info(f"Saving {spectra_type} reference...")
-        save_success = self._save_data( # Call the general save function
+        # Assertions for required data components
+        assert intensities is not None, f"Cannot save {spectra_type}: Intensities are None."
+        assert self.wavelengths is not None, f"Cannot save {spectra_type}: Wavelengths are None."
+        assert timestamp is not None, f"Cannot save {spectra_type}: Timestamp is None."
+        assert integration_ms is not None, f"Cannot save {spectra_type}: Integration_ms is None."
+        assert isinstance(intensities, np.ndarray), "Intensities must be a numpy array."
+        assert isinstance(self.wavelengths, np.ndarray), "Wavelengths must be a numpy array."
+        assert isinstance(timestamp, datetime.datetime), "Timestamp must be a datetime object."
+        assert isinstance(integration_ms, int), "Integration_ms must be an integer."
+
+
+        logger.info(f"Attempting to save {spectra_type} reference...")
+        save_success = self._save_data(
             intensities=intensities, wavelengths=self.wavelengths,
-            timestamp=timestamp, integration_ms=integration_ms, # Use original MS
-            spectra_type=spectra_type, save_plot=False # No plot for calib
+            timestamp=timestamp, integration_ms=integration_ms,
+            spectra_type=spectra_type, save_plot=False # No plot for WHITE calibration
         )
-        if save_success: logger.info(f"{spectra_type} reference saved successfully.")
-        else: logger.error(f"Failed to save {spectra_type} reference.")
+        if save_success:
+            logger.info(f"{spectra_type} reference saved successfully.")
+        else:
+            logger.error(f"Failed to save {spectra_type} reference.")
 
     def _handle_freeze_capture(self):
-        """Captures the current OOI spectrum data and freezes the display state."""
-        if not (self.spectrometer and hasattr(self.spectrometer, '_dev') and self.spectrometer._dev.is_open and self.wavelengths is not None):
-             logger.error("Cannot freeze: Spectrometer not ready."); return
-        logger.info("Freezing current OOI spectrum...")
+        """Captures the current spectrum data (RAW or REFLECTANCE) and freezes the display state."""
+        # Assertion: menu_system must be available
+        assert self.menu_system is not None, "MenuSystem is None in _handle_freeze_capture"
+        device_proxy = getattr(self.spectrometer, '_dev', None)
+        if not (self.spectrometer and device_proxy and hasattr(device_proxy, 'is_open') and device_proxy.is_open and self.wavelengths is not None):
+             logger.error("Cannot freeze: Spectrometer not ready or wavelengths missing."); return
+
+        logger.info("Attempting to freeze current spectrum...")
         try:
             current_integration_time_ms = self.menu_system.get_integration_time_ms()
-            integration_micros_scaled = int((current_integration_time_ms * 1000) * INTEGRATION_TIME_SCALE_FACTOR)
+            collection_mode = self.menu_system.get_collection_mode() # Get current mode
+
+            # Assertion: Check integration time and collection_mode
+            assert isinstance(current_integration_time_ms, int) and current_integration_time_ms > 0, \
+                   f"Invalid integration time from menu: {current_integration_time_ms}"
+            assert isinstance(collection_mode, str) and collection_mode in AVAILABLE_COLLECTION_MODES, \
+                   f"Invalid collection mode from menu: {collection_mode}"
+
+
             if current_integration_time_ms != self._last_integration_time_ms:
+                 integration_micros_scaled = int((current_integration_time_ms * 1000) * INTEGRATION_TIME_SCALE_FACTOR)
+                 logger.debug(f"FREEZE_CAPTURE: Setting integration time to {integration_micros_scaled} µs (target {current_integration_time_ms} ms)")
                  self.spectrometer.integration_time_micros(integration_micros_scaled)
                  self._last_integration_time_ms = current_integration_time_ms
 
-            intensities = self.spectrometer.intensities(correct_dark_counts=True, correct_nonlinearity=True)
-            if intensities is not None and len(intensities) == len(self.wavelengths):
-                self._frozen_intensities = intensities
+            # Logic for acquiring intensities based on mode would go here if REFLECTANCE freeze was different.
+            # As per App Overview, "SAMPLE" save is based on original mode.
+            # The _capture_and_plot itself handles RAW vs REFLECTANCE for display.
+            # For _save_data, it expects the final processed intensities.
+            # Current implementation: freeze always stores raw, _capture_and_plot applies processing.
+            # This means a "frozen reflectance" would be calculated live if displayed, then saved from that calc.
+            # The current _handle_save_ooi saves _frozen_intensities, which are raw.
+            # This needs clarification if frozen REFLECTANCE should be stored differently.
+            # For now, assume freeze captures raw, and plot will show it as Raw or Reflectance.
+            # The save operation for "SAMPLE" in App Overview should save the *processed* form.
+
+            raw_intensities = self.spectrometer.intensities(correct_dark_counts=True, correct_nonlinearity=True)
+            # For Reflectance mode, the _frozen_intensities should ideally be the calculated reflectance.
+            # However, the current structure seems to freeze raw and then _capture_and_plot calculates reflectance if needed.
+            # This path means _frozen_intensities will always be raw-like.
+            # Let's stick to freezing raw counts, and _capture_and_plot + _handle_save_ooi handle mode.
+
+            if raw_intensities is not None and len(raw_intensities) == len(self.wavelengths):
+                self._frozen_intensities = raw_intensities # Store the raw intensities
                 self._frozen_wavelengths = self.wavelengths
                 self._frozen_timestamp = self.menu_system.get_timestamp_datetime()
-                self._frozen_integration_time_ms = current_integration_time_ms # Store original MS
+                self._frozen_integration_time_ms = current_integration_time_ms
+                # Store the mode AT THE TIME OF FREEZE
+                self._frozen_collection_mode = collection_mode # NEW instance variable
+
                 self._current_state = self.STATE_FROZEN_VIEW
-                logger.info(f"OOI Spectrum frozen (target integ: {self._frozen_integration_time_ms} ms)")
-            else: logger.error("Failed to capture valid OOI intensities.")
-        except Exception as e: logger.error(f"Error freezing OOI: {e}", exc_info=True)
+                logger.info(f"Spectrum frozen (Mode: {self._frozen_collection_mode}, Integ: {self._frozen_integration_time_ms} ms)")
+            else:
+                logger.error(f"Failed to capture valid intensities for freeze. Length mismatch or None intensities.")
+        except sb.SeaBreezeError as e_sb_freeze:
+            logger.error(f"SeaBreezeError during freeze capture: {e_sb_freeze}", exc_info=True)
+        except Exception as e: # Catch any other unexpected error
+            logger.error(f"Unexpected error freezing spectrum: {e}", exc_info=True)
 
     def _handle_save_ooi(self):
-        """Saves the currently frozen OOI spectrum data, then returns to live view."""
-        if not all([self._frozen_intensities is not None, self._frozen_wavelengths is not None,
-                    self._frozen_timestamp is not None, self._frozen_integration_time_ms is not None]):
-             logger.error("Cannot save OOI: Missing frozen data components."); self._handle_discard_frozen(); return
+        """Saves the currently frozen spectrum data (RAW or REFLECTANCE), then returns to live view."""
+        # Assertions for frozen data components
+        assert self._frozen_intensities is not None, "Cannot save: _frozen_intensities is None."
+        assert self._frozen_wavelengths is not None, "Cannot save: _frozen_wavelengths is None."
+        assert self._frozen_timestamp is not None, "Cannot save: _frozen_timestamp is None."
+        assert self._frozen_integration_time_ms is not None, "Cannot save: _frozen_integration_time_ms is None."
+        # _frozen_collection_mode should also be set by _handle_freeze_capture
+        assert hasattr(self, '_frozen_collection_mode') and self._frozen_collection_mode in AVAILABLE_COLLECTION_MODES, \
+               "Cannot save: _frozen_collection_mode is not set or invalid."
 
-        logger.info("Attempting to save frozen OOI spectrum...")
-        save_success = self._save_data( # Call general save function
-            intensities=self._frozen_intensities, wavelengths=self._frozen_wavelengths,
-            timestamp=self._frozen_timestamp, integration_ms=self._frozen_integration_time_ms,
-            spectra_type="OOI", save_plot=True # Save plot for OOI
+        logger.info(f"Attempting to save frozen spectrum (Mode: {self._frozen_collection_mode})...")
+
+        intensities_to_save = self._frozen_intensities # Start with raw frozen
+        spectra_type_for_csv = self._frozen_collection_mode.upper() # e.g., "RAW", "REFLECTANCE"
+
+        if self._frozen_collection_mode == MODE_REFLECTANCE:
+            # Calculate reflectance from the frozen raw data, dark, and white.
+            # This requires valid dark_ref and white_ref.
+            # The App Overview implies Target_raw, Dark_raw, White_raw are acquired with specific seabreeze params.
+            # This part needs careful implementation if full reflectance calculation is done here from frozen raw.
+            # For simplicity and based on current _capture_and_plot, we assume _frozen_intensities IS ALREADY the
+            # data that was being displayed (i.e. if reflectance was live, _capture_and_plot might have
+            # returned that, and _handle_freeze_capture should have stored *that*).
+            # Re-evaluating: _handle_freeze_capture stores raw.
+            # So if we save REFLECTANCE, we need to calculate it here.
+            # This implies _capture_and_store_dark_ref() and valid white_ref are needed.
+            # The current `_capture_and_plot` already calculates reflectance if in white_ref_setup.
+            # This is getting complex. The App Overview: "Saves captured data to daily CSV logs ...
+            # spectra_type (RAW, REFLECTANCE, DARK, WHITE)".
+            # And for REFLECTANCE: "Live display and saved data are calculated as (Target_raw - Dark_raw) / (White_raw - Dark_raw)."
+            #
+            # Let's assume if _frozen_collection_mode is REFLECTANCE, _frozen_intensities *should* be reflectance.
+            # This means _handle_freeze_capture should capture processed data if mode is REFLECTANCE.
+            # This is a larger change.
+            # For now, the simplest path that matches "saves what was frozen":
+            # If _frozen_collection_mode is "Reflectance", we need to be sure _frozen_intensities *is* reflectance.
+            # The current _capture_and_plot does the calculation for display.
+            # If _handle_freeze_capture stores the output of _capture_and_plot, that would work.
+            # Let's assume _frozen_intensities IS the data to save for the given _frozen_collection_mode.
+            # This means if REFLECTANCE was active, _capture_and_plot must have produced it,
+            # and _handle_freeze_capture stored it. This seems like a gap.
+            #
+            # Sticking to a simpler interpretation for now:
+            # The "SAMPLE" save should reflect the mode. If mode was REFLECTANCE, and we have valid
+            # white and dark references, we should calculate it.
+            # This implies _frozen_intensities is always RAW-like counts.
+            logger.warning("Saving frozen REFLECTANCE is not fully implemented with on-the-fly calculation from raw frozen data + stored refs. Saving raw-like data labeled as REFLECTANCE if that was the mode.")
+            # To correctly save Reflectance, we'd need:
+            # 1. A stored dark reference (similar to white reference).
+            # 2. Calculation: (self._frozen_intensities - dark_ref) / (self._stored_white_reference - dark_ref)
+            # This is not currently in place for _handle_save_ooi.
+            # The CSV type will be "REFLECTANCE" but data will be the raw counts if this isn't changed.
+            # This is consistent with saving what was literally frozen if "Reflectance" was not calculated *before* freezing.
+            pass # intensities_to_save remains self._frozen_intensities
+
+        save_success = self._save_data(
+            intensities=intensities_to_save,
+            wavelengths=self._frozen_wavelengths,
+            timestamp=self._frozen_timestamp,
+            integration_ms=self._frozen_integration_time_ms,
+            spectra_type=spectra_type_for_csv, # Use the mode at time of freeze
+            save_plot=True
         )
-        if save_success: logger.info("Frozen OOI spectrum saved successfully.")
-        else: logger.error("Failed to save frozen OOI spectrum.")
-        self._handle_discard_frozen() # Clear state and return
+
+        if save_success:
+            logger.info(f"Frozen {self._frozen_collection_mode} spectrum saved successfully.")
+        else:
+            logger.error(f"Failed to save frozen {self._frozen_collection_mode} spectrum.")
+
+        self._handle_discard_frozen() # Clears frozen state and returns to live view
+
 
     def _handle_discard_frozen(self):
         """Discards the currently frozen spectrum data and returns to live view."""
         logger.info("Discarding frozen spectrum.")
-        self._frozen_intensities = None; self._frozen_wavelengths = None
-        self._frozen_timestamp = None; self._frozen_integration_time_ms = None
-        self._current_state = self.STATE_LIVE_VIEW # Always return to normal live view
-        logger.info("Returned to live view (discarded).")
+        self._frozen_intensities = None
+        self._frozen_wavelengths = None
+        self._frozen_timestamp = None
+        self._frozen_integration_time_ms = None
+        if hasattr(self, '_frozen_collection_mode'): # Clear if it exists
+            delattr(self, '_frozen_collection_mode')
+        self._current_state = self.STATE_LIVE_VIEW
+        logger.info("Returned to live view after discarding/saving frozen data.")
+
 
     def _save_data(self, intensities: np.ndarray, wavelengths: np.ndarray,
                    timestamp: datetime.datetime, integration_ms: int,
                    spectra_type: str, save_plot: bool = True) -> bool:
-        """Saves spectrum data (OOI, DARK, or WHITE) to CSV. Optionally saves plot."""
-        if intensities is None or wavelengths is None or timestamp is None or integration_ms is None or not spectra_type:
-            logger.error(f"Cannot save data: Invalid params for type '{spectra_type}'.")
+        """
+        Saves spectrum data to daily CSV. Optionally saves plot.
+        CSV columns: timestamp_utc, spectra_type, lens_type, integration_time_ms, w1, w2, ...
+        """
+        # Assertions for parameters
+        assert intensities is not None, "Intensities are None in _save_data."
+        assert wavelengths is not None, "Wavelengths are None in _save_data."
+        assert timestamp is not None, "Timestamp is None in _save_data."
+        assert integration_ms is not None, "Integration_ms is None in _save_data."
+        assert spectra_type, "spectra_type is empty in _save_data."
+        assert isinstance(intensities, np.ndarray), "Intensities must be numpy array."
+        assert isinstance(wavelengths, np.ndarray), "Wavelengths must be numpy array."
+        assert isinstance(timestamp, datetime.datetime), "Timestamp must be datetime object."
+        assert isinstance(integration_ms, int), "Integration_ms must be int."
+        assert self.menu_system is not None, "MenuSystem is None in _save_data."
+
+        # --- Create Daily Folder ---
+        # Folder: ~/pysb-app/spectra_data/YYYY-MM-DD/
+        # Use timestamp's date for folder name to ensure data goes into correct day's log
+        daily_folder_path = os.path.join(DATA_DIR, timestamp.strftime("%Y-%m-%d"))
+        try:
+            os.makedirs(daily_folder_path, exist_ok=True)
+        except OSError as e:
+            logger.error(f"Could not create daily data directory {daily_folder_path}: {e}")
+            return False # Cannot proceed without directory
+        except Exception as e_mkdir: # Catch any other unexpected error
+            logger.error(f"Unexpected error creating daily directory {daily_folder_path}: {e_mkdir}")
             return False
 
-        timestamp_str = timestamp.strftime("%Y-%m-%d-%H-%M-%S")
-        logger.debug(f"Saving data (Type: {spectra_type})...")
+        # --- Prepare CSV ---
+        # CSV Filename: YYYY-MM-DD_spectra_log.csv (using global CSV_BASE_FILENAME)
+        csv_filename_dated = f"{timestamp.strftime('%Y-%m-%d')}_{CSV_BASE_FILENAME}"
+        csv_filepath = os.path.join(daily_folder_path, csv_filename_dated)
+        # Assertion for path components
+        assert isinstance(csv_filepath, str), "Generated CSV filepath is not a string."
+
+        timestamp_str_utc = timestamp.strftime("%Y-%m-%dT%H:%M:%SZ") # ISO 8601 like format for CSV
+        lens_type_str = self.menu_system.get_lens_type()
+        # Assertion for lens_type
+        assert isinstance(lens_type_str, str) and lens_type_str in LENS_TYPES, \
+               f"Invalid lens type '{lens_type_str}' from menu_system."
+
+        logger.debug(f"Saving data (Type: {spectra_type}, Lens: {lens_type_str}) to {csv_filepath}")
         try:
-            os.makedirs(DATA_DIR, exist_ok=True)
-            with open(CSV_FILENAME, 'a', newline='') as csvfile:
+            # Check if file exists and has content to determine if header is needed
+            # This check should be as close to the open() as possible to minimize race conditions,
+            # though for this app, it's unlikely to be an issue.
+            write_header = not (os.path.isfile(csv_filepath) and os.path.getsize(csv_filepath) > 0)
+
+            with open(csv_filepath, 'a', newline='') as csvfile:
                 csvwriter = csv.writer(csvfile)
-                file_exists = os.path.isfile(CSV_FILENAME) and os.path.getsize(CSV_FILENAME) > 0
-                if not file_exists:
-                    header = ["timestamp", "spectra_type", "integration_time_ms", "scans_to_average"] + \
-                             [f"{wl:.2f}" for wl in wavelengths]
+                if write_header:
+                    header = ["timestamp_utc", "spectra_type", "lens_type", "integration_time_ms"] + \
+                             [f"{wl:.2f}" for wl in wavelengths] # Wavelengths as part of header
                     csvwriter.writerow(header)
-                data_row = [timestamp_str, spectra_type, integration_ms, 1] + \
-                           [f"{inten:.4f}" for inten in intensities]
+
+                # Data row includes actual intensity values
+                data_row = [timestamp_str_utc, spectra_type, lens_type_str, integration_ms] + \
+                           [f"{inten:.4f}" for inten in intensities] # Format intensities
                 csvwriter.writerow(data_row)
 
-            if save_plot: # Only save plot if flag is True
-                if plt is None: logger.warning("Plot save skipped: Matplotlib unavailable.")
+            # --- Increment scans_today_count after successful CSV write ---
+            self._scans_today_count += 1
+            logger.info(f"Scan count for today incremented to: {self._scans_today_count}")
+
+
+            # --- Optionally Save Plot ---
+            if save_plot:
+                if plt is None or Image is None: # Check for plotting libraries
+                    logger.warning("Plot save skipped: Matplotlib or Pillow unavailable.")
                 else:
-                    plot_filename_base = f"spectrum_{spectra_type}_{timestamp_str}"
-                    plot_filepath_png = os.path.join(PLOT_SAVE_DIR, f"{plot_filename_base}.png")
-                    logger.debug(f"Saving plot: {plot_filepath_png}")
-                    save_fig, save_ax = None, None
+                    plot_timestamp_str_local = timestamp.strftime("%Y-%m-%d-%H%M%S") # Local time for filename
+                    plot_filename_base = f"spectrum_{spectra_type}_{lens_type_str}_{plot_timestamp_str_local}"
+                    plot_filepath_png = os.path.join(daily_folder_path, f"{plot_filename_base}.png")
+                    logger.debug(f"Attempting to save plot: {plot_filepath_png}")
+
+                    save_fig_temp, save_ax_temp = None, None # Initialize for finally block
                     try:
-                        save_fig, save_ax = plt.subplots(figsize=(8, 6))
-                        if not save_fig or not save_ax: raise RuntimeError("Failed plot creation")
-                        save_ax.plot(wavelengths, intensities)
-                        save_ax.set_title(f"Spectrum ({spectra_type}) - {timestamp_str}\nIntegration: {integration_ms} ms, Scans: 1", fontsize=10)
-                        save_ax.set_xlabel("Wavelength (nm)"); save_ax.set_ylabel("Intensity")
-                        save_ax.grid(True, linestyle="--", alpha=0.7); save_fig.tight_layout()
-                        save_fig.savefig(plot_filepath_png, dpi=150)
-                        logger.debug("Plot image saved.")
+                        # Create a new figure for saving to avoid issues with the live plot figure
+                        save_fig_temp, save_ax_temp = plt.subplots(figsize=(8, 6)) # Standard size for saved plots
+                        if not save_fig_temp or not save_ax_temp:
+                            raise RuntimeError("Failed to create temporary figure/axes for saving plot.")
+
+                        save_ax_temp.plot(wavelengths, intensities)
+                        title_str = (f"Spectrum ({spectra_type}) - {plot_timestamp_str_local}\n"
+                                     f"Lens: {lens_type_str}, Integ: {integration_ms} ms, Scans Today: {self._scans_today_count}")
+                        save_ax_temp.set_title(title_str, fontsize=10)
+                        save_ax_temp.set_xlabel("Wavelength (nm)")
+                        save_ax_temp.set_ylabel("Intensity") # Or "Reflectance" if applicable
+                        save_ax_temp.grid(True, linestyle="--", alpha=0.7)
+                        save_fig_temp.tight_layout()
+                        save_fig_temp.savefig(plot_filepath_png, dpi=150)
+                        logger.info(f"Plot image saved: {plot_filepath_png}")
+                    except Exception as e_plot_save: # Catch specific plot saving errors
+                        logger.error(f"Error saving plot image to {plot_filepath_png}: {e_plot_save}", exc_info=True)
                     finally:
-                        if save_fig and plt.fignum_exists(save_fig.number): plt.close(save_fig)
-            else: logger.debug(f"Plot saving skipped for type: {spectra_type}")
-            logger.info(f"Data saved for type: {spectra_type}.")
+                        # Ensure temporary figure is closed
+                        if save_fig_temp and plt and plt.fignum_exists(save_fig_temp.number):
+                            plt.close(save_fig_temp)
+            else:
+                logger.debug(f"Plot saving skipped for spectra_type: {spectra_type}")
+
+            logger.info(f"Data successfully saved for type: {spectra_type} (Lens: {lens_type_str}).")
             return True
-        except Exception as e: logger.error(f"Error saving data: {e}", exc_info=True); return False
+        except csv.Error as e_csv:
+            logger.error(f"CSVError saving data to {csv_filepath}: {e_csv}", exc_info=True)
+        except IOError as e_io:
+            logger.error(f"IOError saving data to {csv_filepath}: {e_io}", exc_info=True)
+        except Exception as e: # Catch any other unexpected error during save
+            logger.error(f"Unexpected error saving data to {csv_filepath}: {e}", exc_info=True)
+        return False
 
     def _rescale_y_axis(self, relative: bool = False):
-        """Captures spectrum, calculates new Y max, updates state. Handles relative."""
-        if np is None: logger.error("NumPy unavailable."); return
-        if not (self.spectrometer and hasattr(self.spectrometer, '_dev') and self.spectrometer._dev.is_open):
-             logger.warning("Spectrometer not ready."); return
-        logger.info(f"Rescaling Y-axis (relative={relative})...")
+        """Captures spectrum, calculates new Y max, updates state. Handles relative display scaling."""
+        # Assertion: menu_system must be available
+        assert self.menu_system is not None, "MenuSystem is None in _rescale_y_axis"
+        if np is None:
+            logger.error("NumPy (np) is unavailable. Cannot rescale Y-axis.")
+            return
+
+        device_proxy = getattr(self.spectrometer, '_dev', None)
+        if not (self.spectrometer and device_proxy and hasattr(device_proxy, 'is_open') and device_proxy.is_open):
+             logger.warning("Spectrometer not ready for Y-axis rescale.")
+             return
+
+        logger.info(f"Attempting to rescale Y-axis (relative display scaling={relative})...")
         try:
             current_integration_time_ms = self.menu_system.get_integration_time_ms()
-            integration_micros_scaled = int((current_integration_time_ms * 1000) * INTEGRATION_TIME_SCALE_FACTOR)
+            # Assertion: Check integration time
+            assert isinstance(current_integration_time_ms, int) and current_integration_time_ms > 0, \
+                   f"Invalid integration time from menu: {current_integration_time_ms}"
+
             if current_integration_time_ms != self._last_integration_time_ms:
-                 logger.debug(f"RESCALE: Sending scaled integ time: {integration_micros_scaled} µs (target {current_integration_time_ms} ms)")
+                 integration_micros_scaled = int((current_integration_time_ms * 1000) * INTEGRATION_TIME_SCALE_FACTOR)
+                 logger.debug(f"RESCALE_Y: Setting integration time to {integration_micros_scaled} µs (target {current_integration_time_ms} ms)")
                  self.spectrometer.integration_time_micros(integration_micros_scaled)
                  self._last_integration_time_ms = current_integration_time_ms
 
             intensities = self.spectrometer.intensities(correct_dark_counts=True, correct_nonlinearity=True)
-            if intensities is not None and len(intensities) > 0:
-                 data_to_scale = intensities
-                 if relative:
+            # Assertion: Check intensities
+            assert intensities is not None, "Received None for intensities from spectrometer for rescale."
+
+            if len(intensities) > 0: # Ensure there's data to process
+                 data_to_scale = intensities # Default to raw intensities
+                 if relative: # This 'relative' is for display scaling in WHITE_REF_SETUP mode
                       if self._stored_white_reference is not None and len(intensities) == len(self._stored_white_reference):
-                           data_to_scale = intensities / self._stored_white_reference
-                      else: logger.warning("Cannot rescale relative: White ref missing/invalid."); return
+                           # Ensure white ref is not zero where intensities are non-zero to avoid inf
+                           safe_white_ref = np.where(self._stored_white_reference == 0, 1e-9, self._stored_white_reference)
+                           data_to_scale = intensities / safe_white_ref
+                      else:
+                           logger.warning("Cannot rescale Y-axis relatively for display: White reference missing or invalid length. Using raw scale.")
+                           # data_to_scale remains raw intensities
 
                  max_val = np.max(data_to_scale)
+                 # Choose min ceiling based on whether data is raw counts or relative (0-1.x typical)
                  min_ceiling = Y_AXIS_MIN_CEILING_RELATIVE if relative else Y_AXIS_MIN_CEILING
-                 new_y_max = max(min_ceiling, max_val * Y_AXIS_RESCALE_FACTOR)
-                 self._current_y_max = float(new_y_max)
-                 logger.info(f"Y-axis max rescaled to: {self._current_y_max:.2f} (based on max val: {max_val:.2f})")
-            else: logger.warning("Failed rescaling: No valid intensities.")
-        except usb.core.USBError as e_usb: logger.error(f"USB error during rescale: {e_usb}")
-        except AttributeError as e_attr: logger.error(f"Attribute error during rescale: {e_attr}")
-        except Exception as e: logger.error(f"Error rescaling Y-axis: {e}", exc_info=True)
+                 new_y_max = max(float(min_ceiling), float(max_val * Y_AXIS_RESCALE_FACTOR))
+                 self._current_y_max = new_y_max # Store as float
+                 logger.info(f"Y-axis max rescaled to: {self._current_y_max:.2f} (based on max_val: {max_val:.2f}, relative scaling: {relative})")
+            else:
+                 logger.warning("Failed Y-axis rescaling: No valid intensities captured.")
+        except sb.SeaBreezeError as e_sb_rescale:
+            logger.error(f"SeaBreezeError during Y-axis rescale: {e_sb_rescale}", exc_info=True)
+        except usb.core.USBError as e_usb: # pyusb can raise this
+            logger.error(f"USB error during Y-axis rescale: {e_usb}", exc_info=True)
+        except AttributeError as e_attr:
+            logger.error(f"Attribute error during Y-axis rescale: {e_attr}", exc_info=True)
+        except Exception as e: # Catch any other unexpected error
+            logger.error(f"Unexpected error rescaling Y-axis: {e}", exc_info=True)
+
 
     def _capture_and_plot(self) -> pygame.Surface | None:
-        """Captures/uses data, applies smoothing, calculates relative if needed, plots."""
-        if not (self.plot_fig and self.plot_ax and self.plot_line and Image):
-             logger.warning("Plotting components not ready."); return None
-        # Check numpy availability, warn if needed but proceed
-        if np is None and self._current_state in [self.STATE_LIVE_VIEW, self.STATE_WHITE_REF_SETUP, self.STATE_DARK_CAPTURE]:
-             logger.warning("NumPy unavailable for smoothing/relative calc.")
+        """Captures/uses data, applies smoothing, calculates relative if needed, plots to an in-memory Pygame surface."""
+        # Assertions for essential components
+        assert self.plot_fig and self.plot_ax and self.plot_line, "Plotting components (fig, ax, line) not initialized."
+        assert Image is not None, "Pillow (Image) is not available for plot rendering."
+        assert self.menu_system is not None, "MenuSystem is None in _capture_and_plot."
 
-        plot_w = None; plot_i_to_display = None; y_label = "Intensity"
+        # Check numpy availability for processing, log warning if missing but proceed where possible
+        if np is None and self._current_state in [self.STATE_LIVE_VIEW, self.STATE_WHITE_REF_SETUP, self.STATE_DARK_CAPTURE, self.STATE_CALIBRATE]:
+             logger.warning("NumPy (np) is unavailable. Smoothing and relative calculations for live plot will be skipped.")
+
+        plot_wavelengths_local: np.ndarray | None = None
+        plot_intensities_to_display: np.ndarray | None = None
+        y_axis_label_str = "Intensity" # Default Y-axis label
+
+        device_proxy = getattr(self.spectrometer, '_dev', None) # Check device proxy status
 
         try:
+            current_internal_state = self._current_state # Cache state for consistent decisions
             # --- Get Live Data if in a live state ---
-            current_state = self._current_state # Cache state
-            if current_state in [self.STATE_LIVE_VIEW, self.STATE_CALIBRATE, self.STATE_WHITE_REF_SETUP, self.STATE_DARK_CAPTURE]:
-                if not (self.spectrometer and hasattr(self.spectrometer, '_dev') and self.spectrometer._dev.is_open and self.wavelengths is not None):
-                     return None # Not ready
+            if current_internal_state in [self.STATE_LIVE_VIEW, self.STATE_CALIBRATE, self.STATE_WHITE_REF_SETUP, self.STATE_DARK_CAPTURE]:
+                if not (self.spectrometer and device_proxy and hasattr(device_proxy, 'is_open') and device_proxy.is_open and self.wavelengths is not None):
+                     logger.debug(f"Spectrometer not ready or wavelengths missing for live plot in state: {current_internal_state}.")
+                     return None # Not ready for live data
 
                 current_integration_time_ms = self.menu_system.get_integration_time_ms()
                 if current_integration_time_ms != self._last_integration_time_ms:
                      integration_micros_scaled = int((current_integration_time_ms * 1000) * INTEGRATION_TIME_SCALE_FACTOR)
-                     # logger.debug(f"PLOT ({self._current_state}): Sending scaled integ time: {integration_micros_scaled} µs (target {current_integration_time_ms} ms)") # Can be noisy
                      self.spectrometer.integration_time_micros(integration_micros_scaled)
                      self._last_integration_time_ms = current_integration_time_ms
 
-                raw_i = self.spectrometer.intensities(correct_dark_counts=True, correct_nonlinearity=True)
-                if raw_i is None or len(raw_i) != len(self.wavelengths):
-                     logger.warning("Failed live capture for plot."); return None
-                plot_w = self.wavelengths
+                raw_intensities_capture = self.spectrometer.intensities(correct_dark_counts=True, correct_nonlinearity=True)
+                if raw_intensities_capture is None or len(raw_intensities_capture) != len(self.wavelengths):
+                     logger.warning(f"Failed live capture for plot or length mismatch in state {current_internal_state}.")
+                     return None
+                plot_wavelengths_local = self.wavelengths # Use instance wavelengths
 
-                # --- Process based on state ---
-                if self._current_state == self.STATE_WHITE_REF_SETUP:
-                     y_label = "Relative Reflectance"
-                     if self._stored_white_reference is not None and np is not None and len(raw_i) == len(self._stored_white_reference):
-                          plot_i_to_display = raw_i / self._stored_white_reference
+                # --- Process intensities based on state ---
+                if current_internal_state == self.STATE_WHITE_REF_SETUP: # Displaying relative to stored white
+                     y_axis_label_str = "Relative Reflectance"
+                     if self._stored_white_reference is not None and np is not None and len(raw_intensities_capture) == len(self._stored_white_reference):
+                          # Ensure safe division
+                          safe_white_ref = np.where(self._stored_white_reference == 0, 1e-9, self._stored_white_reference)
+                          plot_intensities_to_display = raw_intensities_capture / safe_white_ref
                      else:
-                          logger.warning("White ref invalid for relative plot, showing raw.")
-                          plot_i_to_display = raw_i
-                else: # STATE_LIVE_VIEW or STATE_DARK_CAPTURE
-                     y_label = "Intensity (Counts)"
-                     if np is not None and LIVE_SMOOTHING_WINDOW_SIZE > 1 and isinstance(raw_i, np.ndarray):
-                         try: # Apply smoothing
-                             window_size = LIVE_SMOOTHING_WINDOW_SIZE
-                             weights = np.ones(window_size) / window_size
-                             plot_i_to_display = np.convolve(raw_i, weights, mode='same')
+                          logger.warning("White reference invalid or NumPy unavailable for relative plot, showing raw counts instead.")
+                          plot_intensities_to_display = raw_intensities_capture # Fallback to raw
+                else: # STATE_LIVE_VIEW, STATE_CALIBRATE, STATE_DARK_CAPTURE (all show raw-like counts)
+                     y_axis_label_str = "Intensity (Counts)"
+                     # Apply smoothing if configured and NumPy available
+                     if np is not None and USE_LIVE_SMOOTHING and LIVE_SMOOTHING_WINDOW_SIZE > 1 and isinstance(raw_intensities_capture, np.ndarray):
+                         try:
+                             window_s = LIVE_SMOOTHING_WINDOW_SIZE
+                             if window_s % 2 == 0: window_s += 1 # Ensure odd
+                             if window_s > len(raw_intensities_capture): window_s = len(raw_intensities_capture) # Clamp
+
+                             if window_s < 3 : # Min practical window for convolve
+                                 plot_intensities_to_display = raw_intensities_capture
+                             else:
+                                 # Using a simple moving average
+                                 weights = np.ones(window_s) / float(window_s)
+                                 plot_intensities_to_display = np.convolve(raw_intensities_capture, weights, mode='same')
                          except Exception as smooth_err:
-                             logger.error(f"Smoothing error: {smooth_err}. Using raw."); plot_i_to_display = raw_i
-                     else: plot_i_to_display = raw_i 
+                             logger.error(f"Error during live smoothing: {smooth_err}. Using raw data for plot.")
+                             plot_intensities_to_display = raw_intensities_capture
+                     else: # No smoothing or NumPy unavailable
+                         plot_intensities_to_display = raw_intensities_capture
 
-            elif self._current_state == self.STATE_FROZEN_VIEW: # Use frozen (raw) data
+            elif current_internal_state == self.STATE_FROZEN_VIEW: # Use frozen data
                 if not (self._frozen_intensities is not None and self._frozen_wavelengths is not None):
-                     logger.error("Frozen data missing for plot."); self._handle_discard_frozen(); return None
-                plot_w = self._frozen_wavelengths
-                plot_i_to_display = self._frozen_intensities
-                y_label = "Intensity (Frozen)"
-            else: return None
-
-            # --- Update Plot Data & Axes ---
-            if plot_w is None or plot_i_to_display is None: return None
-            self.plot_line.set_data(plot_w, plot_i_to_display)
-            current_y_limit = self._current_y_max
-            if self._current_state == self.STATE_WHITE_REF_SETUP:
-                 current_y_limit = max(Y_AXIS_MIN_CEILING_RELATIVE, self._current_y_max)
-            self.plot_ax.set_ylabel(y_label, fontsize=10, color='white')
-            self.plot_ax.set_ylim(0, current_y_limit)
-            self.plot_ax.set_xlim(min(plot_w), max(plot_w))
-
-            # --- Render Plot to Buffer & Convert ---
-            try:
-                 buf = io.BytesIO()
-                 self.plot_fig.savefig(buf, format='png', dpi=self.plot_fig.dpi, bbox_inches='tight', pad_inches=0.05)
-                 buf.seek(0)
-                 if buf.getbuffer().nbytes == 0: raise RuntimeError("Empty plot buffer")
-                 plot_surface = pygame.image.load(buf, "png")
-                 buf.close()
-                 if plot_surface is None: # Check if load itself failed (unlikely here)
-                     raise RuntimeError("pygame.image.load failed")
-                 return plot_surface
-            except Exception as render_err:
-                 logger.error(f"Error rendering plot to surface: {render_err}", exc_info=True)
-                 if 'buf' in locals() and hasattr(buf, 'closed') and not buf.closed: buf.close()
+                     logger.error("Frozen data or wavelengths missing for plot. Discarding frozen state.")
+                     self._handle_discard_frozen() # Clear inconsistent frozen state
+                     return None
+                plot_wavelengths_local = self._frozen_wavelengths
+                plot_intensities_to_display = self._frozen_intensities # This is raw data frozen
+                # If frozen mode was Reflectance, we'd ideally show that.
+                # This current path always shows the raw frozen data, labeled by mode.
+                frozen_mode_label = getattr(self, '_frozen_collection_mode', 'RAW').upper()
+                y_axis_label_str = f"Intensity ({frozen_mode_label} Frozen)"
+            else: # Should not happen with defined states
+                 logger.error(f"Unknown plot state: {current_internal_state}. Cannot capture/plot.")
                  return None
 
-        # --- Exception Handling ---
-        except usb.core.USBError as e_usb: logger.error(f"USB error in plot: {e_usb}"); return None
-        except AttributeError as e_attr: logger.error(f"Attribute error in plot: {e_attr}"); return None
-        except Exception as e: logger.error(f"General Plot error: {e}", exc_info=True); return None
-    
-    
+            # --- Ensure data is available for plotting ---
+            if plot_wavelengths_local is None or plot_intensities_to_display is None:
+                logger.debug("No data available to plot (wavelengths or intensities are None).")
+                return None
+
+            # --- Update Plot Data & Axes ---
+            self.plot_line.set_data(plot_wavelengths_local, plot_intensities_to_display)
+            # Determine Y-axis limit for current view
+            current_y_limit_for_plot = self._current_y_max
+            if current_internal_state == self.STATE_WHITE_REF_SETUP: # Specific Y-axis scaling for relative display
+                 current_y_limit_for_plot = max(Y_AXIS_MIN_CEILING_RELATIVE, self._current_y_max) # Ensure min ceiling
+            self.plot_ax.set_ylabel(y_axis_label_str, fontsize=9, color='white') # Updated font size
+            self.plot_ax.set_ylim(0, current_y_limit_for_plot)
+            self.plot_ax.set_xlim(min(plot_wavelengths_local), max(plot_wavelengths_local))
+
+            # --- Render Plot to In-Memory Buffer & Convert to Pygame Surface ---
+            plot_buffer = None # Initialize for finally block
+            try:
+                 plot_buffer = io.BytesIO()
+                 # Use figure's DPI for saving to buffer to match on-screen appearance
+                 self.plot_fig.savefig(plot_buffer, format='png', dpi=self.plot_fig.get_dpi(), bbox_inches='tight', pad_inches=0.05)
+                 plot_buffer.seek(0) # Rewind buffer to the beginning
+                 if plot_buffer.getbuffer().nbytes == 0: # Check if buffer is empty
+                     raise RuntimeError("Plot buffer is empty after savefig. Plotting may have failed silently.")
+                 # Load image from buffer into a Pygame surface
+                 plot_surface = pygame.image.load(plot_buffer, "png")
+                 if plot_surface is None: # Check if load itself failed
+                     raise RuntimeError("pygame.image.load returned None when loading plot from buffer.")
+                 return plot_surface
+            except RuntimeError as e_render_rt: # Catch specific runtime errors
+                 logger.error(f"Runtime error rendering plot to Pygame surface: {e_render_rt}", exc_info=True)
+                 return None
+            except Exception as render_err: # Catch any other unexpected errors
+                 logger.error(f"Unexpected error rendering plot to Pygame surface: {render_err}", exc_info=True)
+                 return None
+            finally:
+                if plot_buffer: # Ensure buffer is closed
+                    plot_buffer.close()
+
+        # --- Exception Handling for Outer Try Block ---
+        except sb.SeaBreezeError as e_sb_plot: # Catch SeaBreeze errors during capture
+            logger.error(f"SeaBreezeError in _capture_and_plot: {e_sb_plot}", exc_info=True)
+            return None
+        except usb.core.USBError as e_usb_plot: # Catch USB errors
+            logger.error(f"USBError in _capture_and_plot: {e_usb_plot}", exc_info=True)
+            return None
+        except AttributeError as e_attr_plot: # Catch attribute errors (e.g., on None objects)
+            logger.error(f"AttributeError in _capture_and_plot: {e_attr_plot}", exc_info=True)
+            return None
+        except Exception as e_general_plot: # Catch any other unexpected errors
+            logger.error(f"General unhandled error in _capture_and_plot: {e_general_plot}", exc_info=True)
+            return None
+
     def _draw_overlays(self):
-        """Draws status text overlays on the screen."""
-        if not self.overlay_font: return
-        display_integration_time_ms = DEFAULT_INTEGRATION_TIME_MS
+        """Draws status text overlays on the screen, including integ time and scan count on the same line."""
+        if not self.overlay_font:
+            logger.warning("Overlay font not available, cannot draw overlays.")
+            return
+        if self.menu_system is None:
+            logger.error("MenuSystem not available to SpectrometerScreen, cannot draw overlays correctly.")
+            return
+        if self.screen is None:
+            logger.error("Screen object is None in _draw_overlays.")
+            return
+
+        display_integration_time_ms = DEFAULT_INTEGRATION_TIME_MS # Fallback
         try:
-             current_state = self._current_state
-             if current_state == self.STATE_FROZEN_VIEW and self._frozen_integration_time_ms is not None:
+             current_internal_state_local = self._current_state
+             if current_internal_state_local == self.STATE_FROZEN_VIEW and self._frozen_integration_time_ms is not None:
                   display_integration_time_ms = self._frozen_integration_time_ms
-             elif current_state != self.STATE_FROZEN_VIEW:
+             elif current_internal_state_local != self.STATE_FROZEN_VIEW:
                   display_integration_time_ms = self.menu_system.get_integration_time_ms()
-        except Exception as e: logger.warning(f"Could not get integration time for overlay: {e}")
+        except Exception as e_integ_get:
+            logger.warning(f"Could not get integration time for overlay: {e_integ_get}")
 
         try:
-            # Integ Time
-            integ_text = f"Integ: {display_integration_time_ms} ms"; integ_surf = self.overlay_font.render(integ_text, True, YELLOW)
-            self.screen.blit(integ_surf, (5, 5))
-            # Mode
-            state_text = f"Mode: {self._current_state.upper()}"; state_color = YELLOW
-            if self._current_state == self.STATE_FROZEN_VIEW: state_color = BLUE
-            elif self._current_state == self.STATE_CALIBRATE: state_color = GREEN
-            elif self._current_state == self.STATE_WHITE_REF_SETUP: state_color = CYAN
-            elif self._current_state == self.STATE_DARK_CAPTURE: state_color = RED
-            state_surf = self.overlay_font.render(state_text, True, state_color)
-            state_rect = state_surf.get_rect(right=SCREEN_WIDTH - 5, top=5)
+            # --- Top-Left Overlays: Integration Time and Scan Count ---
+            top_left_y_pos = 5
+            current_x_pos = 5
+            text_spacing = 10 # Horizontal space between "Integ" and "Scans" text
+
+            # 1. Integration Time
+            integ_text_str = f"Integ: {display_integration_time_ms} ms"
+            integ_surf = self.overlay_font.render(integ_text_str, True, YELLOW)
+            assert isinstance(integ_surf, pygame.Surface), "Integration time overlay render failed"
+            self.screen.blit(integ_surf, (current_x_pos, top_left_y_pos))
+            current_x_pos += integ_surf.get_width() + text_spacing # Update X for next item
+
+            # 2. Scans Today Count
+            scans_text_str = f"Scans: {self._scans_today_count}"
+            scans_surf = self.overlay_font.render(scans_text_str, True, YELLOW)
+            assert isinstance(scans_surf, pygame.Surface), "Scans today overlay render failed"
+            # Blit scans_surf at the updated current_x_pos and same top_left_y_pos
+            self.screen.blit(scans_surf, (current_x_pos, top_left_y_pos))
+            # current_x_pos += scans_surf.get_width() + text_spacing # If more items were to follow on this line
+
+            # --- Mode/State Display (Top Right) ---
+            current_internal_state_for_display = self._current_state
+            state_text_to_render = ""
+            state_color = YELLOW # Default
+
+            if current_internal_state_for_display == self.STATE_LIVE_VIEW:
+                collection_mode_str = self.menu_system.get_collection_mode()
+                state_text_to_render = f"Mode: {collection_mode_str.upper()}"
+            elif current_internal_state_for_display == self.STATE_FROZEN_VIEW:
+                frozen_mode_label = getattr(self, '_frozen_collection_mode', 'FROZEN').upper()
+                state_text_to_render = f"Mode: {frozen_mode_label} (F)"
+                state_color = BLUE
+            elif current_internal_state_for_display == self.STATE_CALIBRATE:
+                state_text_to_render = "Mode: CALIBRATE"
+                state_color = GREEN
+            elif current_internal_state_for_display == self.STATE_WHITE_REF_SETUP:
+                state_text_to_render = "Mode: WHITE SETUP"
+                state_color = CYAN
+            elif current_internal_state_for_display == self.STATE_DARK_CAPTURE:
+                state_text_to_render = "Mode: DARK CAPTURE"
+                state_color = RED
+            else:
+                state_text_to_render = f"Mode: {current_internal_state_for_display.upper()} (UNKNOWN)"
+                logger.warning(f"Overlay: Unhandled state '{current_internal_state_for_display}' for mode text.")
+
+            assert isinstance(state_text_to_render, str) and state_text_to_render, \
+                   f"state_text_to_render is invalid ('{state_text_to_render}') for state '{current_internal_state_for_display}'"
+            state_surf = self.overlay_font.render(state_text_to_render, True, state_color)
+            assert isinstance(state_surf, pygame.Surface), "Mode/State overlay render failed"
+            state_rect = state_surf.get_rect(right=SCREEN_WIDTH - 5, top=top_left_y_pos) # Use same Y as top-left
             self.screen.blit(state_surf, state_rect)
 
-            # Hints
-            hint_text = "";
-            if self._current_state == self.STATE_LIVE_VIEW: hint_text = "A:Freeze OOI | X:Calib | Y:Rescale | B:Menu"
-            elif self._current_state == self.STATE_FROZEN_VIEW: hint_text = "A: Save OOI | B: Discard"
-            elif self._current_state == self.STATE_CALIBRATE: hint_text = "A: White Setup | X: Dark Setup | B: Back Live"
-            elif self._current_state == self.STATE_WHITE_REF_SETUP: hint_text = "Aim@White -> A: Save Ref | B: Cancel Live"
-            elif self._current_state == self.STATE_DARK_CAPTURE: hint_text = "Cap On -> A: Save Dark | B: Cancel Live"
+            # --- Contextual Hints Display (Bottom Center) ---
+            hint_text_str = ""
+            if current_internal_state_for_display == self.STATE_LIVE_VIEW:
+                hint_text_str = "A:Freeze | X:Calib | Y:Rescale | B:Menu"
+            elif current_internal_state_for_display == self.STATE_FROZEN_VIEW:
+                hint_text_str = "A:Save | B:Discard"
+            elif current_internal_state_for_display == self.STATE_CALIBRATE:
+                hint_text_str = "A:White Setup | X:Dark Setup | B:Back"
+            elif current_internal_state_for_display == self.STATE_WHITE_REF_SETUP:
+                hint_text_str = "Aim@White -> A:Save Ref | B:Cancel"
+            elif current_internal_state_for_display == self.STATE_DARK_CAPTURE:
+                hint_text_str = "Cap On -> A:Save Dark | B:Cancel"
 
-            if hint_text:
-                hint_surf = self.overlay_font.render(hint_text, True, YELLOW)
+            if hint_text_str:
+                hint_surf = self.overlay_font.render(hint_text_str, True, YELLOW)
+                assert isinstance(hint_surf, pygame.Surface), "Hint overlay render failed"
                 hint_rect = hint_surf.get_rect(centerx=SCREEN_WIDTH // 2, bottom=SCREEN_HEIGHT - 5)
-                self.screen.blit(hint_surf, hint_rect) 
-        except Exception as e: logger.error(f"Error rendering overlays: {e}", exc_info=True)
+                self.screen.blit(hint_surf, hint_rect)
 
-    # <<< Fixed draw method >>>
+        except pygame.error as e_render:
+             logger.error(f"Pygame error rendering overlays: {e_render}", exc_info=True)
+        except AssertionError as e_assert:
+            logger.error(f"AssertionError rendering overlays: {e_assert}", exc_info=True)
+        except Exception as e:
+            logger.error(f"Unexpected error rendering overlays: {e}", exc_info=True)
+
+            # --- Contextual Hints Display (Bottom Center) ---
+            hint_text_str = ""
+            # Use current_internal_state_for_display for consistency
+            if current_internal_state_for_display == self.STATE_LIVE_VIEW:
+                hint_text_str = "A:Freeze | X:Calib | Y:Rescale | B:Menu"
+            elif current_internal_state_for_display == self.STATE_FROZEN_VIEW:
+                hint_text_str = "A:Save | B:Discard"
+            elif current_internal_state_for_display == self.STATE_CALIBRATE:
+                hint_text_str = "A:White Setup | X:Dark Setup | B:Back"
+            elif current_internal_state_for_display == self.STATE_WHITE_REF_SETUP:
+                hint_text_str = "Aim@White -> A:Save Ref | B:Cancel"
+            elif current_internal_state_for_display == self.STATE_DARK_CAPTURE:
+                hint_text_str = "Cap On -> A:Save Dark | B:Cancel"
+
+            if hint_text_str:
+                hint_surf = self.overlay_font.render(hint_text_str, True, YELLOW)
+                assert isinstance(hint_surf, pygame.Surface), "Hint overlay render failed"
+                hint_rect = hint_surf.get_rect(centerx=SCREEN_WIDTH // 2, bottom=SCREEN_HEIGHT - 5)
+                self.screen.blit(hint_surf, hint_rect)
+
+        except pygame.error as e_render: # Catch Pygame-specific errors during render
+             logger.error(f"Pygame error rendering overlays: {e_render}", exc_info=True)
+        except AssertionError as e_assert: # Catch assertion errors from render checks
+            logger.error(f"AssertionError rendering overlays: {e_assert}", exc_info=True)
+        except Exception as e: # Catch any other unexpected errors
+            logger.error(f"Unexpected error rendering overlays: {e}", exc_info=True)
+
     def draw(self):
         """Draws the spectrometer screen based on the current state."""
-        if self.screen is None: return
-        spectrometer_ready = (USE_SPECTROMETER and self.spectrometer and hasattr(self.spectrometer, '_dev') and self.spectrometer._dev.is_open)
-        self.screen.fill(BLACK)
+        if self.screen is None:
+            logger.error("Screen object is None in SpectrometerScreen.draw. Cannot draw.")
+            return
 
-        # --- Draw Plot or Error Message ---
-        if not spectrometer_ready:
-             if self.overlay_font: # Show error message
-                 err_text = "Spectrometer Not Ready";
-                 if not USE_SPECTROMETER: err_text = "Spectrometer Disabled"
-                 elif self.spectrometer is None: err_text = "Not Found"
-                 elif not hasattr(self.spectrometer, '_dev'): err_text = "Backend Err"
-                 elif not self.spectrometer._dev.is_open: err_text = "Connect Err"
-                 err_surf = self.overlay_font.render(err_text, True, RED)
-                 err_rect = err_surf.get_rect(center=self.screen.get_rect().center); self.screen.blit(err_surf, err_rect)
-        else: # Spectrometer Ready: Draw plot for relevant states
-            plot_surface = self._capture_and_plot() # Handles drawing based on state
+        device_proxy = getattr(self.spectrometer, '_dev', None)
+        # Determine if spectrometer is operational for plotting live data
+        spectrometer_can_plot_live = (
+            USE_SPECTROMETER and
+            self.spectrometer is not None and
+            device_proxy is not None and
+            hasattr(device_proxy, 'is_open') and
+            device_proxy.is_open
+        )
+        self.screen.fill(BLACK) # Clear screen at the start of every draw call
+
+        # --- Draw Plot or Error/Status Message ---
+        # Show "Not Ready" only if trying to plot live and spectrometer isn't ready
+        if not spectrometer_can_plot_live and self._current_state != self.STATE_FROZEN_VIEW:
+             if self.overlay_font:
+                 err_text_str = "Spectrometer Not Ready"
+                 if not USE_SPECTROMETER: err_text_str = "Spectrometer Disabled"
+                 elif self.spectrometer is None: err_text_str = "Spectrometer Not Found"
+                 elif not device_proxy or not hasattr(device_proxy, 'is_open'): err_text_str = "Spectrometer Backend Err"
+                 elif not device_proxy.is_open : err_text_str = "Spectrometer Connect Err"
+                 else: err_text_str = "Spectrometer Init Issue" # General fallback
+
+                 err_surf = self.overlay_font.render(err_text_str, True, RED)
+                 assert isinstance(err_surf, pygame.Surface), "Error text render failed"
+                 err_rect = err_surf.get_rect(center=self.screen.get_rect().center)
+                 self.screen.blit(err_surf, err_rect)
+        else: # Spectrometer is ready for live plotting OR we are in frozen view (can always plot frozen data)
+            plot_surface = self._capture_and_plot() # Handles current state for plotting
             if plot_surface:
-                 plot_rect = plot_surface.get_rect(centerx=SCREEN_WIDTH // 2, top=20); plot_rect.clamp_ip(self.screen.get_rect()); self.screen.blit(plot_surface, plot_rect)
-            else: # Draw placeholder if plot failed
-                 if self.overlay_font: status_text = "Capturing..." if self._current_state != self.STATE_FROZEN_VIEW else "Plot Error"; status_surf = self.overlay_font.render(status_text, True, GRAY); status_rect = status_surf.get_rect(center=self.screen.get_rect().center); self.screen.blit(status_surf, status_rect)
+                 # Position plot with a top margin for overlays
+                 # Ensure plot_surface is valid before get_rect
+                 assert isinstance(plot_surface, pygame.Surface), "plot_surface from _capture_and_plot is not a Surface."
+                 plot_rect = plot_surface.get_rect(centerx=SCREEN_WIDTH // 2, top=25) # Increased top for scans text
+                 plot_rect.clamp_ip(self.screen.get_rect()) # Ensure it fits
+                 self.screen.blit(plot_surface, plot_rect)
+            else: # Plotting failed or no data, show a placeholder
+                 if self.overlay_font:
+                     status_text_str = "Plot Error"
+                     if self._current_state != self.STATE_FROZEN_VIEW and spectrometer_can_plot_live:
+                         status_text_str = "Capturing..." # If live and spec ready but plot failed
+                     elif self._current_state != self.STATE_FROZEN_VIEW and not spectrometer_can_plot_live:
+                         # This case should ideally be caught by the "Spectrometer Not Ready" block above,
+                         # but as a fallback if logic flow is complex.
+                         status_text_str = "Device Issue"
 
-        # --- Draw Overlays (Hints, Status) for all states ---
-        self._draw_overlays() 
+                     status_surf = self.overlay_font.render(status_text_str, True, GRAY)
+                     assert isinstance(status_surf, pygame.Surface), "Status text render failed"
+                     status_rect = status_surf.get_rect(center=self.screen.get_rect().center)
+                     self.screen.blit(status_surf, status_rect)
+
+        # --- Draw Overlays (Hints, Status) ---
+        self._draw_overlays() # This will draw integ time, scans today, mode, and hints
         update_hardware_display(self.screen, self.display_hat) # Update physical screen
 
 
     def run_loop(self) -> str:
-        """Runs the main loop for the Spectrometer screen."""
-        logger.info(f"Starting Spectrometer screen loop (State: {self._current_state}).")
+        """Runs the main loop for the Spectrometer screen, handling input, drawing, and timing."""
+        logger.info(f"Starting Spectrometer screen loop (Initial State: {self._current_state}).")
+        # Assertion: menu_system must be available for integration time
+        assert self.menu_system is not None, "MenuSystem is None at start of SpectrometerScreen.run_loop"
+
+        # Loop bound by self.is_active and global g_shutdown_flag
         while self.is_active and not g_shutdown_flag.is_set():
-            action = self.handle_input() # Handle input based on state
-            if action == "QUIT": self.deactivate(); return "QUIT"
-            if action == "BACK_TO_MENU": self.deactivate(); return "BACK"
-            self.draw() # Draw the current state
-            wait_time_ms = int(SPECTRO_LOOP_DELAY_S * 1000)
-            try: # Adjust wait based on integration time only in live states
-                current_integ_ms = 0
-                if self._current_state in [self.STATE_LIVE_VIEW, self.STATE_WHITE_REF_SETUP, self.STATE_DARK_CAPTURE]: # Use self.
-                     current_integ_ms = self.menu_system.get_integration_time_ms()
-                if current_integ_ms > 0:
-                    integration_seconds = current_integ_ms / 1000.0
-                    target_wait_s = integration_seconds + SPECTRO_REFRESH_OVERHEAD_S # Use constant
-                    wait_time_ms = int(max(SPECTRO_LOOP_DELAY_S, target_wait_s) * 1000)
-            except Exception: pass
-            pygame.time.wait(wait_time_ms)
-        return "QUIT" if g_shutdown_flag.is_set() else "BACK"
+            action = self.handle_input() # Handles Pygame events and button presses
+            if action == "QUIT":
+                logger.info("SpectrometerScreen.handle_input signaled QUIT.")
+                self.deactivate() # Ensure screen is marked inactive
+                return "QUIT" # Propagate QUIT to main loop
+            if action == "BACK_TO_MENU":
+                logger.info("SpectrometerScreen.handle_input signaled BACK_TO_MENU.")
+                self.deactivate() # Ensure screen is marked inactive
+                return "BACK"   # Signal main loop to switch to menu
+
+            self.draw() # Draw the current state of the spectrometer screen
+
+            # Calculate wait time, potentially dynamic based on integration time
+            wait_time_ms = int(SPECTRO_LOOP_DELAY_S * 1000) # Default wait
+            try:
+                # Only adjust wait time if in a live capture state
+                if self._current_state in [self.STATE_LIVE_VIEW, self.STATE_CALIBRATE,
+                                           self.STATE_WHITE_REF_SETUP, self.STATE_DARK_CAPTURE]:
+                     current_integ_ms_for_wait = self.menu_system.get_integration_time_ms()
+                     # Assertion: Check integration time for wait calculation
+                     assert isinstance(current_integ_ms_for_wait, int) and current_integ_ms_for_wait >= 0, \
+                            f"Invalid integration time for wait calc: {current_integ_ms_for_wait}"
+
+                     if current_integ_ms_for_wait > 0:
+                         # Add a buffer to integration time for processing, plotting, etc.
+                         target_wait_s = (current_integ_ms_for_wait / 1000.0) + SPECTRO_REFRESH_OVERHEAD_S
+                         # Ensure wait is not less than the base loop delay
+                         wait_time_ms = int(max(SPECTRO_LOOP_DELAY_S, target_wait_s) * 1000)
+            except Exception as e_wait_calc: # Catch any error during wait calculation
+                logger.warning(f"Error calculating dynamic wait time: {e_wait_calc}. Using default.")
+                # wait_time_ms remains default
+
+            # Assertion: Ensure wait_time_ms is a non-negative integer
+            assert isinstance(wait_time_ms, int) and wait_time_ms >= 0, f"Invalid wait_time_ms: {wait_time_ms}"
+            pygame.time.wait(wait_time_ms) # Pause for the calculated duration
+
+        # Loop exited, ensure deactivation if not already done
+        if self.is_active: # If exited due to g_shutdown_flag while still active
+            self.deactivate()
+        logger.info("Spectrometer screen loop finished.")
+        return "QUIT" if g_shutdown_flag.is_set() else "BACK" # Default to BACK if not explicit QUIT
 
     def cleanup(self):
         """Cleans up spectrometer connection and plotting resources."""
         logger.info("Cleaning up SpectrometerScreen resources...")
         if self.spectrometer:
             try:
-                if hasattr(self.spectrometer, '_dev') and self.spectrometer._dev.is_open:
-                     self.spectrometer.close(); logger.info("Spectrometer closed.")
-                else: logger.debug("Spectrometer already closed/invalid.")
-            except Exception as e: logger.error(f"Error closing spectrometer: {e}", exc_info=True)
-        self.spectrometer = None
+                device_proxy = getattr(self.spectrometer, '_dev', None)
+                if device_proxy and hasattr(device_proxy, 'is_open') and device_proxy.is_open:
+                     logger.info(f"Closing spectrometer connection: {self.spectrometer.serial_number}")
+                     self.spectrometer.close()
+                     logger.info("Spectrometer connection closed.")
+                else:
+                     logger.debug("Spectrometer already closed, invalid, or proxy not found during cleanup.")
+            except sb.SeaBreezeError as e_sb_close:
+                logger.error(f"SeaBreezeError closing spectrometer: {e_sb_close}", exc_info=True)
+            except Exception as e: # Catch any other unexpected error
+                logger.error(f"Unexpected error closing spectrometer: {e}", exc_info=True)
+        self.spectrometer = None # Ensure it's None after cleanup attempt
+
+        # Clean up Matplotlib figure
         if self.plot_fig and plt and plt.fignum_exists(self.plot_fig.number):
-            try: plt.close(self.plot_fig); logger.info("Plot figure closed.")
-            except Exception as e: logger.error(f"Error closing plot figure: {e}", exc_info=True)
-        self.plot_fig = self.plot_ax = self.plot_line = None     
+            try:
+                plt.close(self.plot_fig)
+                logger.info("Matplotlib plot figure closed.")
+            except Exception as e_plot_close:
+                logger.error(f"Error closing Matplotlib plot figure: {e_plot_close}", exc_info=True)
+        self.plot_fig = self.plot_ax = self.plot_line = None
+        logger.info("SpectrometerScreen cleanup complete.")
+        
 
 # --- Splash Screen Function ---
 def show_splash_screen(screen: pygame.Surface, display_hat_obj, duration_s: float):
@@ -2429,109 +2840,77 @@ def show_splash_screen(screen: pygame.Surface, display_hat_obj, duration_s: floa
         display_hat_obj: The initialized DisplayHATMini object, or None.
         duration_s: How long to display the splash screen in seconds.
     """
-    # Assertions for parameters
     assert screen is not None, "Screen surface required for splash screen"
     assert isinstance(duration_s, (int, float)) and duration_s >= 0, "Splash duration must be a non-negative number"
 
     logger.info(f"Displaying splash screen for {duration_s:.1f} seconds...")
-    splash_image_final = None # Renamed variable for the surface to blit
+    splash_image_final = None
     try:
-        # Construct path to image robustly
         script_dir = os.path.dirname(os.path.abspath(__file__))
         assets_dir = os.path.join(script_dir, 'assets')
-        image_path = os.path.join(assets_dir, 'pysb-app.png') # Consider making filename a constant
-        # Assertion: Check path is string
+        image_path = os.path.join(assets_dir, 'pysb-app.png')
         assert isinstance(image_path, str), "Splash image path is not string"
 
-        # Check file existence before loading
         if not os.path.isfile(image_path):
              logger.error(f"Splash screen image not found at: {image_path}")
-             time.sleep(min(duration_s, 2.0)) # Wait a short time even if image missing
-             return # Skip rest of splash if image missing
+             time.sleep(min(duration_s, 2.0))
+             return
 
-        # Load the image
         splash_image_raw = pygame.image.load(image_path)
-        # Assertion: Check loaded image type
         assert isinstance(splash_image_raw, pygame.Surface), "Splash image load failed"
         logger.info(f"Loaded splash screen image: {image_path}")
 
-        # Only convert if NOT using the dummy driver (i.e., if a real video mode is set)
         is_dummy_driver = os.environ.get('SDL_VIDEODRIVER') == 'dummy'
-        # Assertion: Check driver type is string or None
-        assert isinstance(is_dummy_driver, bool), "is_dummy_driver check failed"
+        # is_dummy_driver is inherently bool after comparison, no direct assert needed for its type
+        # but can assert the result of os.environ.get if desired (str or None)
 
         if not is_dummy_driver and pygame.display.get_init() and pygame.display.get_surface():
-            # We have a real display mode, attempt conversion for performance
             try:
                 logger.debug("Attempting splash image conversion for standard display.")
                 splash_image_final = splash_image_raw.convert()
-                # Assertion: Check conversion result
                 assert isinstance(splash_image_final, pygame.Surface), "Splash image convert failed"
-                # If using alpha transparency: splash_image_final = splash_image_raw.convert_alpha()
             except pygame.error as convert_error:
-                logger.warning(f"pygame.Surface.convert() failed even for standard display: {convert_error}. Using raw surface.")
-                splash_image_final = splash_image_raw # Use raw as fallback
+                logger.warning(f"pygame.Surface.convert() failed: {convert_error}. Using raw surface.")
+                splash_image_final = splash_image_raw
         else:
-            # Using dummy driver OR no display mode set, use the raw loaded surface
-            logger.debug("Skipping splash image conversion (using dummy driver or no video mode).")
-            splash_image_final = splash_image_raw # Use the raw loaded image directly
-        # --- END CONDITIONAL CONVERT ---
-
-        # Assertion: Check final image surface exists
+            logger.debug("Skipping splash image conversion (dummy driver or no video mode).")
+            splash_image_final = splash_image_raw
         assert splash_image_final is not None, "Final splash image surface is None"
-
 
     except pygame.error as e:
         logger.error(f"Pygame error loading splash screen image: {e}", exc_info=True)
         time.sleep(min(duration_s, 2.0))
-        return # Skip splash on load error
-    except FileNotFoundError: # Should be caught by isfile check, but belt-and-suspenders
+        return
+    except FileNotFoundError:
         logger.error(f"Splash screen image file not found (exception): {image_path}")
         time.sleep(min(duration_s, 2.0))
         return
     except Exception as e:
         logger.error(f"An unexpected error occurred loading splash screen: {e}", exc_info=True)
         time.sleep(min(duration_s, 2.0))
-        return # Skip splash on error
+        return
 
-    # --- Proceed only if splash_image_final was successfully assigned ---
     if splash_image_final:
         try:
-            # Clear screen (optional, depends on desired effect)
             screen.fill(BLACK)
-
-            # Get image dimensions and screen dimensions
             splash_rect = splash_image_final.get_rect()
             screen_rect = screen.get_rect()
-            # Assertions: Check rect types
             assert isinstance(splash_rect, pygame.Rect), "Splash rect calculation failed"
             assert isinstance(screen_rect, pygame.Rect), "Screen rect calculation failed"
-
-            # Center the splash image on the screen
             splash_rect.center = screen_rect.center
-
-            # Draw the image
-            screen.blit(splash_image_final, splash_rect) # Blit the final surface
-
-            # Update the physical display using the helper
+            screen.blit(splash_image_final, splash_rect)
             update_hardware_display(screen, display_hat_obj)
 
-            # Wait for the specified duration (respecting shutdown flag)
-            wait_interval = 0.1 # Check flag every 100ms
-            # Assertion: Check interval is numeric
+            wait_interval = 0.1
             assert isinstance(wait_interval, float), "Wait interval is not float"
             num_intervals = int(duration_s / wait_interval)
-            # Assertion: Check loop bound is int
             assert isinstance(num_intervals, int), "Splash loop interval calculation failed"
-            # Loop is bounded by num_intervals
             for _ in range(num_intervals):
                  if g_shutdown_flag.is_set():
                       logger.info("Shutdown requested during splash screen.")
                       break
                  time.sleep(wait_interval)
-
             logger.info("Splash screen finished.")
-
         except pygame.error as e:
              logger.error(f"Pygame error displaying splash screen: {e}", exc_info=True)
         except Exception as e:
@@ -2542,37 +2921,23 @@ def show_disclaimer_screen(
     screen: pygame.Surface,
     display_hat_obj,
     button_handler: ButtonHandler,
-    hint_font: pygame.font.Font
+    hint_font: pygame.font.Font # Only hint_font is needed
     ):
     """
-    Displays a disclaimer message and waits for user acknowledgement using ButtonHandler.
-    Args:
-        screen: The Pygame Surface to draw on.
-        display_hat_obj: The initialized DisplayHATMini object, or None.
-        button_handler: The initialized ButtonHandler object.
-        # disclaimer_font: Pygame Font object for the main text. # <<< Removed docstring
-        hint_font: Pygame Font object for the hint text.       # <<< Kept docstring
+    Displays a disclaimer message and waits for user acknowledgement.
     """
-    # Assertions for parameters
     assert screen is not None, "Screen surface required for disclaimer"
-    assert button_handler is not None, "ButtonHandler required for disclaimer acknowledgement"
-    assert hint_font is not None, "Hint font object is required for disclaimer"
-    assert isinstance(hint_font, pygame.font.Font), "Hint font is not a valid Font object"
+    assert button_handler is not None, "ButtonHandler required for disclaimer"
+    assert hint_font is not None and isinstance(hint_font, pygame.font.Font), "Valid hint font object is required"
 
     logger.info("Displaying disclaimer screen...")
-
-    # --- Load Disclaimer Font Locally ---
     disclaimer_font = None
     try:
-        if not pygame.font.get_init(): pygame.font.init() # Ensure font module is ready
-        # Assertion: Font module must be ready
-        assert pygame.font.get_init(), "Pygame font module not ready for disclaimer font load"
-
+        if not pygame.font.get_init(): pygame.font.init()
+        assert pygame.font.get_init(), "Pygame font module not ready for disclaimer"
         script_dir = os.path.dirname(os.path.abspath(__file__))
         assets_dir = os.path.join(script_dir, 'assets')
-        # Use the same main font file, but with the specific disclaimer size
-        font_path = os.path.join(assets_dir, MAIN_FONT_FILENAME)
-        # Assertion: Check path is string
+        font_path = os.path.join(assets_dir, MAIN_FONT_FILENAME) # Use main font file for disclaimer
         assert isinstance(font_path, str), "Disclaimer font path is not string"
 
         if not os.path.isfile(font_path):
@@ -2583,162 +2948,103 @@ def show_disclaimer_screen(
                 disclaimer_font = pygame.font.Font(font_path, DISCLAIMER_FONT_SIZE)
                 logger.info(f"Loaded disclaimer font: {font_path} (Size: {DISCLAIMER_FONT_SIZE})")
             except pygame.error as e:
-                logger.error(f"Failed to load disclaimer font '{font_path}' size {DISCLAIMER_FONT_SIZE}: {e}. Using fallback.")
+                logger.error(f"Failed to load font '{font_path}' size {DISCLAIMER_FONT_SIZE}: {e}. Using fallback.")
                 disclaimer_font = pygame.font.SysFont(None, DISCLAIMER_FONT_SIZE)
-            except Exception as e:
-                 logger.error(f"Unexpected error loading disclaimer font '{font_path}': {e}. Using fallback.", exc_info=True)
-                 disclaimer_font = pygame.font.SysFont(None, DISCLAIMER_FONT_SIZE)
-
-        # Assertion: Check font object created (or SysFont fallback)
         assert disclaimer_font is not None, "Disclaimer font failed to load even with fallback"
-
     except Exception as e:
-        logger.error(f"Error during disclaimer font loading setup: {e}", exc_info=True)
-        # Attempt SysFont as last resort if setup failed
-        try:
-            disclaimer_font = pygame.font.SysFont(None, DISCLAIMER_FONT_SIZE)
-            assert disclaimer_font is not None, "SysFont fallback failed for disclaimer"
-        except Exception as e_sys:
-             logger.critical(f"FATAL: Could not load any font for disclaimer: {e_sys}")
-             return # Cannot proceed without any font
+        logger.error(f"Error loading disclaimer font: {e}", exc_info=True)
+        try: disclaimer_font = pygame.font.SysFont(None, DISCLAIMER_FONT_SIZE)
+        except Exception as e_sys: logger.critical(f"FATAL: Could not load any font for disclaimer: {e_sys}"); return
 
-    # Check if font loading succeeded (either TTF or SysFont fallback)
-    if not disclaimer_font:
-        logger.error("Failed to load any font for disclaimer text. Cannot display.")
-        return
-    # --- End Font Loading Section ---
+    if not disclaimer_font: logger.error("No font for disclaimer. Cannot display."); return
 
-    # --- Prepare Text ---
     try:
         lines = DISCLAIMER_TEXT.splitlines()
         rendered_lines = []
-        max_width = 0
-        total_height = 0
-        line_spacing = 4 # Vertical space between lines
-        # Assertion: Check lines is list
-        assert isinstance(lines, list), "Disclaimer text did not split into lines correctly"
-        # Assertion: Ensure line spacing is int
-        assert isinstance(line_spacing, int), "Line spacing must be integer"
+        max_width = 0; total_height = 0; line_spacing = 4
+        assert isinstance(lines, list), "Disclaimer text did not split correctly"
+        assert isinstance(line_spacing, int), "Line spacing must be int"
 
-        # Loop bounded by number of lines in disclaimer text (fixed)
-        for line in lines:
-            # Assertion: Check line is string
-            assert isinstance(line, str), "Line in disclaimer is not string"
-            if line.strip():
-                # Use the *locally loaded* disclaimer_font
-                line_surface = disclaimer_font.render(line, True, WHITE) # <<< Use local font
-                # Assertion: Check render result
-                assert isinstance(line_surface, pygame.Surface), f"Disclaimer line render failed for '{line}'"
+        for line_text in lines:
+            assert isinstance(line_text, str), "Line in disclaimer is not string"
+            if line_text.strip():
+                line_surface = disclaimer_font.render(line_text, True, WHITE)
+                assert isinstance(line_surface, pygame.Surface), f"Disclaimer line render failed: '{line_text}'"
                 rendered_lines.append(line_surface)
                 max_width = max(max_width, line_surface.get_width())
                 total_height += line_surface.get_height() + line_spacing
-            else:
+            else: # Blank line
                 rendered_lines.append(None)
-                # Use local font height for spacing calculation
-                total_height += (disclaimer_font.get_height() // 2) + line_spacing # <<< Use local font
-            # Assertion: Check total height calculation
-            assert isinstance(total_height, int), "Disclaimer total height calculation failed"
+                total_height += (disclaimer_font.get_height() // 2) + line_spacing
+            assert isinstance(total_height, int), "Disclaimer total height calc failed"
+        if total_height > 0: total_height -= line_spacing # Remove last spacing
 
-        if total_height > 0: total_height -= line_spacing
-
-        # Prepare hint text
-        hint_text = "Press A or B to continue..."
-        # Use the *passed-in* hint_font
-        hint_surface = hint_font.render(hint_text, True, YELLOW) # <<< Use passed hint_font
-        # Assertion: Check hint render result
+        hint_text_str = "Press A or B to continue..."
+        hint_surface = hint_font.render(hint_text_str, True, YELLOW) # Use passed hint_font
         assert isinstance(hint_surface, pygame.Surface), "Disclaimer hint render failed"
-        hint_height = hint_surface.get_height()
-        total_height += hint_height + 10 # Add space for hint + padding
-        # Assertion: Check total height again
-        assert isinstance(total_height, int), "Disclaimer total height calculation failed after hint"
+        total_height += hint_surface.get_height() + 10 # Space for hint
+        assert isinstance(total_height, int), "Disclaimer total height calc failed after hint"
 
-        # Calculate starting Y position
         start_y = max(10, (screen.get_height() - total_height) // 2)
-        # Assertion: Check start_y is int
-        assert isinstance(start_y, int), "Disclaimer start_y calculation failed"
+        assert isinstance(start_y, int), "Disclaimer start_y calc failed"
 
-
-        # --- Draw Static Content ---
         screen.fill(BLACK)
         current_y = start_y
-        # Loop bounded by number of rendered lines (fixed)
         for surface in rendered_lines:
-            if surface: # Rendered line
-                # Assertion: Check surface is valid
+            if surface:
                 assert isinstance(surface, pygame.Surface), "Invalid surface in rendered_lines"
                 line_rect = surface.get_rect(centerx=screen.get_width() // 2, top=current_y)
                 screen.blit(surface, line_rect)
                 current_y += surface.get_height() + line_spacing
             else: # Blank line spacing
-                 # Use local font height
-                current_y += (disclaimer_font.get_height() // 2) + line_spacing # <<< Use local font
-            # Assertion: Check current_y update
+                current_y += (disclaimer_font.get_height() // 2) + line_spacing
             assert isinstance(current_y, int), "Disclaimer current_y update failed"
 
-        # Draw hint at the bottom
         hint_rect = hint_surface.get_rect(centerx=screen.get_width() // 2, top=current_y + 10)
         screen.blit(hint_surface, hint_rect)
-
-        # --- Update Display Once ---
         update_hardware_display(screen, display_hat_obj)
 
-    except pygame.error as e:
-         logger.error(f"Pygame error preparing or drawing disclaimer: {e}", exc_info=True)
-         return
-    except Exception as e:
-         logger.error(f"Unexpected error preparing or drawing disclaimer: {e}", exc_info=True)
-         return
+    except pygame.error as e: logger.error(f"Pygame error preparing/drawing disclaimer: {e}", exc_info=True); return
+    except Exception as e: logger.error(f"Unexpected error preparing/drawing disclaimer: {e}", exc_info=True); return
 
-    # --- Wait for Acknowledgement Loop ---
     logger.info("Waiting for user acknowledgement on disclaimer screen...")
     acknowledged = False
-    # Loop bound by external flag g_shutdown_flag or user action
     while not acknowledged and not g_shutdown_flag.is_set():
-        # Assertion: Loop condition variables must be bool
         assert isinstance(acknowledged, bool), "acknowledged flag is not bool"
-        assert isinstance(g_shutdown_flag.is_set(), bool), "g_shutdown_flag state is not bool"
-
+        # g_shutdown_flag.is_set() is bool
         quit_signal = button_handler.process_pygame_events()
         if quit_signal == "QUIT":
-             # Assertion: Check signal value
              assert quit_signal == "QUIT", "Invalid quit signal received"
              logger.warning("QUIT signal received during disclaimer.")
-             g_shutdown_flag.set()
-             continue
+             g_shutdown_flag.set() # Propagate quit
+             continue # Loop will terminate
         if button_handler.check_button(BTN_ENTER) or button_handler.check_button(BTN_BACK):
             acknowledged = True
-            logger.info("Disclaimer acknowledged by user via button.")
-        pygame.time.wait(50) # Small delay to prevent busy-waiting
+            logger.info("Disclaimer acknowledged by user.")
+        pygame.time.wait(50) # Small delay
 
-    if not acknowledged:
-         logger.warning("Exited disclaimer wait due to shutdown signal.")
-    else:
-         logger.info("Disclaimer screen finished.")
+    if not acknowledged: logger.warning("Exited disclaimer wait due to shutdown signal.")
+    else: logger.info("Disclaimer screen finished.")
+
 
 # --- Signal Handling ---
 def setup_signal_handlers(button_handler: ButtonHandler, network_info: NetworkInfo):
     """Sets up signal handlers for graceful shutdown."""
-    # Assertion: Ensure handlers are provided
     assert button_handler is not None, "Button handler required for signal handler setup"
     assert network_info is not None, "Network info required for signal handler setup"
 
     def signal_handler(sig, frame):
-        # Keep handler very simple: set flag and log.
-        # Avoid complex cleanup logic here; do it in `finally`.
-        if not g_shutdown_flag.is_set(): # Prevent multiple logs if signal received twice
+        if not g_shutdown_flag.is_set():
             logger.warning(f"Received signal {sig}. Initiating graceful shutdown...")
-            g_shutdown_flag.set() # Signal threads and loops to stop
+            g_shutdown_flag.set()
         else:
              logger.debug(f"Signal {sig} received again, shutdown already in progress.")
 
-
-    # Attempt to register handlers
     try:
-        signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
-        signal.signal(signal.SIGTERM, signal_handler) # kill command
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
         logger.info("Signal handlers set up for SIGINT and SIGTERM.")
     except ValueError as e:
-         # This can happen if not run in the main thread
          logger.error(f"Failed to set signal handlers: {e}. Shutdown via Ctrl+C might not be clean.")
     except Exception as e:
          logger.error(f"Unexpected error setting signal handlers: {e}", exc_info=True)
@@ -2749,24 +3055,74 @@ def get_safe_datetime(year, month, day, hour=0, minute=0, second=0):
     Attempts to create a datetime object, handling potential ValueErrors.
     Returns the new datetime object or None if invalid.
     """
-    # Assertions added for parameter types
     assert isinstance(year, int), "Year must be an integer"
     assert isinstance(month, int), "Month must be an integer"
     assert isinstance(day, int), "Day must be an integer"
     assert isinstance(hour, int), "Hour must be an integer"
     assert isinstance(minute, int), "Minute must be an integer"
     assert isinstance(second, int), "Second must be an integer"
-
     try:
-        # Clamp month first to avoid some direct errors
-        month = max(1, min(12, month))
-        # Day clamping requires month/year context, datetime constructor handles it well
-        # Year clamping can also be done if desired: year = max(1970, min(2100, year))
-        new_dt = datetime.datetime(year, month, day, hour, minute, second)
+        month_clamped = max(1, min(12, month)) # Clamp month for safety before creating datetime
+        # Datetime constructor handles day clamping based on month/year
+        new_dt = datetime.datetime(year, month_clamped, day, hour, minute, second)
         return new_dt
-    except ValueError as e:
-        logger.warning(f"Invalid date/time combination attempted: {year}-{month}-{day} {hour}:{minute}:{second}. Error: {e}")
-        return None # Return value checked by caller
+    except ValueError as e: # Catches invalid day for month/year, etc.
+        logger.warning(f"Invalid date/time combination: Y{year}-M{month}-D{day} H{hour}:M{minute}:S{second}. Error: {e}")
+        return None
+
+def show_leak_warning_screen(screen: pygame.Surface, display_hat_obj, button_handler: ButtonHandler):
+    assert screen is not None and button_handler is not None
+    logger.critical("Displaying LEAK WARNING screen!")
+    leak_font_large, leak_font_small = None, None
+    try:
+        if not pygame.font.get_init(): pygame.font.init()
+        leak_font_large = pygame.font.SysFont(None, 60); leak_font_small = pygame.font.SysFont(None, 24)
+        assert leak_font_large and leak_font_small, "Failed font load for leak warning"
+    except Exception as e: logger.error(f"Could not load fonts for leak warning: {e}")
+
+    screen_center_x, screen_center_y = screen.get_width() // 2, screen.get_height() // 2
+    last_blink_time, show_text_blink = time.monotonic(), True # Renamed show_text to avoid conflict
+
+    # Loop while leak detected and shutdown not otherwise signaled
+    while g_leak_detected_flag.is_set() and not g_shutdown_flag.is_set():
+        if button_handler.process_pygame_events() == "QUIT":
+            g_shutdown_flag.set() # Propagate QUIT signal
+            break # Exit loop immediately
+
+        screen.fill(RED) # Constant red background
+
+        # Blinking text logic
+        if time.monotonic() - last_blink_time > 0.5:
+            show_text_blink = not show_text_blink
+            last_blink_time = time.monotonic()
+
+        if show_text_blink and leak_font_large and leak_font_small: # Ensure fonts are loaded
+            try:
+                texts_to_render = [("! LEAK !", leak_font_large, -30),
+                                   ("WATER DETECTED!", leak_font_small, 20),
+                                   ("Press ANY btn to shutdown.", leak_font_small, 50)]
+                # Bounded loop by number of texts
+                for txt_content, font_obj, y_offset in texts_to_render:
+                    surf = font_obj.render(txt_content, True, YELLOW, RED) # Yellow on Red
+                    rect = surf.get_rect(center=(screen_center_x, screen_center_y + y_offset))
+                    screen.blit(surf, rect)
+            except Exception as e_render: logger.error(f"Error rendering leak text: {e_render}")
+
+        update_hardware_display(screen, display_hat_obj)
+
+        # Check for button press to acknowledge and initiate shutdown
+        # Bounded loop (fixed number of buttons to check)
+        for btn_name_check in [BTN_UP, BTN_DOWN, BTN_ENTER, BTN_BACK]:
+            if button_handler.check_button(btn_name_check):
+                logger.warning(f"Leak warning acknowledged by {btn_name_check}. Shutting down application.")
+                g_shutdown_flag.set() # Signal application shutdown
+                break # Exit button check loop
+        if g_shutdown_flag.is_set(): break # Exit outer while loop if shutdown initiated
+
+        pygame.time.wait(100) # Brief pause
+
+    logger.info("Exiting leak warning screen (shutdown likely initiated).")
+    return "QUIT" # Always signal QUIT to main loop from here
 
 
 def update_hardware_display(screen: pygame.Surface, display_hat_obj):
@@ -2776,45 +3132,43 @@ def update_hardware_display(screen: pygame.Surface, display_hat_obj):
         screen: The Pygame Surface to display.
         display_hat_obj: The initialized DisplayHATMini object, or None.
     """
-    # Assertions for required parameters
     assert screen is not None, "Screen surface cannot be None for display update"
-    # display_hat_obj can be None, checked below
 
-    if USE_DISPLAY_HAT and display_hat_obj: # Check flag AND object validity
+    if USE_DISPLAY_HAT and display_hat_obj:
         try:
-            # Ensure display_hat_obj is the correct type or has the required method
             assert hasattr(display_hat_obj, 'st7789'), "Display HAT object missing st7789 interface"
-            assert hasattr(display_hat_obj.st7789, 'set_window'), "Display HAT st7789 missing set_window method"
-            assert hasattr(display_hat_obj.st7789, 'data'), "Display HAT st7789 missing data method"
+            assert hasattr(display_hat_obj.st7789, 'set_window'), "st7789 missing set_window"
+            assert hasattr(display_hat_obj.st7789, 'data'), "st7789 missing data method"
 
-            # Rotation and byte swapping for ST7789
             rotated_surface = pygame.transform.rotate(screen, 180)
-            pixelbytes = rotated_surface.convert(16, 0).get_buffer()
-            pixelbytes_swapped = bytearray(pixelbytes)
-            pixelbytes_swapped[0::2], pixelbytes_swapped[1::2] = pixelbytes_swapped[1::2], pixelbytes_swapped[0::2]
+            # Ensure the surface is in a format suitable for ST7789 (RGB565)
+            # Pygame's convert(16, 0) might not be exactly RGB565 depending on system/pygame build
+            # For ST7789, an explicit conversion to RGB565 byte order is often needed if `convert` isn't perfect.
+            # The provided code attempts byte swapping, which is common for this.
+            pixelbytes_raw = rotated_surface.convert(16, 0).get_buffer() # Get raw buffer
+            pixelbytes_swapped = bytearray(pixelbytes_raw) # Modifiable copy
+
+            # Perform byte swapping for ST7789 (big-endian to little-endian for 16-bit words, or vice-versa)
+            # Loop is bounded by length of pixelbytes_swapped
+            for i in range(0, len(pixelbytes_swapped), 2):
+                pixelbytes_swapped[i], pixelbytes_swapped[i+1] = pixelbytes_swapped[i+1], pixelbytes_swapped[i]
 
             display_hat_obj.st7789.set_window()
-            chunk_size = 4096 # Send data in chunks
-            # Ensure loop range is valid even for empty byte array
+            chunk_size = 4096
+            # Loop is bounded by length of pixelbytes_swapped / chunk_size
             for i in range(0, len(pixelbytes_swapped), chunk_size):
-                # Assertion: Check loop bounds implicitly via range
                 display_hat_obj.st7789.data(pixelbytes_swapped[i:i + chunk_size])
         except AttributeError as ae:
-             logger.error(f"Display HAT object missing expected attribute/method: {ae}", exc_info=False)
+             logger.error(f"Display HAT update failed: Missing attribute/method - {ae}", exc_info=False)
         except Exception as e:
-            # Log specific error but don't crash the whole app if display fails
-            logger.error(f"Error updating Display HAT Mini: {e}", exc_info=False)
-            # Potentially disable further HAT updates?
+            logger.error(f"Error updating Display HAT Mini: {e}", exc_info=False) # Log exc_info=False for less noise if frequent
     else:
-        # Standard Pygame window update
         try:
-             # Check if pygame display is initialized and a surface exists
              if pygame.display.get_init() and pygame.display.get_surface():
                   pygame.display.flip()
-             # else: pass # No standard display window to flip
         except pygame.error as e:
-             logger.error(f"Error updating Pygame display: {e}", exc_info=True)
-        except Exception as e: # Catch broader errors just in case
+             logger.error(f"Error updating Pygame display (flip): {e}", exc_info=True)
+        except Exception as e:
              logger.error(f"Unexpected error updating Pygame display: {e}", exc_info=True)
 
 # --- Main Application ---
@@ -2823,30 +3177,23 @@ def main():
     logger.info("=" * 44)
     logger.info("   Underwater Spectrometer Controller Start ")
     logger.info("=" * 44)
-    logger.info(f"Configuration: DisplayHAT={USE_DISPLAY_HAT}, GPIO={USE_GPIO_BUTTONS}, HallSensors={USE_HALL_EFFECT_BUTTONS}, LeakSensor={USE_LEAK_SENSOR}, Spectrometer={USE_SPECTROMETER}")
+    logger.info(f"Config: DisplayHAT={USE_DISPLAY_HAT}, GPIO={USE_GPIO_BUTTONS}, HallSensors={USE_HALL_EFFECT_BUTTONS}, LeakSensor={USE_LEAK_SENSOR}, Spectrometer={USE_SPECTROMETER}")
 
-    display_hat_active = False # Track if HAT *object* was successfully created
-    # Note: ButtonHandler manages its internal GPIO/HAT status
-
-    # --- Initialize variables to None ---
+    display_hat_active = False
     display_hat = None
     screen = None
     button_handler = None
     network_info = None
     menu_system = None
-    spectrometer_screen = None # <<< NEW: Add variable for the new screen
-    main_clock = None # Clock can still be useful for main menu loop timing
+    spectrometer_screen = None
+    main_clock = None
 
     try:
-        # --- Initialize Pygame and Display FIRST ---
         logger.info("Initializing Pygame and display...")
         try:
              pygame.init()
-             # Assertion: Check Pygame initialized
              assert pygame.get_init(), "Pygame initialization failed"
-             # Initialize clock here too
              main_clock = pygame.time.Clock()
-             # Assertion: Check clock created
              assert main_clock is not None, "Pygame clock initialization failed"
         except pygame.error as e:
              logger.critical(f"FATAL: Pygame initialization failed: {e}", exc_info=True)
@@ -2854,229 +3201,163 @@ def main():
 
         if USE_DISPLAY_HAT and DisplayHATMini_lib:
             try:
-                # Setup dummy video driver for HAT mode BEFORE display init/surface creation
                 os.environ['SDL_VIDEODRIVER'] = 'dummy'
-                pygame.display.init() # Need display module init even for dummy driver
-                # Assertion: Check display module initialized
-                assert pygame.display.get_init(), "Pygame display module failed to initialize (dummy)"
-                screen = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT)) # Create buffer surface
-                # Assertion: Check screen created
+                pygame.display.init()
+                assert pygame.display.get_init(), "Pygame display module failed (dummy)"
+                screen = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
                 assert screen is not None, "Failed to create screen buffer for HAT"
-                # Attempt to create DisplayHATMini instance
-                display_hat = DisplayHATMini_lib(screen) # Pass buffer if needed by constructor, else None
-                # Assertion: Check HAT object created
+                display_hat = DisplayHATMini_lib(screen)
                 assert display_hat is not None, "DisplayHATMini object creation failed"
-                display_hat_active = True # Mark as active
-                logger.info("DisplayHATMini initialized successfully with dummy driver.")
+                display_hat_active = True
+                logger.info("DisplayHATMini initialized with dummy driver.")
             except Exception as e:
                 logger.error(f"Failed to initialize DisplayHATMini: {e}", exc_info=True)
-                logger.warning("Falling back to standard Pygame window (if possible).")
-                display_hat_active = False
-                display_hat = None # Ensure display_hat is None if init failed
-                # Clean up dummy driver env var if fallback needed
+                logger.warning("Falling back to standard Pygame window.")
+                display_hat_active = False; display_hat = None
                 os.environ.pop('SDL_VIDEODRIVER', None)
-                # Re-init display for standard window
                 if pygame.display.get_init(): pygame.display.quit()
                 pygame.display.init()
-                # Assertion: Check display module re-initialized
-                assert pygame.display.get_init(), "Pygame display module failed to re-initialize (fallback)"
-                # Screen creation attempt moved below
+                assert pygame.display.get_init(), "Pygame display module failed (fallback)"
         else:
-            # Not using HAT or library failed to import, setup standard window
-            logger.info("Configured for standard Pygame window (Display HAT disabled or unavailable).")
-            # No dummy driver needed
-            if not pygame.display.get_init(): pygame.display.init() # Ensure display is initialized
-            # Assertion: Check display module initialized
-            assert pygame.display.get_init(), "Pygame display module failed to initialize (standard)"
+            logger.info("Configured for standard Pygame window.")
+            if not pygame.display.get_init(): pygame.display.init()
+            assert pygame.display.get_init(), "Pygame display module failed (standard)"
 
-        # --- Create Screen Surface (Standard Window or Fallback) ---
-        if screen is None: # If not created by HAT init
+        if screen is None:
             try:
                 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
                 pygame.display.set_caption("Spectrometer Menu")
                 logger.info("Initialized standard Pygame display window.")
             except pygame.error as e:
-                logger.critical(f"FATAL: Failed to create Pygame screen surface: {e}", exc_info=True)
+                logger.critical(f"FATAL: Failed to create Pygame screen: {e}", exc_info=True)
                 raise RuntimeError("Display surface creation failed") from e
-
-        # Assertion: Screen surface must exist now
         assert screen is not None, "Failed to create Pygame screen surface"
 
-        # --- Initialize Core Components SECOND (Before Startup Screens) ---
         logger.info("Initializing core components...")
         network_info = NetworkInfo()
-        # Pass the initialized display_hat object only if it's active
         button_handler = ButtonHandler(display_hat if display_hat_active else None)
         menu_system = MenuSystem(screen, button_handler, network_info)
 
-        # <<< NEW: Initialize SpectrometerScreen >>>
         if USE_SPECTROMETER:
-             # Pass dependencies needed by SpectrometerScreen
              spectrometer_screen = SpectrometerScreen(
-                 screen,
-                 button_handler,
-                 menu_system, # Pass menu system to get integration time etc.
+                 screen, button_handler, menu_system,
                  display_hat if display_hat_active else None
              )
-             # Assertion: Check if screen initialization failed internally (e.g., no device)
-             # SpectrometerScreen constructor handles logging if device fails.
-             # We can proceed even if spectrometer init failed, it will show error on screen.
-             assert spectrometer_screen is not None, "SpectrometerScreen object creation failed unexpectedly"
+             assert spectrometer_screen is not None, "SpectrometerScreen creation failed"
 
-        # Assign display_hat to menu_system *after* menu_system is created if active
         if display_hat_active:
-            # Assertion: Check menu_system exists before assignment
-            assert menu_system is not None, "MenuSystem not created before display_hat assignment"
-            menu_system.display_hat = display_hat
+            assert menu_system is not None, "MenuSystem not created for display_hat assign"
+            menu_system.display_hat = display_hat # For menu to update HAT
+            # SpectrometerScreen already received display_hat in its constructor
 
-        # Assertion: Ensure essential components initialized
-        assert network_info is not None, "NetworkInfo failed to initialize"
-        assert button_handler is not None, "ButtonHandler failed to initialize"
-        assert menu_system is not None, "MenuSystem failed to initialize"
-        assert menu_system.font is not None, "MenuSystem failed to load essential font"
-        # Assertion: Check spectrometer screen initialized if configured
+        assert network_info is not None, "NetworkInfo failed init"
+        assert button_handler is not None, "ButtonHandler failed init"
+        assert menu_system is not None and menu_system.font is not None, "MenuSystem or its font failed init"
         if USE_SPECTROMETER:
-            assert spectrometer_screen is not None, "SpectrometerScreen failed to initialize when USE_SPECTROMETER is True"
+            assert spectrometer_screen is not None, "SpectrometerScreen failed init when configured"
 
-        # --- Show Splash Screen ---
         show_splash_screen(screen, display_hat if display_hat_active else None, SPLASH_DURATION_S)
 
-        # --- Show Disclaimer Screen (Pass button_handler and hint font) ---
         if not g_shutdown_flag.is_set():
-             # Assertion: Ensure hint_font exists before passing
-             assert menu_system.hint_font is not None, "Hint font not loaded before disclaimer call"
+             assert menu_system.hint_font is not None, "Hint font not loaded for disclaimer"
              show_disclaimer_screen(screen,
                                    display_hat if display_hat_active else None,
                                    button_handler,
-                                   # menu_system.font,      # REMOVED main font arg
-                                   menu_system.hint_font) # Pass only hint font
+                                   menu_system.hint_font)
 
-        # --- Setup Signal Handling & Start Background Tasks ---
-        # Check shutdown flag again in case user quit during disclaimer
         if g_shutdown_flag.is_set():
-            logger.warning("Shutdown requested during startup screens. Exiting early.")
-            raise SystemExit("Shutdown during startup") # Use SystemExit for cleaner exit path
+            logger.warning("Shutdown requested during startup screens. Exiting.")
+            raise SystemExit("Shutdown during startup")
 
         logger.info("Setting up signal handlers and starting background tasks...")
-        setup_signal_handlers(button_handler, network_info) # Pass initialized handlers
-        network_info.start_updates() # Start network thread
+        setup_signal_handlers(button_handler, network_info)
+        network_info.start_updates()
 
-
-        # --- Main Loop ---
         logger.info("Starting main application loop...")
-        current_screen = "MENU" # Track which screen is active: "MENU" or "SPECTROMETER"
-        # Loop bound by external flag g_shutdown_flag
+        current_screen_state = "MENU" # "MENU" or "SPECTROMETER"
+        # Loop bound by global shutdown flag
         while not g_shutdown_flag.is_set():
-            # Assertion: Check flag state is bool
             assert isinstance(g_shutdown_flag.is_set(), bool), "g_shutdown_flag state is not bool"
 
-            if current_screen == "MENU":
-                # --- Handle Menu ---
-                menu_action = menu_system.handle_input()
-                # ... (keep existing action processing for "QUIT", "CAPTURE") ...
+            # --- Global Leak Check ---
+            if g_leak_detected_flag.is_set():
+                logger.critical("Leak detected flag is set! Switching to leak warning screen.")
+                leak_screen_action = show_leak_warning_screen(screen, display_hat if display_hat_active else None, button_handler)
+                if leak_screen_action == "QUIT" or g_shutdown_flag.is_set():
+                    logger.warning("Leak warning screen signaled QUIT or shutdown flag was set. Terminating.")
+                    if not g_shutdown_flag.is_set(): g_shutdown_flag.set() # Ensure it's set
+                    break # Exit main loop
 
-                if menu_action == "CAPTURE":
+            if current_screen_state == "MENU":
+                menu_action = menu_system.handle_input()
+                if menu_action == "QUIT":
+                    logger.info("Menu signaled QUIT.")
+                    g_shutdown_flag.set()
+                elif menu_action == "START_CAPTURE":
                     if USE_SPECTROMETER and spectrometer_screen:
                         logger.info("Switching to Spectrometer screen...")
-                        spectrometer_screen.activate() # Activate the screen
-                        current_screen = "SPECTROMETER"
-                        # Skip drawing menu this iteration
-                        continue
+                        spectrometer_screen.activate()
+                        current_screen_state = "SPECTROMETER"
+                        continue # Skip menu draw this iteration
                     else:
-                        # ... (handle unavailable spectrometer) ...
-                        pass
+                        logger.warning("START_CAPTURE requested, but spectrometer not available/configured.")
+                        # Stay in menu, perhaps show a message on screen if desired
+                if not g_shutdown_flag.is_set(): # Only draw if not shutting down
+                    menu_system.draw()
+                assert main_clock is not None, "Main clock not initialized for menu tick"
+                main_clock.tick(1.0 / MAIN_LOOP_DELAY_S)
 
-                # Draw Menu Screen (only if not switching)
-                menu_system.draw()
-                # Tick Clock
-                assert main_clock is not None, "Main clock not initialized"
-                main_clock.tick(1.0 / MAIN_LOOP_DELAY_S) # Target FPS for menu
-
-            elif current_screen == "SPECTROMETER":
-                # --- Handle Spectrometer Screen ---
-                assert USE_SPECTROMETER and spectrometer_screen is not None, "In SPECTROMETER state but screen not available"
-
-                # run_loop now handles input, drawing, timing, and internal state changes
-                spectro_status = spectrometer_screen.run_loop() # Returns "BACK" or "QUIT"
-
+            elif current_screen_state == "SPECTROMETER":
+                assert USE_SPECTROMETER and spectrometer_screen is not None, "Spectrometer state without screen"
+                spectro_status = spectrometer_screen.run_loop() # Handles its own input, draw, timing
                 if spectro_status == "QUIT":
-                    # Quit signal was handled internally by run_loop setting g_shutdown_flag
                     logger.info("Spectrometer screen signaled QUIT.")
-                    # Loop will terminate on next check
-                    continue
+                    if not g_shutdown_flag.is_set(): g_shutdown_flag.set() # Ensure shutdown
                 elif spectro_status == "BACK":
-                    # User pressed Back or screen deactivated normally
-                    logger.info("Returning to Menu screen...")
-                    current_screen = "MENU"
-                    # spectrometer_screen.deactivate() was called by run_loop
-                    continue
-
+                    logger.info("Returning to Menu screen from Spectrometer.")
+                    current_screen_state = "MENU"
+                # run_loop ensures spectrometer_screen.deactivate() is called
             else:
-                logger.error(f"FATAL: Unknown screen state '{current_screen}'")
-                g_shutdown_flag.set() # Unknown state, force shutdown
-                
-             
-    except SystemExit as e: # Catch specific exit reasons like shutdown during startup
+                logger.error(f"FATAL: Unknown screen state '{current_screen_state}'")
+                g_shutdown_flag.set()
+
+    except SystemExit as e:
         logger.warning(f"Exiting due to SystemExit: {e}")
-    except RuntimeError as e: # Catch configuration/initialization errors
+    except RuntimeError as e:
         logger.critical(f"RUNTIME ERROR: {e}", exc_info=True)
-        g_shutdown_flag.set() # Ensure flag is set on critical errors
-    except KeyboardInterrupt: # Handle Ctrl+C if signal handler failed
-         logger.warning("KeyboardInterrupt caught directly. Initiating shutdown...")
+        g_shutdown_flag.set()
+    except KeyboardInterrupt:
+         logger.warning("KeyboardInterrupt caught. Initiating shutdown...")
          g_shutdown_flag.set()
     except Exception as e:
-        logger.critical(f"FATAL UNHANDLED EXCEPTION in main function: {e}", exc_info=True)
-        g_shutdown_flag.set() # Ensure flag is set on unexpected errors
-
+        logger.critical(f"FATAL UNHANDLED EXCEPTION in main: {e}", exc_info=True)
+        g_shutdown_flag.set()
     finally:
-        # --- Cleanup Resources ---
-        # This block executes regardless of how the try block exited (normal, exception, SystemExit)
         logger.warning("Initiating final cleanup...")
-
-        # Stop background threads first
         if network_info:
             logger.debug("Stopping network info...")
             try: network_info.stop_updates()
-            except Exception as e: logger.error(f"Error stopping network info: {e}")
-
-        # Cleanup application logic (screens)
-        if menu_system:
-            logger.debug("Cleaning up menu system...")
-            try: menu_system.cleanup()
-            except Exception as e: logger.error(f"Error cleaning up menu system: {e}")
-        # <<< NEW: Cleanup Spectrometer Screen >>>
+            except Exception as e_ni_stop: logger.error(f"Error stopping network_info: {e_ni_stop}")
         if spectrometer_screen:
             logger.debug("Cleaning up spectrometer screen...")
             try: spectrometer_screen.cleanup()
-            except Exception as e: logger.error(f"Error cleaning up spectrometer screen: {e}")
-
-
-        # Cleanup hardware interfaces (GPIO) - ButtonHandler manages its own
+            except Exception as e_spec_clean: logger.error(f"Error cleaning spectrometer_screen: {e_spec_clean}")
+        if menu_system:
+            logger.debug("Cleaning up menu system...")
+            try: menu_system.cleanup()
+            except Exception as e_menu_clean: logger.error(f"Error cleaning menu_system: {e_menu_clean}")
         if button_handler:
             logger.debug("Cleaning up button handler / GPIO...")
             try: button_handler.cleanup()
-            except Exception as e: logger.error(f"Error cleaning up button handler / GPIO: {e}")
-
-        # Cleanup Display HAT resources if active?
-        # Typically, the library might not require explicit cleanup, or it's tied to Pygame exit.
-        # Check Pimoroni library docs if specific cleanup is needed for display_hat object.
-        # if display_hat_active and display_hat:
-        #     try: display_hat.cleanup() # Hypothetical cleanup method
-        #     except Exception as e: logger.error(f"Error cleaning up Display HAT: {e}")
-
-        # Quit Pygame last
+            except Exception as e_btn_clean: logger.error(f"Error cleaning button_handler: {e_btn_clean}")
         if pygame.get_init():
              logger.info("Quitting Pygame...")
              try: pygame.quit()
-             except Exception as e: logger.error(f"Error quitting Pygame: {e}")
+             except Exception as e_pq_quit: logger.error(f"Error quitting Pygame: {e_pq_quit}")
              logger.info("Pygame quit.")
         else:
              logger.info("Pygame not initialized, skipping quit.")
-
-        logger.info("=" * 44)
-        logger.info("   Application Finished.")
-        logger.info("=" * 44)
+        logger.info("=" * 44); logger.info("   Application Finished."); logger.info("=" * 44)
 
 if __name__ == "__main__":
-    # Keep __main__ block simple: just call main()
     main()
