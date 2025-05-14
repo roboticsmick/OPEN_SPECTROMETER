@@ -159,5 +159,19 @@ RTC is based on Adafruit's I2C DS3231 module.
 
 ![image](https://github.com/user-attachments/assets/7edfee91-a727-4598-ba51-139883b82f8c)
 
+## Power Usage:
+
+Using a 10000mAh battery pack, the Raspberry Pi and spectrometer setup for approximately 10 hours and 18 minutes under the current load conditions.
+
+Current during spectrometer live feed: ~0.6A 
+Voltage: 5.099V
+Power consumption = Voltage × Current
+Power consumption = 5.099V × 0.6A = 3.06W
+Energy capacity = 10000mAh × 3.7V ÷ 1000 = 37Wh
+Assuming a typical efficiency rate: 85%
+Actual available energy = 37Wh × 0.85 = 31.45Wh
+Runtime = Available energy ÷ Power consumption
+Runtime = 31.45Wh ÷ 3.06W ≈ 10.3 hours
+
 
 
