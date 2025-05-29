@@ -63,6 +63,26 @@ ssh -X pi@<IP>
 ```
 Enter password: spectro
 
+If the ssh isn't working, check that your connected via your hotspot. Connect to your hotspot via your Ubuntu laptop. Two hotspot connections should now be showing. Check the IP address for your latop.
+
+```sh
+ifconfig
+# Example:
+# wlp3s0: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500
+#        inet 10.119.124.83  netmask 255.255.255.0  broadcast 10.119.124.255
+#        inet6 fe80::3c24:e953:7879:4e71  prefixlen 64  scopeid 0x20<link>
+#        ether 54:e4:ed:74:18:cd  txqueuelen 1000  (Ethernet)
+#        RX packets 1052664  bytes 1320322796 (1.3 GB)
+#        RX errors 0  dropped 0  overruns 0  frame 0
+#        TX packets 441016  bytes 54203222 (54.2 MB)
+#        TX errors 0  dropped 4 overruns 0  carrier 0  collisions 0
+```
+Copy for first, leaving the last digit as a 0/24.
+
+```sh
+nmap -sn 10.119.124.0/24
+```
+
 ### Add a new wifi connection
 
 1. Insert the SD card into your computer.
