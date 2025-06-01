@@ -284,10 +284,10 @@ Y_AXIS_REFLECTANCE_RESCALE_MIN_CEILING = (
     0.2  # Min Y-axis ceiling after rescale for reflectance
 )
 Y_AXIS_REFLECTANCE_RESCALE_MAX_CEILING = (
-    50  # Max Y-axis ceiling after rescale for reflectance
+    200  # Max Y-axis ceiling after rescale for reflectance
 )
 Y_AXIS_RESCALE_FACTOR = 1.2
-Y_AXIS_MIN_CEILING = 200.0  # Ensure float
+Y_AXIS_MIN_CEILING = 100.0  # Ensure float
 Y_AXIS_MIN_CEILING_RELATIVE = 1.1
 
 # --- GPIO Pin Definitions (BCM Mode) ---
@@ -2403,8 +2403,6 @@ class SpectrometerScreen:
                 f"Auto-Integ: {self._auto_integ_status_msg} Proposed Integ: {self._pending_auto_integ_ms} ms."
             )
 
-        # --- End of helper ---
-
         if self._auto_integ_iteration_count >= AUTO_INTEG_MAX_ITERATIONS:
             # Note: _frozen_intensities should hold the spectrum from the *last successful iteration*
             # before hitting max iterations. The helper will use this.
@@ -3036,22 +3034,27 @@ class SpectrometerScreen:
             logger.error(f"Error saving data to CSV {csv_path}: {e_csv}", exc_info=True)
             return False
 
-    def _rescale_y_axis(self, relative: bool = False):
+    def _rescale_y_axis(
+        self, relative: bool = False
+    ):  # `relative` param is unused in current logic
         assert (
             self.menu_system is not None
             and np is not None
             and self.spectrometer is not None
-        )
-        dev_proxy = getattr(self.spectrometer, "_dev", None)
-        if not (dev_proxy and hasattr(dev_proxy, "is_open") and dev_proxy.is_open):
+        ), "Dependencies missing for _rescale_y_axis"
+
+        if not self._is_spectrometer_ready():
             logger.warning("Spectrometer not ready for Y-axis rescale.")
             return
 
-        logger.info(f"Attempting to rescale Y-axis...")
+        logger.info(
+            f"Attempting to rescale Y-axis (based on smoothed data if enabled)..."
+        )
         try:
             current_menu_integ_ms = self.menu_system.get_integration_time_ms()
             current_menu_mode = self.menu_system.get_collection_mode()
             assert isinstance(current_menu_integ_ms, int) and current_menu_integ_ms > 0
+            assert isinstance(current_menu_mode, str)
 
             if current_menu_integ_ms != self._last_integration_time_ms:
                 integ_us = int(current_menu_integ_ms * 1000)
@@ -3068,18 +3071,32 @@ class SpectrometerScreen:
             intensities_for_rescale_raw = self.spectrometer.intensities(
                 correct_dark_counts=True, correct_nonlinearity=True
             )
-            assert intensities_for_rescale_raw is not None
+            assert (
+                intensities_for_rescale_raw is not None
+            ), "Spectrometer returned None for intensities"
+            if len(intensities_for_rescale_raw) == 0:
+                logger.warning(
+                    "Empty intensities array received during rescale, cannot proceed."
+                )
+                return
 
-            max_val_for_scaling = 0.0
+            data_for_max_finding: np.ndarray | None = None
             is_reflectance_plot_for_rescale = False
 
             if current_menu_mode == MODE_REFLECTANCE:
-                valid_refs, _ = self._are_references_valid_for_reflectance()
+                valid_refs, reason_code = self._are_references_valid_for_reflectance()
                 if valid_refs:
                     assert (
                         self._dark_reference_intensities is not None
                         and self._white_reference_intensities is not None
-                    )
+                        and self.wavelengths is not None
+                        and len(intensities_for_rescale_raw) == len(self.wavelengths)
+                        and len(self._dark_reference_intensities)
+                        == len(self.wavelengths)
+                        and len(self._white_reference_intensities)
+                        == len(self.wavelengths)
+                    ), "Reference length mismatch or None during rescale, despite valid_refs=True check"
+
                     is_reflectance_plot_for_rescale = True
                     numerator = (
                         intensities_for_rescale_raw - self._dark_reference_intensities
@@ -3088,32 +3105,82 @@ class SpectrometerScreen:
                         self._white_reference_intensities
                         - self._dark_reference_intensities
                     )
-                    reflectance_values = np.full_like(intensities_for_rescale_raw, 0.0)
+
+                    reflectance_values = np.full_like(
+                        intensities_for_rescale_raw, 0.0, dtype=float
+                    )
                     valid_indices = np.where(np.abs(denominator) > DIVISION_EPSILON)
                     reflectance_values[valid_indices] = (
                         numerator[valid_indices] / denominator[valid_indices]
                     )
+                    data_for_max_finding = reflectance_values
+                else:
+                    logger.warning(
+                        f"Rescaling in Reflectance mode, but references are not valid ({reason_code}). Using raw data for scaling."
+                    )
+                    data_for_max_finding = intensities_for_rescale_raw
+            else:  # MODE_RAW or other modes
+                data_for_max_finding = intensities_for_rescale_raw
 
-                    if len(reflectance_values) > 0:
-                        max_val_for_scaling = np.max(reflectance_values)
-                    else:
-                        logger.warning("Empty reflectance values for rescale.")
-                        return
-                else:
-                    if len(intensities_for_rescale_raw) > 0:
-                        max_val_for_scaling = np.max(intensities_for_rescale_raw)
-                    else:
-                        logger.warning(
-                            "Empty raw intensities for rescale (reflectance mode, bad refs)."
+            assert (
+                data_for_max_finding is not None
+            ), "data_for_max_finding was not assigned"
+            if len(data_for_max_finding) == 0:
+                logger.warning("Data for max finding is empty. Cannot rescale.")
+                return
+
+            # --- MODIFICATION: Apply smoothing before finding max ---
+            smoothed_data_for_scaling = data_for_max_finding  # Default to unsmoothed
+            if (
+                USE_LIVE_SMOOTHING
+                and LIVE_SMOOTHING_WINDOW_SIZE > 1
+                # and isinstance(data_for_max_finding, np.ndarray) # Already asserted by type hint essentially
+                and data_for_max_finding.size >= LIVE_SMOOTHING_WINDOW_SIZE
+            ):
+                # Ensure window size is odd for symmetrical convolution
+                win_size = LIVE_SMOOTHING_WINDOW_SIZE + (
+                    1 if LIVE_SMOOTHING_WINDOW_SIZE % 2 == 0 else 0
+                )
+                # Check if window size is valid for the data length and at least 3
+                if win_size <= len(data_for_max_finding) and win_size >= 3:
+                    weights = np.ones(win_size) / float(win_size)
+                    try:
+                        smoothed_data_for_scaling = np.convolve(
+                            data_for_max_finding, weights, mode="same"
                         )
-                        return
-            else:
-                if len(intensities_for_rescale_raw) > 0:
-                    max_val_for_scaling = np.max(intensities_for_rescale_raw)
+                        logger.debug(
+                            "Applied smoothing to data before finding max for Y-axis rescale."
+                        )
+                    except Exception as e_smooth:
+                        logger.warning(
+                            f"Error applying smoothing during rescale: {e_smooth}. Using unsmoothed data."
+                        )
+                        # smoothed_data_for_scaling remains data_for_max_finding
                 else:
-                    logger.warning("Empty raw intensities for rescale (raw mode).")
+                    logger.debug(
+                        "Smoothing window size invalid for current data length during rescale. Using unsmoothed."
+                    )
+            # --- END MODIFICATION ---
+
+            max_val_for_scaling = 0.0
+            if len(smoothed_data_for_scaling) > 0:
+                max_val_for_scaling = np.max(smoothed_data_for_scaling)
+            else:
+                logger.warning(
+                    "Smoothed data for scaling is empty. Cannot determine max value."
+                )
+                # Potentially use a default or the unsmoothed max if smoothing somehow failed and emptied it
+                if (
+                    len(data_for_max_finding) > 0
+                ):  # Fallback to unsmoothed if smoothed is empty
+                    max_val_for_scaling = np.max(data_for_max_finding)
+                else:  # Should not happen if initial checks pass
+                    logger.error(
+                        "Critical: Both raw and smoothed data are empty in rescale. Aborting rescale."
+                    )
                     return
 
+            new_y_max = 0.0
             if is_reflectance_plot_for_rescale:
                 new_y_max = max(
                     float(Y_AXIS_REFLECTANCE_RESCALE_MIN_CEILING),
@@ -3122,7 +3189,7 @@ class SpectrometerScreen:
                 new_y_max = min(
                     new_y_max, float(Y_AXIS_REFLECTANCE_RESCALE_MAX_CEILING)
                 )
-            else:
+            else:  # Raw data scaling
                 new_y_max = max(
                     float(Y_AXIS_MIN_CEILING),
                     float(max_val_for_scaling * Y_AXIS_RESCALE_FACTOR),
@@ -3133,9 +3200,11 @@ class SpectrometerScreen:
 
             self._current_y_max = new_y_max
             logger.info(
-                f"Y-axis max rescaled to: {self._current_y_max:.2f} (peak val: {max_val_for_scaling:.2f}, mode: {'Reflectance' if is_reflectance_plot_for_rescale else 'Raw'})"
+                f"Y-axis max rescaled to: {self._current_y_max:.2f} (based on {'smoothed ' if USE_LIVE_SMOOTHING else ''}peak val: {max_val_for_scaling:.2f}, type: {'Reflectance' if is_reflectance_plot_for_rescale else 'Raw'})"
             )
 
+        except AssertionError as ae:
+            logger.error(f"AssertionError during Y-axis rescale: {ae}", exc_info=True)
         except Exception as e:
             logger.error(f"Error rescaling Y-axis: {e}", exc_info=True)
 
@@ -3614,9 +3683,25 @@ class SpectrometerScreen:
         logger.info(
             f"Starting Spectrometer screen loop (Initial State: {self._current_state})."
         )
-        assert self.menu_system is not None
+        assert (
+            self.menu_system is not None
+        ), "MenuSystem not available in SpectrometerScreen run_loop"
+
         while self.is_active and not g_shutdown_flag.is_set():
-            action = self.handle_input()
+            # --- MODIFICATION: Check for leak flag within SpectrometerScreen's loop ---
+            if g_leak_detected_flag.is_set():
+                logger.warning(
+                    "Leak detected while SpectrometerScreen is active. Returning to main for handling."
+                )
+                self.deactivate()  # Properly deactivate this screen
+                return (
+                    "BACK"  # Signal main loop to take over (it will then see the leak)
+                )
+            # --- END MODIFICATION ---
+
+            action = (
+                self.handle_input()
+            )  # Processes Pygame events, button states for spectrometer screen
             if action == "QUIT":
                 self.deactivate()
                 return "QUIT"
@@ -3627,15 +3712,15 @@ class SpectrometerScreen:
             if (
                 self._current_state == self.STATE_AUTO_INTEG_RUNNING
                 and self._auto_integ_optimizing
+                and self._is_spectrometer_ready()  # Ensure spec is still ready for this step
             ):
-                self._run_auto_integration_step()  # This might change state
+                self._run_auto_integration_step()  # This might change state if an error occurs or completes
 
-            self.draw()
+            self.draw()  # Draws the spectrometer screen content
 
             wait_ms = int(SPECTRO_LOOP_DELAY_S * 1000)
             try:
-                # Dynamic wait time based on integration time for live/setup states
-                # Exclude frozen, calibrate menu, and confirm states from dynamic wait, as they don't continuously capture
+                # Dynamic wait time calculation
                 if self._current_state not in [
                     self.STATE_FROZEN_VIEW,
                     self.STATE_CALIBRATE,
@@ -3643,31 +3728,47 @@ class SpectrometerScreen:
                 ]:
                     integ_ms_for_wait = 0
                     if self._current_state == self.STATE_AUTO_INTEG_RUNNING:
+                        # current_auto_integ_us is already clamped in its usage
                         integ_ms_for_wait = int(
                             round(self._current_auto_integ_us / 1000.0)
                         )
                     else:  # live_view, dark_setup, white_setup, auto_integ_setup
                         integ_ms_for_wait = self.menu_system.get_integration_time_ms()
 
-                    assert isinstance(integ_ms_for_wait, int) and integ_ms_for_wait >= 0
+                    assert (
+                        isinstance(integ_ms_for_wait, int) and integ_ms_for_wait >= 0
+                    ), f"Invalid integration time for wait: {integ_ms_for_wait}"
+
                     if integ_ms_for_wait > 0:
                         target_wait_s = (
                             integ_ms_for_wait / 1000.0
                         ) + SPECTRO_REFRESH_OVERHEAD_S
+                        # Ensure wait_ms is at least the base loop delay
                         wait_ms = int(max(SPECTRO_LOOP_DELAY_S, target_wait_s) * 1000)
+            except AssertionError as ae_wait:  # Catch assertion from integ_ms_for_wait
+                logger.warning(
+                    f"Assertion error calculating dynamic wait time: {ae_wait}. Using default."
+                )
             except Exception as e_wait:
                 logger.warning(
                     f"Error calculating dynamic wait time: {e_wait}. Using default."
                 )
+
             assert (
                 isinstance(wait_ms, int) and wait_ms >= 0
-            ), f"Invalid wait_ms: {wait_ms}"
+            ), f"Invalid final wait_ms: {wait_ms}"
             pygame.time.wait(wait_ms)
 
-        if self.is_active:
+        # Loop exited (either by shutdown, leak, or normal screen exit)
+        if (
+            self.is_active
+        ):  # If loop exited due to shutdown/leak but screen was technically still active
             self.deactivate()
+
         logger.info("Spectrometer screen loop finished.")
-        return "QUIT" if g_shutdown_flag.is_set() else "BACK"
+        return (
+            "QUIT" if g_shutdown_flag.is_set() else "BACK"
+        )  # Default return if not explicitly set earlier
 
     def cleanup(self):
         logger.info("Cleaning up SpectrometerScreen resources...")
@@ -3703,6 +3804,7 @@ def show_splash_screen(screen: pygame.Surface, display_hat_obj, duration_s: floa
         )
         if not os.path.isfile(img_path):
             logger.error(f"Splash image not found: {img_path}")
+            # Fallback: just wait, allow leak check to occur if main loop is structured for it
             time.sleep(min(duration_s, 2.0))
             return
         img_raw = pygame.image.load(img_path)
@@ -3719,7 +3821,7 @@ def show_splash_screen(screen: pygame.Surface, display_hat_obj, duration_s: floa
             img_final = img_raw
     except Exception as e:
         logger.error(f"Error loading splash: {e}", exc_info=True)
-        time.sleep(min(duration_s, 2.0))
+        time.sleep(min(duration_s, 2.0))  # Fallback wait
         return
 
     if img_final:
@@ -3728,15 +3830,40 @@ def show_splash_screen(screen: pygame.Surface, display_hat_obj, duration_s: floa
             img_rect = img_final.get_rect(center=screen.get_rect().center)
             screen.blit(img_final, img_rect)
             update_hardware_display(screen, display_hat_obj)
-            wait_interval, num_intervals = 0.1, int(duration_s / 0.1)
-            for _ in range(num_intervals):
+
+            wait_interval_s = 0.1  # Check flags every 100ms
+            num_intervals = int(duration_s / wait_interval_s)
+
+            for i in range(num_intervals):
                 if g_shutdown_flag.is_set():
-                    logger.info("Shutdown during splash.")
+                    logger.info("Shutdown signal received during splash screen.")
                     break
-                time.sleep(wait_interval)
-            logger.info("Splash screen finished.")
+                # --- MODIFICATION FOR ISSUE 1: Check leak flag during splash screen loop ---
+                if g_leak_detected_flag.is_set():
+                    logger.warning(
+                        "Leak detected during splash screen. Exiting splash."
+                    )
+                    break
+                # --- END MODIFICATION ---
+                # Process Pygame events to allow window close/escape even during splash
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        logger.info("Pygame QUIT event during splash.")
+                        g_shutdown_flag.set()
+                        break
+                    if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                        logger.info("Escape key pressed during splash.")
+                        g_shutdown_flag.set()
+                        break
+                if g_shutdown_flag.is_set():  # Check again after event processing
+                    break
+
+                time.sleep(wait_interval_s)
+            logger.info("Splash screen finished or interrupted.")
         except Exception as e:
             logger.error(f"Error displaying splash: {e}", exc_info=True)
+    elif duration_s > 0:  # Ensure there's a pause even if image load fails
+        time.sleep(duration_s)
 
 
 # --- Disclaimer Screen Function ---
@@ -3779,7 +3906,8 @@ def show_disclaimer_screen(
             else None
         )
     if not disc_font:
-        logger.error("No font for disclaimer.")
+        logger.error("No font for disclaimer. Skipping display but pausing.")
+        time.sleep(2.0)  # Pause briefly even if no font
         return
 
     try:
@@ -3791,31 +3919,40 @@ def show_disclaimer_screen(
             4,
         )
         for line_txt in lines:
-            if line_txt.strip():
+            if line_txt.strip():  # Only render non-empty lines
                 surf = disc_font.render(line_txt, True, WHITE)
                 rendered.append(surf)
                 max_w, total_h = (
                     max(max_w, surf.get_width()),
                     total_h + surf.get_height() + l_space,
                 )
-            else:
-                rendered.append(None)
-                total_h += (disc_font.get_height() // 2) + l_space
-        if total_h > 0:
-            total_h -= l_space
+            else:  # Handle blank lines in disclaimer for spacing
+                rendered.append(None)  # Placeholder for a blank line
+                total_h += (
+                    disc_font.get_height() // 2
+                ) + l_space  # Approximate height of a blank line
+
+        if (
+            total_h > 0 and l_space > 0 and len(rendered) > 0
+        ):  # Avoid negative if l_space is 0 or no lines
+            total_h -= l_space  # Remove last line_space
+
         hint_surf = hint_font.render("Press A or B to continue...", True, YELLOW)
-        total_h += hint_surf.get_height() + 10
+        total_h += hint_surf.get_height() + 10  # Space for hint
+
         start_y = max(10, (screen.get_height() - total_h) // 2)
+
         screen.fill(BLACK)
         current_y = start_y
         for surf in rendered:
-            if surf:
+            if surf:  # If it's a rendered text surface
                 screen.blit(
                     surf, surf.get_rect(centerx=screen.get_width() // 2, top=current_y)
                 )
                 current_y += surf.get_height() + l_space
-            else:
+            else:  # If it's a placeholder for a blank line
                 current_y += (disc_font.get_height() // 2) + l_space
+
         screen.blit(
             hint_surf,
             hint_surf.get_rect(centerx=screen.get_width() // 2, top=current_y + 10),
@@ -3823,23 +3960,40 @@ def show_disclaimer_screen(
         update_hardware_display(screen, display_hat_obj)
     except Exception as e:
         logger.error(f"Error drawing disclaimer: {e}", exc_info=True)
-        return
+        return  # Exit if drawing fails
 
     logger.info("Waiting for disclaimer acknowledgement...")
     acknowledged = False
     while not acknowledged and not g_shutdown_flag.is_set():
-        if button_handler.process_pygame_events() == "QUIT":
-            g_shutdown_flag.set()
-            logger.warning("QUIT during disclaimer.")
-            continue
+        if (
+            button_handler.process_pygame_events() == "QUIT"
+        ):  # Handles K_ESCAPE and window close
+            g_shutdown_flag.set()  # Ensure shutdown flag is set
+            logger.warning("QUIT signal received during disclaimer.")
+            break  # Exit loop
+
+        # --- MODIFICATION FOR ISSUE 1: Check leak flag during disclaimer loop ---
+        if g_leak_detected_flag.is_set():
+            logger.warning(
+                "Leak detected during disclaimer screen. Exiting disclaimer."
+            )
+            break
+        # --- END MODIFICATION ---
+
         if button_handler.check_button(BTN_ENTER) or button_handler.check_button(
             BTN_BACK
         ):
             acknowledged = True
             logger.info("Disclaimer acknowledged.")
-        pygame.time.wait(50)
-    if not acknowledged:
-        logger.warning("Exited disclaimer due to shutdown.")
+
+        pygame.time.wait(50)  # Loop delay
+
+    if (
+        not acknowledged and not g_shutdown_flag.is_set()
+    ):  # If loop exited due to leak but not shutdown
+        logger.warning("Exited disclaimer due to leak detection, not acknowledged.")
+    elif not acknowledged and g_shutdown_flag.is_set():
+        logger.warning("Exited disclaimer due to shutdown signal, not acknowledged.")
     else:
         logger.info("Disclaimer screen finished.")
 
@@ -3872,9 +4026,9 @@ def show_leak_warning_screen(
         if show_txt and font_l and font_s:
             try:
                 texts = [
-                    ("! LEAK !", font_l, -30),
-                    ("WATER DETECTED!", font_s, 20),
-                    ("Press ANY btn to shutdown.", font_s, 50),
+                    ("LEAK DETECTED", font_l, -30),
+                    ("SOS SENSOR TRIGGERED", font_s, 20),
+                    ("POWER OFF DEVICE", font_s, 50),
                 ]
                 for content, font, y_off in texts:
                     surf = font.render(content, True, YELLOW, RED)
@@ -4012,45 +4166,49 @@ def main():
     logger.info(
         "=" * 44 + "\n   Underwater Spectrometer Controller Start \n" + "=" * 44
     )
-    # Use USE_TEMP_SENSOR_IF_AVAILABLE for clarity in the log
     logger.info(
         f"Config: DH={USE_DISPLAY_HAT}, AdafruitTFT={USE_ADAFRUIT_PITFT}, GPIO={USE_GPIO_BUTTONS}, Hall={USE_HALL_EFFECT_BUTTONS}, Leak={USE_LEAK_SENSOR}, Spec={USE_SPECTROMETER}, TempSensorAttempt={USE_TEMP_SENSOR_IF_AVAILABLE}"
     )
 
-    # Initialize display-related variables
     display_hat_active = False
     display_hat = None
     screen = None
-
-    # Initialize hardware control objects
-    mcp9808_physical_sensor = None  #
+    mcp9808_physical_sensor = None
     temp_sensor_info = None
     net_info = None
     btn_handler = None
     menu_sys = None
     spec_screen = None
     clock = None
-    spectrometer_hardware_ok = False
+    spectrometer_hardware_ok = False  # Default to false
 
     try:
         # --- Pygame and Display Setup ---
+        # ... (No changes to this section) ...
         if USE_ADAFRUIT_PITFT:
             logger.info(
                 "Configuring Pygame for Adafruit PiTFT (dummy SDL_VIDEODRIVER for manual fb write)..."
             )
             os.environ["SDL_VIDEODRIVER"] = "dummy"
-            # Disable console cursor on fb1
             try:
                 with open("/sys/class/graphics/fbcon/cursor_blink", "w") as f:
                     f.write("0")
                 logger.info("Console cursor blink disabled")
             except Exception as e:
                 logger.warning(f"Could not disable cursor blink: {e}")
-
             try:
-                # Hide cursor on the framebuffer
-                os.system("echo 0 > /sys/class/vtconsole/vtcon1/bind 2>/dev/null")
-                logger.info("Console unbound from fb1")
+                # This might need sudo or specific permissions
+                if os.path.exists("/sys/class/vtconsole/vtcon1/bind"):
+                    with open("/sys/class/vtconsole/vtcon1/bind", "w") as f:
+                        f.write("0")
+                    logger.info("Console unbound from fb1 (vtcon1)")
+                else:  # Try fbcon (older method)
+                    subprocess.run(
+                        ["sudo", "sh", "-c", "echo 0 > /sys/class/graphics/fbcon/bind"],
+                        check=False,
+                    )
+                    logger.info("Attempted to unbind console from fbcon")
+
             except Exception as e:
                 logger.warning(f"Could not unbind console: {e}")
 
@@ -4062,19 +4220,23 @@ def main():
                 "Adafruit PiTFT: Pygame surface created for manual framebuffer writing."
             )
         elif USE_DISPLAY_HAT and DisplayHATMini_lib:
-            if "SDL_VIDEODRIVER" not in os.environ:
+            if "SDL_VIDEODRIVER" not in os.environ:  # Ensure dummy if not already set
                 os.environ["SDL_VIDEODRIVER"] = "dummy"
             pygame.init()
             assert pygame.get_init(), "Pygame (core) init failed"
-            screen = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
-            display_hat = DisplayHATMini_lib(screen)
-            display_hat_active = True
-            logger.info(
-                "DisplayHATMini initialized (likely with dummy SDL for Pygame surface)."
+            # Create a Pygame surface that matches the HAT dimensions
+            screen = pygame.Surface(
+                (DisplayHATMini_lib.WIDTH, DisplayHATMini_lib.HEIGHT)
             )
-        else:
+            display_hat = DisplayHATMini_lib(
+                screen
+            )  # Pass the surface to the HAT library
+            display_hat_active = True
+            pygame.mouse.set_visible(False)  # Usually no mouse with HATs
+            logger.info("DisplayHATMini initialized with Pygame surface.")
+        else:  # Standard Pygame window
             logger.info("Initializing standard Pygame display window...")
-            if (
+            if (  # If dummy was set by mistake, unset it
                 "SDL_VIDEODRIVER" in os.environ
                 and os.environ["SDL_VIDEODRIVER"] == "dummy"
             ):
@@ -4083,6 +4245,7 @@ def main():
             assert pygame.get_init(), "Pygame (core) init failed"
             screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
             pygame.display.set_caption("Spectrometer Menu")
+            # pygame.mouse.set_visible(True) # Or False, depending on preference for dev
             logger.info("Standard Pygame display window initialized.")
 
         assert screen, "Pygame screen/surface was not created."
@@ -4090,6 +4253,7 @@ def main():
         assert clock, "Pygame clock failed to initialize."
 
         # --- Temperature Sensor Initialization ---
+        # ... (No changes to this section) ...
         if USE_TEMP_SENSOR_IF_AVAILABLE:
             if MCP9808_Driver:
                 try:
@@ -4109,11 +4273,13 @@ def main():
                         logger.warning(
                             "MCP9808 sensor begin() returned False. Sensor likely not connected or faulty."
                         )
+                        mcp9808_physical_sensor = None  # Ensure it's None
                 except Exception as e_temp_init:
                     logger.error(
                         f"Error initializing MCP9808 sensor hardware: {e_temp_init}",
                         exc_info=True,
                     )
+                    mcp9808_physical_sensor = None  # Ensure it's None on error
             else:
                 logger.warning(
                     "MCP9808_Driver class not available. Cannot attempt temperature sensor init."
@@ -4122,142 +4288,169 @@ def main():
             logger.info(
                 "Temperature sensor usage is disabled by USE_TEMP_SENSOR_IF_AVAILABLE=False."
             )
-
-        temp_sensor_info = TempSensorInfo(mcp9808_physical_sensor)  # Always created
+        temp_sensor_info = TempSensorInfo(mcp9808_physical_sensor)
 
         # --- Initialize Core Components ---
+        # ... (No changes to this section up to spec_screen instantiation) ...
         logger.info("Initializing core components...")
         net_info = NetworkInfo()
-        btn_handler = ButtonHandler(display_hat if display_hat_active else None)
+        # Pass display_hat only if it's active and of the correct type
+        button_handler_display_hat_arg = (
+            display_hat
+            if (
+                display_hat_active
+                and DisplayHATMini_lib
+                and isinstance(display_hat, DisplayHATMini_lib)
+            )
+            else None
+        )
+        btn_handler = ButtonHandler(button_handler_display_hat_arg)
+
         menu_sys = MenuSystem(screen, btn_handler, net_info, temp_sensor_info)
 
-        if USE_SPECTROMETER:  # Config flag says we want to use it
-            # Instantiate SpectrometerScreen regardless of hardware status at this point.
-            # It will manage its own state based on actual device connection.
+        # Ensure menu_sys.display_hat is set correctly if Display HAT is used
+        if (
+            display_hat_active
+            and DisplayHATMini_lib
+            and isinstance(display_hat, DisplayHATMini_lib)
+        ):
+            menu_sys.display_hat = display_hat
+
+        if USE_SPECTROMETER:
+            spec_screen_display_hat_arg = (
+                display_hat
+                if (
+                    display_hat_active
+                    and DisplayHATMini_lib
+                    and isinstance(display_hat, DisplayHATMini_lib)
+                )
+                else None
+            )
             spec_screen = SpectrometerScreen(
                 screen,
                 btn_handler,
                 menu_sys,
-                display_hat if display_hat_active else None,
+                spec_screen_display_hat_arg,
                 temp_sensor_info,
             )
             assert spec_screen, "SpectrometerScreen failed to initialize"
-            if display_hat_active:
-                assert menu_sys  # menu_sys should exist at this point
-                menu_sys.display_hat = display_hat  # Keep this for Pimoroni
-                if (
-                    spec_screen
-                ):  # spec_screen might be None if USE_SPECTROMETER is False
-                    spec_screen.display_hat = display_hat  # Keep this for Pimoroni
+            if (
+                spec_screen.display_hat is None
+                and spec_screen_display_hat_arg is not None
+            ):  # Redundant check, but safe
+                spec_screen.display_hat = spec_screen_display_hat_arg
 
-            # Check if the spectrometer hardware was actually initialized successfully within SpectrometerScreen
-            # This assumes SpectrometerScreen._initialize_spectrometer_device() sets self.spectrometer
-            if spec_screen.spectrometer and hasattr(
-                spec_screen.spectrometer, "_dev"
-            ):  # A basic check
+            if spec_screen._is_spectrometer_ready():  # Use the robust check
                 spectrometer_hardware_ok = True
                 logger.info(
-                    "Spectrometer hardware appears to be initialized within SpectrometerScreen."
+                    "Spectrometer hardware initialized successfully within SpectrometerScreen."
                 )
             else:
-                logger.warning(
-                    "Spectrometer hardware FAILED to initialize within SpectrometerScreen, or not found. Spectrometer operations will be limited."
-                )
                 spectrometer_hardware_ok = False  # Explicitly false
+                logger.warning(
+                    "Spectrometer hardware FAILED to initialize or not found within SpectrometerScreen. Operations will be limited."
+                )
         else:
             logger.info("Spectrometer usage disabled by USE_SPECTROMETER=False config.")
+            spectrometer_hardware_ok = False  # Ensure it's false if not used
 
-        if not menu_sys.font:
+        if not menu_sys.font:  # Check after menu_sys is initialized
             logger.critical(
                 "Main font failed to load. UI will be impaired. Attempting to continue..."
             )
-            # Application might be unusable but try to proceed for debugging.
 
         # --- Startup Screens (Splash, Disclaimer) ---
-        show_splash_screen(
-            screen, display_hat if display_hat_active else None, SPLASH_DURATION_S
-        )
-        if not g_shutdown_flag.is_set():
-            if menu_sys.hint_font:
-                show_disclaimer_screen(
-                    screen,
-                    display_hat if display_hat_active else None,
-                    btn_handler,
-                    menu_sys.hint_font,
-                )
-            else:
-                logger.warning(
-                    "Hint font not loaded, skipping disclaimer screen text render, but pausing."
-                )
-                time.sleep(3)
-        if g_shutdown_flag.is_set():
-            raise SystemExit("Shutdown during startup phase.")
+        # Pass the active display_hat object if display_hat_active is True
+        splash_display_arg = display_hat if display_hat_active else None
+        show_splash_screen(screen, splash_display_arg, SPLASH_DURATION_S)
+
+        # Check for shutdown or leak *after* splash, before disclaimer
+        if g_shutdown_flag.is_set() or g_leak_detected_flag.is_set():
+            pass  # Allow loop below to handle it immediately
+        elif (
+            menu_sys.hint_font
+        ):  # Only show disclaimer if hint font loaded and no critical flags
+            disclaimer_display_arg = display_hat if display_hat_active else None
+            show_disclaimer_screen(
+                screen,
+                disclaimer_display_arg,
+                btn_handler,
+                menu_sys.hint_font,
+            )
+        else:  # No hint font, or critical flag set before disclaimer
+            logger.warning(
+                "Hint font not loaded or critical flag set; skipping disclaimer screen text render, but pausing if no flags."
+            )
+            if not g_shutdown_flag.is_set() and not g_leak_detected_flag.is_set():
+                time.sleep(2.0)  # Brief pause if no critical flags
 
         # --- Start Background Tasks ---
         logger.info("Setting up signal handlers and starting background tasks...")
-        setup_signal_handlers(btn_handler, net_info)  # Assuming this is defined
+        setup_signal_handlers(btn_handler, net_info)
         net_info.start_updates()
-        temp_sensor_info.start_updates()  # TempSensorInfo handles if sensor is None
+        temp_sensor_info.start_updates()
 
         # --- Main Application Loop ---
         logger.info("Starting main application loop...")
         current_scr_state = "MENU"
         while not g_shutdown_flag.is_set():
-            # Handle global events like leak first
+            # --- MODIFICATION FOR ISSUE 1: Prioritize leak check ---
             if g_leak_detected_flag.is_set():
-                logger.critical("Leak detected! Switching to leak warning.")
+                logger.critical("Leak detected! Switching to leak warning screen.")
+                # Pass the active display_hat object
+                leak_display_arg = display_hat if display_hat_active else None
                 leak_action = show_leak_warning_screen(
-                    screen, display_hat if display_hat_active else None, btn_handler
+                    screen, leak_display_arg, btn_handler
                 )
-                # show_leak_warning_screen() itself is a loop.
-                # It will set g_shutdown_flag if a button is pressed.
+                # show_leak_warning_screen is a blocking loop.
+                # It should set g_shutdown_flag if a button is pressed.
                 if leak_action == "QUIT" or g_shutdown_flag.is_set():
-                    if not g_shutdown_flag.is_set():  # Ensure flag is set
+                    if (
+                        not g_shutdown_flag.is_set()
+                    ):  # Ensure flag is set if QUIT was returned
                         g_shutdown_flag.set()
-                    logger.warning(
-                        "Leak warning resulted in QUIT or shutdown flag set."
+                    logger.info(
+                        "Leak warning screen signaled QUIT or shutdown flag set. Breaking main loop."
                     )
-                    break  # Exit main loop to cleanup and exit
-                # If leak somehow clears without shutdown, loop continues.
+                    break  # Exit main application loop
+
+                # If leak warning exits but flag is still set (e.g. if it could be cleared externally),
+                # this 'continue' will re-trigger the leak warning.
+                # If flag was cleared, normal operation resumes.
+                logger.info("Leak warning screen exited. Re-evaluating flags.")
+                continue  # Restart the main while loop to re-check flags
+            # --- END MODIFICATION ---
 
             # State-specific logic:
             if current_scr_state == "MENU":
-                menu_action = (
-                    menu_sys.handle_input()
-                )  # Processes Pygame events, sets button states
+                assert menu_sys is not None, "MenuSystem is None in MENU state"
+                menu_action = menu_sys.handle_input()
 
                 if menu_action == "QUIT":
                     g_shutdown_flag.set()
                     logger.info("Menu signaled QUIT.")
                 elif menu_action == "START_CAPTURE":
-                    if spec_screen:  # Check if spectrometer screen object exists
-                        spec_screen.activate()  # Prepare spectrometer screen
+                    if spec_screen:
+                        spec_screen.activate()
                         current_scr_state = "SPECTROMETER"
                         logger.info("Transitioning to Spectrometer screen.")
-                        if not spectrometer_hardware_ok:
+                        if not spectrometer_hardware_ok:  # This check is informative
                             logger.warning(
-                                "Spectrometer hardware not ready, operations limited."
+                                "Spectrometer hardware not ready, operations will be limited on Spectrometer screen."
                             )
-                        # The Spectrometer screen's loop will run in the next main loop iteration.
                     else:
                         logger.warning(
-                            "START_CAPTURE selected, but SpectrometerScreen not configured (USE_SPECTROMETER=False)."
+                            "START_CAPTURE selected, but SpectrometerScreen not available (USE_SPECTROMETER might be False or init failed)."
                         )
-                        # Stay in MENU state, menu will be drawn below.
 
-                # If still in MENU state (or returned to it) and not shutting down, draw the menu.
-                # This ensures the menu is drawn every frame it's active.
                 if current_scr_state == "MENU" and not g_shutdown_flag.is_set():
-                    menu_sys.draw()  # This method calls update_hardware_display
+                    menu_sys.draw()
 
             elif current_scr_state == "SPECTROMETER":
                 assert (
-                    spec_screen
-                ), "In SPECTROMETER state, but spec_screen is None. This should not happen."
-
-                # spec_screen.run_loop() is a blocking loop that handles its own input, drawing, and state.
-                # It will only return "BACK" (to menu) or "QUIT".
-                spec_status = spec_screen.run_loop()
+                    spec_screen is not None
+                ), "SpectrometerScreen is None in SPECTROMETER state"
+                spec_status = spec_screen.run_loop()  # This is a blocking loop
 
                 if spec_status == "QUIT":
                     logger.info("Spectrometer screen signaled QUIT.")
@@ -4265,27 +4458,25 @@ def main():
                 elif spec_status == "BACK":
                     logger.info("Returning to Menu from Spectrometer screen.")
                     current_scr_state = "MENU"
-                    # The next main loop iteration will handle menu input and draw the menu.
 
-            else:  # Should not be reached if states are managed correctly
+            else:
                 logger.error(f"FATAL: Unknown screen state '{current_scr_state}'")
-                g_shutdown_flag.set()  # Force shutdown on unknown state
+                g_shutdown_flag.set()
 
-            # Regulate loop speed if not shutting down
             if not g_shutdown_flag.is_set():
-                clock.tick(1.0 / MAIN_LOOP_DELAY_S)
+                clock.tick(1.0 / MAIN_LOOP_DELAY_S)  # Regulate loop speed
 
     except SystemExit as e:
         logger.warning(f"Exiting due to SystemExit: {e}")
     except RuntimeError as e:
         logger.critical(f"RUNTIME ERROR in main: {e}", exc_info=True)
-        g_shutdown_flag.set()
+        g_shutdown_flag.set()  # Ensure shutdown on critical errors
     except KeyboardInterrupt:
         logger.warning("KeyboardInterrupt. Initiating shutdown...")
         g_shutdown_flag.set()
     except Exception as e:
         logger.critical(f"FATAL UNHANDLED EXCEPTION in main: {e}", exc_info=True)
-        g_shutdown_flag.set()
+        g_shutdown_flag.set()  # Ensure shutdown
     finally:
         logger.warning("Initiating final cleanup...")
         if net_info:
@@ -4303,19 +4494,18 @@ def main():
                 spec_screen.cleanup()
             except Exception as e_ss:
                 logger.error(f"Error cleaning spec_screen: {e_ss}")
-        if menu_sys:
+        if menu_sys:  # menu_sys might not be fully initialized if error occurs early
             try:
                 menu_sys.cleanup()
             except Exception as e_ms:
                 logger.error(f"Error cleaning menu_sys: {e_ms}")
-        if btn_handler:
+        if btn_handler:  # btn_handler might not be fully initialized
             try:
                 btn_handler.cleanup()
             except Exception as e_bh:
                 logger.error(f"Error cleaning btn_handler: {e_bh}")
 
-        # Pygame quit should be robust
-        if pygame.get_init():
+        if pygame.get_init():  # Check if Pygame was initialized
             try:
                 pygame.quit()
                 logger.info("Pygame quit successfully.")
