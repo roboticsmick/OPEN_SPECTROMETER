@@ -16,150 +16,286 @@ pip install seabreeze[pyseabreeze]
 seabreeze_os_setup
 ```
 
-## 2 inch RPi Display For RPi
+## Raspberry Pi Spectrometer Setup with Adafruit PiTFT 2.8"
 
-Flash the Raspberry Pi Zeroe 2 W with Ubuntu 22.04 Server LTS
+Automated setup for a Raspberry Pi Zero 2 W with Ubuntu 22.04 Server LTS, Adafruit PiTFT 2.8" display, and pyseabreeze spectrometer integration.
 
-```sh
+## Hardware Requirements
+
+- Raspberry Pi Zero 2 W
+- Adafruit PiTFT 2.8" Resistive Touchscreen (Product ID: 1601)
+- High-quality microSD card (128GB Samsung PRO Plus recommended)
+- DS3231 RTC module (optional but recommended)
+- Ocean Optics compatible spectrometer
+
+## Initial Setup: Flash Ubuntu 22.04 Server LTS
+
+### 1. Install Raspberry Pi Imager
+
+```bash
 sudo apt install rpi-imager
 ```
 
-Setup parameters:
-1. Raspberry Pi Device: Raspberry Pi Zeroe 2 W
-2. Operating System: Ubuntu 22.04 Server LTS (https://ubuntu.com/tutorials/how-to-install-ubuntu-on-your-raspberry-pi#1-overview)
-3. Stoage - Use a Samsung 128GB PRO Plus microSD Card or high quality SD card. Get the best one you can afford from a reputable supplier. Don't be cheap here.
-4. Select `Edit Settings`
-  1. Set hostname: `rpi`
-  2.Tick `Set username and password`
-  3. Set username: `pi`
-  4. Set password: `spectro`
-  5. Tick `Configure wireless LAN`
-  6. Enter known wifi name (I use my mobile hotspot name so I can access this easily in the field)
-  7. Enter wifi password I use my mobile hotspot password so I can access this easily in the field)
-  8. Set Wireless LAN country: `AU`
-  9. Tick `Set locale settings`
-  10. Timezone: `Australia/Brisbane`
-  11. Keyboard Layout: `US`
-  12. Select Services Tab
-  13. Tick `Enable SSH - Use password authentication`
-  14. Click Save
-  15. Click Yes to apply OS customisation settings when you write the image to the storage device.
+### 2. Flash the Operating System
 
-This will flash the OS to the SD card.
+**Hardware Configuration:**
+- **Device:** Raspberry Pi Zero 2 W
+- **OS:** Ubuntu 22.04 Server LTS
+- **Storage:** Use a high-quality microSD card (don't skimp on quality)
 
-Enable your mobile phone hotspot so it can connect to the wifi.
-Insert the SD card into the Raspberry Pi. 
-Boot up the Raspberry Pi.
-*Note: When first booting *
-Check you mobile phone hotspot. 
-When a connection is detected, you Raspberry Pi will have internet access. Check you mobile phone hotspot connections. The Raspberry Pi should show. Click on this and you should be able to see the IP address.
-Connect you laptops wifi to your mobile phone hotspot. 
-From a terminal on you PC SSH into the Raspberry Pi.
+**Imager Settings:**
+1. Click `Edit Settings` before flashing
+2. **General Tab:**
+   - Hostname: `rpi`
+   - Username: `pi`
+   - Password: `spectro`
+   - Configure wireless LAN: ✓
+     - SSID: Your WiFi network name (mobile hotspot recommended for field use)
+     - Password: Your WiFi password
+     - Wireless LAN country: `AU` (or your country)
+   - Set locale settings: ✓
+     - Timezone: `Australia/Brisbane` (or your timezone)
+     - Keyboard layout: `US`
+3. **Services Tab:**
+   - Enable SSH: ✓ (Use password authentication)
+4. Click `Save`
+5. Confirm OS customization settings when prompted
+6. Flash the image to your microSD card
 
-```sh
+## First Boot and Connection
+
+### 1. Initial Boot
+- Enable your mobile phone hotspot (if using mobile hotspot for WiFi)
+- Insert the flashed microSD card into the Raspberry Pi
+- Power on the Raspberry Pi
+- Wait for the device to connect to your WiFi network
+
+### 2. Find the Pi's IP Address
+
+**Option A: Using hostname (if available)**
+```bash
 ping rpi.local
-# Copy IP address from ping below into <IP>
-ssh -X pi@<IP>
 ```
-Enter password: spectro
 
-If the ssh isn't working, check that your connected via your hotspot. Connect to your hotspot via your Ubuntu laptop. Two hotspot connections should now be showing. Check the IP address for your latop.
-
-```sh
+**Option B: Network scan (if hostname doesn't work)**
+```bash
+# Check your laptop's IP address when connected to the same network
 ifconfig
-# Example:
-# wlp3s0: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500
-#        inet 10.119.124.83  netmask 255.255.255.0  broadcast 10.119.124.255
-#        inet6 fe80::3c24:e953:7879:4e71  prefixlen 64  scopeid 0x20<link>
-#        ether 54:e4:ed:74:18:cd  txqueuelen 1000  (Ethernet)
-#        RX packets 1052664  bytes 1320322796 (1.3 GB)
-#        RX errors 0  dropped 0  overruns 0  frame 0
-#        TX packets 441016  bytes 54203222 (54.2 MB)
-#        TX errors 0  dropped 4 overruns 0  carrier 0  collisions 0
-```
-Copy for first, leaving the last digit as a 0/24.
+# Look for your interface (e.g., wlp3s0) and note the network
+# Example: inet 10.119.124.83 means network is 10.119.124.0/24
 
-```sh
+# Scan the network
 nmap -sn 10.119.124.0/24
 ```
 
-### Add a new wifi connection
+### 3. SSH into the Raspberry Pi
+```bash
+ssh pi@<IP_ADDRESS>
+```
+Enter password: `spectro`
 
-1. Insert the SD card into your computer.
-2. Navigate to the root filesystem on the SD card. You should see a directory structure similar to a Linux system.
-3. Find and edit the network configuration file. On Ubuntu 22.04 Server, this is typically located at /etc/netplan/50-cloud-init.yaml (or similar).
-4. Open this file with a text editor. On Ubuntu: 
+**Note:** Both your laptop and Raspberry Pi must be on the same network for SSH to work.
 
-```sh
-sudo vim 50-cloud-init.yaml
+## Adding Additional WiFi Networks (Optional)
+
+If you need to add more WiFi networks after initial setup:
+
+1. Insert the microSD card into your computer
+2. Navigate to the boot partition and edit the network configuration:
+   ```bash
+   sudo nano /path/to/boot/50-cloud-init.yaml
+   ```
+3. Add additional networks to the configuration:
+   ```yaml
+   network:
+       version: 2
+       wifis:
+           renderer: networkd
+           wlan0:
+               access-points:
+                   existing_network:
+                       password: existing_password
+                   new_network:
+                       password: new_password
+               dhcp4: true
+               optional: true
+   ```
+4. Save and safely eject the microSD card
+5. Reinsert into the Pi and power on
+
+## Automated Setup
+
+### 1. Download and Run the Setup Script
+
+```bash
+# Download the setup script
+wget https://raw.githubusercontent.com/yourusername/yourrepo/main/setup_ada.sh
+
+# Make it executable
+chmod +x setup_ada.sh
+
+# Run the setup (requires sudo)
+sudo ./setup_ada.sh
 ```
 
-If you're on Windows, make sure to use an editor that preserves Linux line endings (like Notepad++, VS Code, etc.). 
-5. Add your new WiFi network to the existing configuration. Here's an example of how to modify the file:
+### 2. What the Setup Script Does
 
-```sh
-# This file is generated from information provided by the datasource.  Changes
-# to it will not persist across an instance reboot.  To disable cloud-init's
-# network configuration capabilities, write a file
-# /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg with the following:
-# network: {config: disabled}
-network:
-    version: 2
-    wifis:
-        renderer: networkd
-        wlan0:
-            access-points:
-                wifi_name:
-                    password: password
-                new_wifi_name:
-                    password: new_password
-            dhcp4: true
-            optional: true
-```
-Make sure the indentation is consistent. 
+The automated setup script handles:
 
-6 If using the vim editor save (esc -> shift + : -> wq -> enter)
-7. Insert the SD card back in the Pi and power it on. 
-8. If you did it correctly it will show the new wifi connection and the IP address in the menu.
+- **System Configuration:**
+  - System package updates and installation
+  - Swap file configuration (2GB)
+  - SPI and I2C interface enabling
+  - User group permissions for hardware access
 
-### Setting up the Raspberry Pi software for the LCD
+- **Display Setup:**
+  - Adafruit PiTFT 2.8" driver installation and configuration
+  - Console cursor control permissions for application use
+  - Display rotation and framebuffer configuration
 
-```sh
-cd
-nano setup_pi.sh
-```
+- **Python Environment:**
+  - Virtual environment creation (`~/pysb-app/pysb_venv/`)
+  - Integrated package installation (no separate requirements.txt needed):
+    - numpy, pyusb (core dependencies)
+    - matplotlib, pygame, pygame-menu (UI)
+    - spidev, RPi.GPIO, rpi-lgpio (hardware interfaces)
+    - seabreeze[pyseabreeze] (spectrometer support)
 
-Copy the code into the text file editor.
+- **Hardware Configuration:**
+  - DS3231 RTC module setup (if connected)
+  - Seabreeze udev rules for spectrometer access
+  - Terminal and bash improvements
 
-```sh
-chmod +x setup_pi.sh
-./setup_pi.sh
-```
-## Run the main script
+### 3. Reboot Required
 
-```sh
-cd pysb-app/
-vim main.py
+After the setup script completes:
+
+```bash
+sudo reboot
 ```
 
-Copy the main.py script
+**Important:** The reboot is required for display drivers, hardware interfaces, and user permissions to take full effect.
 
-```sh
-mkdir assets
-```
+## Running Your Application
 
-From whereever I have saved the fonts and images:
+After reboot, SSH back into the Pi and run your application:
 
-```sh
-scp -r . pi@rpi.local:~/pysb-app/assets/
-```
+```bash
+# Navigate to project directory
+cd ~/pysb-app
 
-Now run the script:
+# Activate the virtual environment
+source pysb_venv/bin/activate
 
-```py
-source venv/bin/activate
+# Run your application
 python3 main.py
 ```
+
+## Project File Structure
+
+After setup, your project directory will contain:
+
+```
+~/pysb-app/
+├── pysb_venv/           # Python virtual environment
+├── main.py              # Your main application (copy this file to the Pi)
+├── assets/              # Fonts, images, etc. (copy this directory to the Pi)
+└── lib/                 # Additional libraries (if needed)
+```
+
+## Copying Your Application Files
+
+You'll need to copy your `main.py` and `assets/` directory to the Pi:
+
+```bash
+# From your development machine, copy files to the Pi
+scp main.py pi@<PI_IP>:~/pysb-app/
+scp -r assets/ pi@<PI_IP>:~/pysb-app/
+```
+
+## Testing and Verification
+
+### Test Spectrometer Connection
+```bash
+cd ~/pysb-app
+source pysb_venv/bin/activate
+python -m seabreeze.cseabreeze_backend ListDevices
+```
+
+### Test RTC (if installed)
+```bash
+sudo hwclock -r
+```
+
+### Test Display Cursor Control
+```bash
+# Disable cursor blinking (should work without permission errors)
+echo 0 > /sys/class/graphics/fbcon/cursor_blink
+```
+
+### Test SPI Interface
+```bash
+ls -l /dev/spidev*
+```
+
+## Troubleshooting
+
+### Common Issues
+
+1. **SSH Connection Failed:**
+   - Ensure both devices are on the same network
+   - Try using IP address instead of hostname
+   - Check that SSH is enabled in the Pi configuration
+
+2. **Display Not Working:**
+   - Ensure reboot was completed after setup
+   - Check that the display is properly connected
+   - Verify that the PiTFT installer completed successfully
+
+3. **Spectrometer Not Detected:**
+   - Check USB connection
+   - Verify udev rules: `ls /etc/udev/rules.d/*ocean*`
+   - Test with: `lsusb` to see if device is detected
+
+4. **Python Package Import Errors:**
+   - Ensure virtual environment is activated
+   - Reinstall specific packages: `pip install <package_name>`
+
+### Manual Fixes
+
+If automatic setup fails for any component, you can run individual steps manually:
+
+```bash
+cd ~/pysb-app
+source pysb_venv/bin/activate
+
+# Reinstall specific Python packages
+pip install matplotlib pygame pygame-menu
+
+# Reinstall seabreeze
+pip install seabreeze[pyseabreeze]
+
+# Reset udev rules for seabreeze
+sudo seabreeze_os_setup
+```
+
+## Hardware Notes
+
+- **Power:** Use a quality power supply (2.5A recommended for Pi Zero 2 W with display)
+- **microSD:** Use Class 10 or better, avoid cheap/counterfeit cards
+- **Display:** Ensure proper connection of the PiTFT ribbon cable
+- **RTC:** Connect DS3231 to I2C pins (SDA to GPIO 2, SCL to GPIO 3, VCC to 3.3V, GND to GND)
+
+## Development Tips
+
+- Use `screen` or `tmux` for persistent SSH sessions
+- The setup script adds helpful bash aliases and history search
+- Log files are typically in `/var/log/` for troubleshooting
+- Use `dmesg` to check for hardware detection issues
+
+## License
+
+This setup is designed for educational and research purposes. Please ensure compliance with all applicable licenses for the software components used.
 
 ## Raspberry Pi breakout PCB
 
