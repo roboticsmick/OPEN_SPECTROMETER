@@ -330,7 +330,7 @@ WHITE = (255, 255, 255)
 BLUE = (0, 0, 255)
 GREEN = (0, 255, 0)
 RED = (255, 0, 0)
-YELLOW = (255, 255, 0)
+YELLOW = (255, 240, 31)
 GRAY = (128, 128, 128)
 CYAN = (0, 255, 255)
 MAGENTA = (255, 0, 255)
@@ -338,24 +338,28 @@ MAGENTA = (255, 0, 255)
 # Menu Layout
 FONT_SIZE = 16
 TITLE_FONT_SIZE = 22
-HINT_FONT_SIZE = 15
+HINT_FONT_SIZE = 16
 DISCLAIMER_FONT_SIZE = 14
 MENU_SPACING = 19
-MENU_MARGIN_TOP = 44
+MENU_MARGIN_TOP = 38
 MENU_MARGIN_LEFT = 12
+SPECTRO_FONT_SIZE = 14
+PLOTTER_TICK_LABEL_FONT_SIZE = 12
+PLOTTER_AXIS_LABEL_FONT_SIZE = 14
 
 # --- Font Filenames
 TITLE_FONT_FILENAME = "ChakraPetch-Medium.ttf"
-MAIN_FONT_FILENAME = "Roboto-Regular.ttf"
-HINT_FONT_FILENAME = "Roboto-Regular.ttf"
-SPECTRO_FONT_FILENAME = "Roboto-Regular.ttf"
-SPECTRO_FONT_SIZE = 14
+MAIN_FONT_FILENAME = "Segoe UI.ttf"
+HINT_FONT_FILENAME = "Segoe UI.ttf"
+SPECTRO_FONT_FILENAME = "Segoe UI.ttf"
+PLOTTER_AXIS_LABEL_FONT_FILENAME = "Segoe UI.ttf"
+PLOTTER_TICK_LABEL_FONT_FILENAME = "Segoe UI Semilight.ttf"
 
 # Timing
 DEBOUNCE_DELAY_S = 0.2
 NETWORK_UPDATE_INTERVAL_S = 10.0
 MAIN_LOOP_DELAY_S = 0.03
-SPLASH_DURATION_S = 3.0
+SPLASH_DURATION_S = 1.0
 SPECTRO_LOOP_DELAY_S = 0.05
 SPECTRO_REFRESH_OVERHEAD_S = 0.05
 # Epsilon for division, to prevent division by zero
@@ -1678,14 +1682,574 @@ class MenuSystem:
         )
         surf = self.hint_font.render(hint, True, YELLOW)
         self.screen.blit(
-            surf, surf.get_rect(left=MENU_MARGIN_LEFT, bottom=SCREEN_HEIGHT - 10)
+            surf, surf.get_rect(centerx=SCREEN_WIDTH // 2, bottom=SCREEN_HEIGHT - 5)
         )
+
+
+class PygamePlotter:
+    """
+    A simple plotter using Pygame's drawing primitives for live spectra display.
+    Manages its own sub-surfaces for optimized redrawing of axes and plot lines.
+    Loads its own fonts based on globally defined constants from the main script.
+    """
+
+    def __init__(
+        self,
+        parent_surface: pygame.Surface,
+        plot_widget_rect: pygame.Rect,
+        initial_x_data: np.ndarray | None,
+        x_label_text: str = "Wavelength (nm)",
+        y_label_text: str = "Intensity",
+        bg_color: tuple[int, int, int] = BLACK,  # Uses global BLACK
+        axis_color: tuple[int, int, int] = GRAY,  # Uses global GRAY
+        plot_color: tuple[int, int, int] = CYAN,  # Uses global CYAN
+        text_color: tuple[int, int, int] = WHITE,  # Uses global WHITE
+        grid_color: tuple[int, int, int] = (40, 40, 40),
+        num_x_ticks: int = 5,
+        num_y_ticks: int = 5,
+    ):
+
+        assert (
+            parent_surface is not None
+        ), "PygamePlotter: parent_surface cannot be None"
+        assert (
+            plot_widget_rect is not None
+        ), "PygamePlotter: plot_widget_rect cannot be None"
+        assert (
+            pygame.font.get_init()
+        ), "PygamePlotter: Pygame font system not initialized."
+
+        self.parent_surface = parent_surface
+        self.plot_widget_rect = plot_widget_rect
+
+        # --- Font Loading using Global Constants from main.py ---
+        # Determine the absolute path to the 'assets' directory relative to main.py
+        # __file__ in main.py refers to main.py itself.
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        assets_dir = os.path.join(script_dir, "assets")
+
+        axis_font_path = os.path.join(assets_dir, PLOTTER_AXIS_LABEL_FONT_FILENAME)
+        tick_font_path = os.path.join(assets_dir, PLOTTER_TICK_LABEL_FONT_FILENAME)
+
+        # Load fonts using the globally defined _load_font_safe function
+        # and global size constants
+        self.axis_label_font = _load_font_safe(
+            axis_font_path, PLOTTER_AXIS_LABEL_FONT_SIZE
+        )
+        self.tick_label_font = _load_font_safe(
+            tick_font_path, PLOTTER_TICK_LABEL_FONT_SIZE
+        )
+        # --- End Font Loading ---
+
+        self.x_label_text = x_label_text
+        self.y_label_text = y_label_text
+        self.bg_color = bg_color
+        self.axis_color = axis_color
+        self.plot_color = plot_color
+        self.text_color = text_color
+        self.grid_color = grid_color
+        self.num_x_ticks = max(0, num_x_ticks)
+        self.num_y_ticks = max(0, num_y_ticks)
+        self.y_tick_format_str: str = "{:.1f}"
+
+        # --- Layout Customization Constants ---
+        self.LAYOUT_GAP_WIDGET_EDGE_TO_Y_TITLE = 1
+        self.LAYOUT_GAP_Y_TITLE_TO_Y_TICKS = 4
+        self.LAYOUT_GAP_Y_TICKS_TO_Y_AXIS_LINE = 5
+        self.LAYOUT_GAP_X_TICK_LABEL_RIGHT_MARGIN = 4
+
+        self.LAYOUT_PLOT_AREA_TOP_MARGIN = 2
+        self.LAYOUT_PLOT_AREA_BOTTOM_MARGIN = 2
+
+        self.LAYOUT_X_TICK_MARK_LENGTH = 5
+        self.LAYOUT_X_TICK_LABEL_MARGIN_FROM_MARK = 2
+        self.LAYOUT_X_AXIS_LABEL_MARGIN_FROM_X_TICK_LABELS = 2
+
+        # Calculate padding based on font sizes and layout constants
+        # Ensure fonts were loaded successfully before using get_height() or size()
+        if not self.axis_label_font or not self.tick_label_font:
+            logger.critical(
+                "PygamePlotter: Essential fonts (axis_label_font or tick_label_font) not loaded. Layout will be incorrect. Raising error."
+            )
+            # This is a critical failure. Application cannot proceed meaningfully.
+            # Alternatively, could try to use Pygame's default font if these are None,
+            # but _load_font_safe should have already done that.
+            # If they are None here, it means even the Pygame default font failed.
+            raise RuntimeError("PygamePlotter critical font loading failure.")
+
+        y_axis_title_width_rotated = self.axis_label_font.get_height()
+
+        example_y_tick_label_str = "1000"
+        if self.y_tick_format_str == "{:.0f}":
+            example_y_tick_label_str = "16383"
+        max_y_tick_label_width = self.tick_label_font.size(example_y_tick_label_str)[0]
+
+        self.padding_left = int(
+            self.LAYOUT_GAP_WIDGET_EDGE_TO_Y_TITLE
+            + y_axis_title_width_rotated
+            + self.LAYOUT_GAP_Y_TITLE_TO_Y_TICKS
+            + max_y_tick_label_width
+            + self.LAYOUT_GAP_Y_TICKS_TO_Y_AXIS_LINE
+        )
+
+        example_x_tick_label_str = "812"
+        max_x_tick_label_width = self.tick_label_font.size(example_x_tick_label_str)[0]
+        self.padding_right = int(
+            (max_x_tick_label_width / 2) + self.LAYOUT_GAP_X_TICK_LABEL_RIGHT_MARGIN
+        )
+
+        self.padding_top = int(
+            (self.tick_label_font.get_height() / 2) + self.LAYOUT_PLOT_AREA_TOP_MARGIN
+        )
+
+        self.padding_bottom = int(
+            self.LAYOUT_X_TICK_MARK_LENGTH
+            + self.LAYOUT_X_TICK_LABEL_MARGIN_FROM_MARK
+            + self.tick_label_font.get_height()
+            + self.LAYOUT_X_AXIS_LABEL_MARGIN_FROM_X_TICK_LABELS
+            + self.axis_label_font.get_height()
+            + self.LAYOUT_PLOT_AREA_BOTTOM_MARGIN
+        )
+
+        self.graph_area = pygame.Rect(
+            self.plot_widget_rect.left + self.padding_left,
+            self.plot_widget_rect.top + self.padding_top,
+            max(
+                20, self.plot_widget_rect.width - self.padding_left - self.padding_right
+            ),
+            max(
+                20,
+                self.plot_widget_rect.height - self.padding_top - self.padding_bottom,
+            ),
+        )
+
+        if self.graph_area.width < 20 or self.graph_area.height < 20:
+            logger.warning(
+                f"PygamePlotter: Graph area {self.graph_area} is very small. "
+                f"Widget: {self.plot_widget_rect}, Paddings LTRB: {self.padding_left}, "
+                f"{self.padding_right}, {self.padding_top}, {self.padding_bottom}."
+            )
+
+        self.x_data_static: np.ndarray | None = None
+        self.y_data_current: np.ndarray | None = None
+        self.screen_x_coords_static: list[float] = []
+
+        self.x_min_val: float = 0.0
+        self.x_max_val: float = 1.0
+        self.y_min_val_display: float = 0.0
+        self.y_max_val_display: float = 1.0
+
+        self._bg_surface: pygame.Surface = pygame.Surface(self.plot_widget_rect.size)
+        self._static_x_elements_surface: pygame.Surface = pygame.Surface(
+            self.plot_widget_rect.size, pygame.SRCALPHA
+        )
+        self._dynamic_y_elements_surface: pygame.Surface = pygame.Surface(
+            self.plot_widget_rect.size, pygame.SRCALPHA
+        )
+        self._plot_line_surface: pygame.Surface = pygame.Surface(
+            self.plot_widget_rect.size, pygame.SRCALPHA
+        )
+
+        self._needs_render_bg = True
+        self._needs_render_static_x = True
+        self._needs_render_dynamic_y = True
+        self._needs_render_plot_line = True
+
+        if initial_x_data is not None and len(initial_x_data) > 0:
+            self.set_x_data_static(initial_x_data)
+        else:
+            self.set_x_data_static(np.array([0.0, 1.0]))
+            logger.debug("PygamePlotter: Initialized with dummy X data.")
+
+        self._render_background()
+        self._render_static_x_elements()
+        self._render_dynamic_y_elements()
+        self._render_plot_line()
+
+    def set_y_tick_format(self, format_str: str):
+        """Sets the format string for Y-axis tick labels (e.g., '{:.0f}', '{:.2f}')."""
+        assert isinstance(format_str, str), "Format string must be a string."
+        if self.y_tick_format_str != format_str:
+            self.y_tick_format_str = format_str
+            self._needs_render_dynamic_y = True
+
+    def _map_value(
+        self,
+        value: float,
+        from_min: float,
+        from_max: float,
+        to_min: float,
+        to_max: float,
+    ) -> float:
+        assert (
+            from_max >= from_min
+        ), f"from_max ({from_max}) must be >= from_min ({from_min})"
+        if (from_max - from_min) == 0:
+            return to_min
+        return to_min + (value - from_min) * (to_max - to_min) / (from_max - from_min)
+
+    def set_x_data_static(self, x_data: np.ndarray):
+        assert (
+            isinstance(x_data, np.ndarray) and x_data.ndim == 1 and len(x_data) > 0
+        ), "Invalid static X data"
+        self.x_data_static = x_data.copy()
+        self.x_min_val = float(np.min(self.x_data_static))
+        self.x_max_val = float(np.max(self.x_data_static))
+        if self.x_max_val == self.x_min_val:
+            self.x_max_val = self.x_min_val + 1.0
+
+        self._precalculate_screen_x_coords()
+        self._needs_render_static_x = True
+
+    def _precalculate_screen_x_coords(self):
+        self.screen_x_coords_static = []
+        if (
+            self.x_data_static is None
+            or len(self.x_data_static) == 0
+            or self.graph_area.width <= 0
+        ):
+            return
+
+        for val in self.x_data_static:
+            self.screen_x_coords_static.append(
+                self._map_value(
+                    val,
+                    self.x_min_val,
+                    self.x_max_val,
+                    float(self.graph_area.left),
+                    float(self.graph_area.right),
+                )
+            )
+
+    def set_y_data(self, y_data: np.ndarray | None):
+        if y_data is not None:
+            assert isinstance(y_data, np.ndarray) and y_data.ndim == 1, "Invalid Y data"
+            if self.x_data_static is not None and len(y_data) != len(
+                self.x_data_static
+            ):
+                logger.error(
+                    f"PygamePlotter: Y data length ({len(y_data)}) "
+                    f"mismatches X data ({len(self.x_data_static)}). Plotting skipped."
+                )
+                self.y_data_current = None
+            else:
+                self.y_data_current = y_data.copy()
+        else:
+            self.y_data_current = None
+        self._needs_render_plot_line = True
+
+    def set_y_limits(self, y_min: float, y_max: float):
+        assert isinstance(y_min, (int, float)) and isinstance(
+            y_max, (int, float)
+        ), "Y limits must be numeric"
+        y_min_f, y_max_f = float(y_min), float(y_max)
+
+        if y_max_f == y_min_f:
+            y_max_f = y_min_f + 1.0
+        if y_max_f < y_min_f:
+            logger.warning(
+                f"PygamePlotter: Y_max {y_max_f} < Y_min {y_min_f}. Swapping."
+            )
+            y_min_f, y_max_f = y_max_f, y_min_f
+
+        if self.y_min_val_display != y_min_f or self.y_max_val_display != y_max_f:
+            self.y_min_val_display = y_min_f
+            self.y_max_val_display = y_max_f
+            self._needs_render_dynamic_y = True
+            self._needs_render_plot_line = True
+
+    def set_y_label(self, label: str):
+        assert isinstance(label, str), "Y label must be a string"
+        if self.y_label_text != label:
+            self.y_label_text = label
+            self._needs_render_dynamic_y = True
+
+    def _render_background(self):
+        if not self._needs_render_bg:
+            return
+        self._bg_surface.fill(self.bg_color)
+        self._needs_render_bg = False
+
+    def _render_static_x_elements(self):
+        if not self._needs_render_static_x:
+            return
+        self._static_x_elements_surface.fill((0, 0, 0, 0))
+
+        if (
+            self.x_data_static is None
+            or self.axis_label_font is None  # Added check
+            or self.tick_label_font is None  # Added check
+            or self.graph_area.width <= 0
+            or self.graph_area.height <= 0
+        ):
+            self._needs_render_static_x = False
+            return
+
+        graph_left_rel = self.graph_area.left - self.plot_widget_rect.left
+        graph_right_rel = self.graph_area.right - self.plot_widget_rect.left
+        graph_bottom_rel = self.graph_area.bottom - self.plot_widget_rect.top
+
+        pygame.draw.line(
+            self._static_x_elements_surface,
+            self.axis_color,
+            (graph_left_rel, graph_bottom_rel),
+            (graph_right_rel, graph_bottom_rel),
+            1,
+        )
+
+        if self.num_x_ticks > 0 and self.x_max_val > self.x_min_val:
+            tick_values = np.linspace(
+                self.x_min_val, self.x_max_val, self.num_x_ticks + 1
+            )
+            for val in tick_values:
+                x_pos_rel = self._map_value(
+                    val, self.x_min_val, self.x_max_val, graph_left_rel, graph_right_rel
+                )
+                pygame.draw.line(
+                    self._static_x_elements_surface,
+                    self.axis_color,
+                    (x_pos_rel, graph_bottom_rel),
+                    (x_pos_rel, graph_bottom_rel + self.LAYOUT_X_TICK_MARK_LENGTH),
+                    1,
+                )
+                try:
+                    label_surf = self.tick_label_font.render(
+                        f"{val:.0f}", True, self.text_color
+                    )
+                    tick_label_top_y = (
+                        graph_bottom_rel
+                        + self.LAYOUT_X_TICK_MARK_LENGTH
+                        + self.LAYOUT_X_TICK_LABEL_MARGIN_FROM_MARK
+                    )
+                    self._static_x_elements_surface.blit(
+                        label_surf,
+                        label_surf.get_rect(centerx=x_pos_rel, top=tick_label_top_y),
+                    )
+                except pygame.error as e:
+                    logger.error(f"PygamePlotter: Error rendering X tick label: {e}")
+                except Exception as e_render:
+                    logger.error(
+                        f"PygamePlotter: Unexpected error rendering X tick label: {e_render}"
+                    )
+
+        if self.x_label_text:
+            try:
+                label_surf = self.axis_label_font.render(
+                    self.x_label_text, True, self.text_color
+                )
+                center_x_rel = graph_left_rel + (graph_right_rel - graph_left_rel) / 2
+                x_axis_label_top_y = (
+                    graph_bottom_rel
+                    + self.LAYOUT_X_TICK_MARK_LENGTH
+                    + self.LAYOUT_X_TICK_LABEL_MARGIN_FROM_MARK
+                    + self.tick_label_font.get_height()
+                    + self.LAYOUT_X_AXIS_LABEL_MARGIN_FROM_X_TICK_LABELS
+                )
+                self._static_x_elements_surface.blit(
+                    label_surf,
+                    label_surf.get_rect(centerx=center_x_rel, top=x_axis_label_top_y),
+                )
+            except pygame.error as e:
+                logger.error(f"PygamePlotter: Error rendering X axis title: {e}")
+            except Exception as e_render:
+                logger.error(
+                    f"PygamePlotter: Unexpected error rendering X axis title: {e_render}"
+                )
+
+        self._needs_render_static_x = False
+
+    def _render_dynamic_y_elements(self):
+        if not self._needs_render_dynamic_y:
+            return
+        self._dynamic_y_elements_surface.fill((0, 0, 0, 0))
+
+        if (
+            self.axis_label_font is None  # Added check
+            or self.tick_label_font is None  # Added check
+            or self.graph_area.width <= 0
+            or self.graph_area.height <= 0
+        ):
+            self._needs_render_dynamic_y = False
+            return
+
+        graph_left_rel = self.graph_area.left - self.plot_widget_rect.left
+        graph_right_rel = self.graph_area.right - self.plot_widget_rect.left
+        graph_bottom_rel = self.graph_area.bottom - self.plot_widget_rect.top
+        graph_top_rel = self.graph_area.top - self.plot_widget_rect.top
+
+        pygame.draw.line(
+            self._dynamic_y_elements_surface,
+            self.axis_color,
+            (graph_left_rel, graph_top_rel),
+            (graph_left_rel, graph_bottom_rel),
+            1,
+        )
+
+        if self.num_y_ticks > 0 and self.y_max_val_display > self.y_min_val_display:
+            tick_values = np.linspace(
+                self.y_min_val_display, self.y_max_val_display, self.num_y_ticks + 1
+            )
+            for val in tick_values:
+                y_pos_rel = self._map_value(
+                    val,
+                    self.y_min_val_display,
+                    self.y_max_val_display,
+                    graph_bottom_rel,
+                    graph_top_rel,
+                )
+                pygame.draw.line(
+                    self._dynamic_y_elements_surface,
+                    self.axis_color,
+                    (graph_left_rel - 5, y_pos_rel),
+                    (graph_left_rel, y_pos_rel),
+                    1,
+                )
+                pygame.draw.line(
+                    self._dynamic_y_elements_surface,
+                    self.grid_color,
+                    (graph_left_rel + 1, y_pos_rel),
+                    (graph_right_rel, y_pos_rel),
+                    1,
+                )
+                try:
+                    label_str = self.y_tick_format_str.format(val)
+                    label_surf = self.tick_label_font.render(
+                        label_str, True, self.text_color
+                    )
+                    tick_label_right_x = (
+                        graph_left_rel - self.LAYOUT_GAP_Y_TICKS_TO_Y_AXIS_LINE
+                    )
+                    self._dynamic_y_elements_surface.blit(
+                        label_surf,
+                        label_surf.get_rect(
+                            right=tick_label_right_x, centery=y_pos_rel
+                        ),
+                    )
+                except pygame.error as e:
+                    logger.error(f"PygamePlotter: Error rendering Y tick label: {e}")
+                except (ValueError, TypeError) as e_fmt:
+                    logger.error(
+                        f"PygamePlotter: Invalid Y tick format ('{self.y_tick_format_str}') or value ({val}): {e_fmt}"
+                    )
+                except Exception as e_render:
+                    logger.error(
+                        f"PygamePlotter: Unexpected error rendering Y tick label: {e_render}"
+                    )
+
+        if self.y_label_text:
+            try:
+                label_surf_orig = self.axis_label_font.render(
+                    self.y_label_text, True, self.text_color
+                )
+                label_surf_rotated = pygame.transform.rotate(label_surf_orig, 90)
+                title_center_x_rel = self.LAYOUT_GAP_WIDGET_EDGE_TO_Y_TITLE + (
+                    self.axis_label_font.get_height() / 2
+                )
+                title_center_y_rel = (
+                    graph_top_rel + (graph_bottom_rel - graph_top_rel) / 2
+                )
+                self._dynamic_y_elements_surface.blit(
+                    label_surf_rotated,
+                    label_surf_rotated.get_rect(
+                        centerx=title_center_x_rel, centery=title_center_y_rel
+                    ),
+                )
+            except pygame.error as e:
+                logger.error(f"PygamePlotter: Error rendering Y axis title: {e}")
+            except Exception as e_render:
+                logger.error(
+                    f"PygamePlotter: Unexpected error rendering Y axis title: {e_render}"
+                )
+
+        self._needs_render_dynamic_y = False
+
+    def _render_plot_line(self):
+        if not self._needs_render_plot_line:
+            return
+        self._plot_line_surface.fill((0, 0, 0, 0))
+
+        if (
+            self.x_data_static is None
+            or self.y_data_current is None
+            or len(self.screen_x_coords_static) == 0
+            or len(self.y_data_current) == 0
+            or len(self.screen_x_coords_static) != len(self.y_data_current)
+            or self.graph_area.width <= 0
+            or self.graph_area.height <= 0
+            or self.y_max_val_display == self.y_min_val_display
+        ):
+            self._needs_render_plot_line = False
+            return
+
+        points_for_drawing_rel: list[tuple[float, float]] = []
+        num_points_to_plot = min(
+            len(self.screen_x_coords_static), len(self.y_data_current)
+        )
+
+        for i in range(num_points_to_plot):
+            sx_rel = self.screen_x_coords_static[i] - self.plot_widget_rect.left
+            sy_abs = self._map_value(
+                self.y_data_current[i],
+                self.y_min_val_display,
+                self.y_max_val_display,
+                float(self.graph_area.bottom),
+                float(self.graph_area.top),
+            )
+            sy_abs_clipped = max(
+                self.graph_area.top, min(self.graph_area.bottom, sy_abs)
+            )
+            sy_rel = sy_abs_clipped - self.plot_widget_rect.top
+            points_for_drawing_rel.append((sx_rel, sy_rel))
+
+        if len(points_for_drawing_rel) > 1:
+            clip_rect_rel = pygame.Rect(
+                self.graph_area.left - self.plot_widget_rect.left,
+                self.graph_area.top - self.plot_widget_rect.top,
+                self.graph_area.width,
+                self.graph_area.height,
+            )
+            try:
+                self._plot_line_surface.set_clip(clip_rect_rel)
+                pygame.draw.lines(
+                    self._plot_line_surface,
+                    self.plot_color,
+                    False,
+                    points_for_drawing_rel,
+                    1,
+                )
+            except Exception as e:
+                logger.error(f"PygamePlotter: Error during pygame.draw.lines: {e}")
+            finally:
+                self._plot_line_surface.set_clip(None)
+
+        self._needs_render_plot_line = False
+
+    def draw(self):
+        """Draws the plot onto the parent surface."""
+        if self._needs_render_bg:
+            self._render_background()
+        if self._needs_render_static_x:
+            self._render_static_x_elements()
+        if self._needs_render_dynamic_y:
+            self._render_dynamic_y_elements()
+        if self._needs_render_plot_line:
+            self._render_plot_line()
+
+        self.parent_surface.blit(self._bg_surface, self.plot_widget_rect.topleft)
+        self.parent_surface.blit(
+            self._static_x_elements_surface, self.plot_widget_rect.topleft
+        )
+        self.parent_surface.blit(
+            self._dynamic_y_elements_surface, self.plot_widget_rect.topleft
+        )
+        self.parent_surface.blit(self._plot_line_surface, self.plot_widget_rect.topleft)
 
 
 class SpectrometerScreen:
     """
     Handles the spectrometer live view, capture, saving, and state management.
     Calibration (Dark/White/Auto-Integration) follows a setup-run-confirm/save model.
+    Uses PygamePlotter for live plotting.
     """
 
     # --- Internal State Flags ---
@@ -1709,7 +2273,7 @@ class SpectrometerScreen:
         screen: pygame.Surface,
         button_handler: ButtonHandler,
         menu_system: MenuSystem,
-        display_hat_obj,
+        display_hat_obj,  # Can be None
         temp_sensor_info: TempSensorInfo,
     ):
         assert (
@@ -1738,21 +2302,85 @@ class SpectrometerScreen:
             AUTO_INTEG_TARGET_HIGH_PERCENT / 100.0
         )
 
-        if USE_SPECTROMETER:  # Only initialise if config flag is True
+        if USE_SPECTROMETER:
             self._initialize_spectrometer_device()
         else:
             logger.info(
                 "SpectrometerScreen: USE_SPECTROMETER is False, skipping device initialization."
             )
 
-        self.plot_fig, self.plot_ax, self.plot_line = None, None, None
-        if (
-            USE_SPECTROMETER
-        ):  # Plotting is only relevant if spectrometer is intended to be used
-            self._initialize_plot()
+        self.pygame_plotter: PygamePlotter | None = None
 
+        # Initialize font attributes
         self.overlay_font: pygame.font.Font | None = None
-        self._load_overlay_font()  # Font is always needed for status messages
+        self.spectro_hint_font: pygame.font.Font | None = (
+            None  # NEW attribute for hint font
+        )
+        self._load_spectro_screen_fonts()  # MODIFIED: Call new font loading method
+
+        if self.overlay_font is None:  # Check for the general overlay font
+            logger.critical(
+                "SpectrometerScreen: General overlay font (overlay_font) failed to load. Overlays will be impaired."
+            )
+            # Fallback for overlay_font if critical
+            if pygame.font.get_init():
+                try:
+                    self.overlay_font = pygame.font.SysFont(None, SPECTRO_FONT_SIZE)
+                    if not self.overlay_font:
+                        raise RuntimeError(
+                            "SysFont(None) for overlay_font also failed."
+                        )
+                except Exception as e_font_final_fallback:
+                    logger.critical(
+                        f"Final fallback for overlay_font failed: {e_font_final_fallback}"
+                    )
+                    self.overlay_font = None  # Ensure it's None
+            else:
+                logger.critical(
+                    "Pygame font module not initialized, cannot create any font."
+                )
+
+        # Log if hint font specifically failed
+        if self.spectro_hint_font is None:
+            logger.warning(
+                "SpectrometerScreen: Hint font (spectro_hint_font) failed to load. Hints on this screen might be missing or use fallback."
+            )
+
+        plot_widget_top_margin = 25
+        plot_widget_bottom_margin = 25
+        plot_widget_horizontal_margin = 5
+        plot_widget_height = (
+            SCREEN_HEIGHT - plot_widget_top_margin - plot_widget_bottom_margin
+        )
+
+        # PygamePlotter initialization does NOT depend on self.overlay_font
+        # It loads its own fonts based on PLOTTER_... global constants
+        plot_display_rect = pygame.Rect(
+            plot_widget_horizontal_margin,
+            plot_widget_top_margin,
+            SCREEN_WIDTH - (2 * plot_widget_horizontal_margin),
+            plot_widget_height,
+        )
+        if (
+            plot_display_rect.width > 20 and plot_display_rect.height > 20
+        ):  # Min sensible size
+            self.pygame_plotter = PygamePlotter(
+                parent_surface=self.screen,
+                plot_widget_rect=plot_display_rect,
+                initial_x_data=self.wavelengths,
+                # No font argument passed here, PygamePlotter handles its own
+                x_label_text="Wavelength (nm)",
+                y_label_text="Intensity",
+                plot_color=YELLOW,
+            )
+            if self.wavelengths is None and self.pygame_plotter:
+                logger.warning(
+                    "SpectrometerScreen: PygamePlotter initialized without initial wavelengths."
+                )
+        else:
+            logger.error(
+                f"SpectrometerScreen: Cannot initialize PygamePlotter, plot_display_rect too small: {plot_display_rect}"
+            )
 
         self.is_active = False
         self._current_state = self.STATE_LIVE_VIEW
@@ -1765,7 +2393,7 @@ class SpectrometerScreen:
         self._frozen_capture_type: str | None = None
         self._frozen_sample_collection_mode: str | None = None
 
-        self._current_y_max: float = float(Y_AXIS_DEFAULT_MAX)
+        self._current_y_max_for_plot: float = float(Y_AXIS_DEFAULT_MAX)
         self._scans_today_count: int = 0
 
         self._auto_integ_optimizing: bool = False
@@ -1782,9 +2410,6 @@ class SpectrometerScreen:
         self._white_reference_integration_ms: int | None = None
         self._raw_target_intensities_for_reflectance: np.ndarray | None = None
 
-        # DATA_DIR creation for scan counts needs to happen even if spec is not ready,
-        # as _scans_today_count is initialized based on existing files.
-        # This is okay, as it doesn't imply saving new spectra yet.
         try:
             os.makedirs(DATA_DIR, exist_ok=True)
         except OSError as e:
@@ -1793,9 +2418,8 @@ class SpectrometerScreen:
             logger.error(f"Unexpected error creating data dir {DATA_DIR}: {e_mkdir}")
 
     def _initialize_spectrometer_device(self):
-        # This method is only called if USE_SPECTROMETER is True
         logger.info("SpectrometerScreen: Initializing spectrometer device...")
-        if sb is None or Spectrometer is None:  # Check if libraries loaded
+        if sb is None or Spectrometer is None:
             logger.error(
                 "SpectrometerScreen: Seabreeze libraries not loaded. Cannot initialize device."
             )
@@ -1808,7 +2432,6 @@ class SpectrometerScreen:
                 self.spectrometer = None
                 return
 
-            # Attempt to connect to the first device
             self.spectrometer = Spectrometer.from_serial_number(
                 devices[0].serial_number
             )
@@ -1824,7 +2447,8 @@ class SpectrometerScreen:
                 logger.error(
                     "SpectrometerScreen: Failed to get wavelengths from device."
                 )
-                self.spectrometer.close()  # Close if wavelengths fail
+                if self.spectrometer:
+                    self.spectrometer.close()
                 self.spectrometer = None
                 return
 
@@ -1840,7 +2464,6 @@ class SpectrometerScreen:
                 f"  Wavelengths: {self.wavelengths[0]:.1f} to {self.wavelengths[-1]:.1f} nm ({len(self.wavelengths)} points)"
             )
 
-            # Query and update hardware limits
             try:
                 min_us, max_us = self.spectrometer.integration_time_micros_limits
                 self._hw_min_integration_us = int(min_us)
@@ -1850,24 +2473,12 @@ class SpectrometerScreen:
                 )
             except (AttributeError, TypeError, ValueError) as e_limits:
                 logger.warning(
-                    f"  Could not query device integration limits ({e_limits}). Using configured defaults: {self._hw_min_integration_us} µs - {self._hw_max_integration_us} µs."
+                    f"  Could not query device integration limits ({e_limits}). Using configured defaults."
                 )
 
-            try:  # Try to get max intensity (ADC max)
-                # Seabreeze API doesn't have a standard way for max_intensity for all devices.
-                # pyseabreeze specific backends might store it, e.g., `self.spectrometer._dev.max_intensity`
-                # For now, we rely on the configured SPECTROMETER_MAX_ADC_COUNT
-                # If a device-specific way is found, it can be used to update self._hw_max_intensity_adc here.
-                # Example: if hasattr(self.spectrometer._dev, 'max_intensity'): self._hw_max_intensity_adc = self.spectrometer._dev.max_intensity
-                logger.info(
-                    f"  Using configured max ADC count: {self._hw_max_intensity_adc}."
-                )
-            except Exception as e_max_adc:
-                logger.warning(
-                    f"  Could not determine device max ADC count ({e_max_adc}). Using configured: {self._hw_max_intensity_adc}"
-                )
-
-            # Recalculate auto-integration target counts based on potentially updated _hw_max_intensity_adc
+            logger.info(
+                f"  Using configured max ADC count: {self._hw_max_intensity_adc}."
+            )
             self._auto_integ_target_low_counts = float(
                 self._hw_max_intensity_adc * (AUTO_INTEG_TARGET_LOW_PERCENT / 100.0)
             )
@@ -1877,15 +2488,11 @@ class SpectrometerScreen:
             logger.info(
                 f"  Auto-integration target ADC range: {self._auto_integ_target_low_counts:.0f} - {self._auto_integ_target_high_counts:.0f}"
             )
-
-            # Check for integration time increment (step size)
-            # This is not a standard Seabreeze API feature. Some devices might have it.
-            # For now, using configured SPECTROMETER_INTEGRATION_TIME_BASE_US for _hw_integration_time_increment_us
             logger.info(
                 f"  Using configured integration time base/increment: {self._hw_integration_time_increment_us} µs."
             )
 
-        except sb.SeaBreezeError as e_sb:
+        except sb.SeaBreezeError as e_sb:  # type: ignore
             logger.error(f"SeaBreezeError initializing device: {e_sb}", exc_info=True)
             self.spectrometer = None
         except Exception as e:
@@ -1893,99 +2500,84 @@ class SpectrometerScreen:
             self.spectrometer = None
 
     def _is_spectrometer_ready(self) -> bool:
-        """Helper to check if the spectrometer hardware is truly ready for operations."""
-        if not USE_SPECTROMETER:  # Global config check first
+        if not USE_SPECTROMETER:
             return False
         if self.spectrometer is None:
             return False
         dev_proxy = getattr(self.spectrometer, "_dev", None)
         if dev_proxy is None or not hasattr(dev_proxy, "is_open"):
             return False
-        # Wavelengths must also be loaded for most operations
         return (
             dev_proxy.is_open
             and self.wavelengths is not None
             and self.wavelengths.size > 0
         )
 
-    def _initialize_plot(self):
-        if plt is None:
-            logger.error("Matplotlib unavailable. Cannot init plot.")
-            return
-        logger.debug("Initializing Matplotlib plot for SpectrometerScreen...")
-        try:
-            plot_w_px, plot_h_px = SCREEN_WIDTH, SCREEN_HEIGHT - 45
-            dpi = float(self.screen.get_width() / 3.33) if self.screen else 96.0
-            fig_w_in, fig_h_in = plot_w_px / dpi, plot_h_px / dpi
-            assert fig_w_in > 0 and fig_h_in > 0
-            self.plot_fig, self.plot_ax = plt.subplots(
-                figsize=(fig_w_in, fig_h_in), dpi=dpi
-            )
-            if not self.plot_fig or not self.plot_ax:
-                raise RuntimeError("plt.subplots failed.")
-            (self.plot_line,) = self.plot_ax.plot([], [], linewidth=1.0, color="cyan")
-            if not self.plot_line:
-                raise RuntimeError("plot_ax.plot failed.")
-            self.plot_ax.grid(True, linestyle=":", alpha=0.6, color="gray")
-            self.plot_ax.tick_params(
-                axis="both", which="major", labelsize=8, colors="white"
-            )
-            self.plot_ax.set_xlabel("Wavelength (nm)", fontsize=9, color="white")
-            self.plot_ax.set_ylabel("Intensity", fontsize=9, color="white")
-            self.plot_fig.patch.set_facecolor("black")
-            self.plot_ax.set_facecolor("black")
-            for spine in ["top", "bottom", "left", "right"]:
-                self.plot_ax.spines[spine].set_color("gray")
-            self.plot_fig.tight_layout(pad=0.3)
-            logger.debug("Matplotlib plot initialized successfully.")
-        except Exception as e:
-            logger.error(f"Failed to initialize Matplotlib plot: {e}", exc_info=True)
-            if self.plot_fig and plt and plt.fignum_exists(self.plot_fig.number):
-                plt.close(self.plot_fig)
-            self.plot_fig = self.plot_ax = self.plot_line = None
-
-    def _load_overlay_font(self):
+    def _load_spectro_screen_fonts(self):
         if not pygame.font.get_init():
             pygame.font.init()
-            logger.info("Pygame font module initialized for overlay_font.")
-        assert pygame.font.get_init(), "Pygame font module failed to initialize."
+        assert (
+            pygame.font.get_init()
+        ), "Pygame font module failed to initialize for SpectrometerScreen fonts."
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        assets_dir = os.path.join(script_dir, "assets")
+
+        # 1. Load the general overlay font
         try:
-            font_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "assets",
-                SPECTRO_FONT_FILENAME,
-            )
-            if not os.path.isfile(font_path):
-                logger.warning(
-                    f"Overlay font file not found: '{font_path}'. Using SysFont."
+            overlay_font_path = os.path.join(assets_dir, SPECTRO_FONT_FILENAME)
+            self.overlay_font = _load_font_safe(overlay_font_path, SPECTRO_FONT_SIZE)
+            if self.overlay_font:
+                logger.info(
+                    f"SpectrometerScreen: Loaded overlay font: {SPECTRO_FONT_FILENAME} (Size: {SPECTRO_FONT_SIZE})"
                 )
-                self.overlay_font = pygame.font.SysFont(None, SPECTRO_FONT_SIZE)
-            else:
-                self.overlay_font = pygame.font.Font(font_path, SPECTRO_FONT_SIZE)
-            if not self.overlay_font:
-                raise RuntimeError("Font loading returned None.")
-            logger.info(
-                f"Loaded overlay font: {SPECTRO_FONT_FILENAME} (Size: {SPECTRO_FONT_SIZE})"
-            )
+            else:  # Should be caught by _load_font_safe, but as a safeguard
+                raise RuntimeError(
+                    f"overlay_font still None after _load_font_safe for {SPECTRO_FONT_FILENAME}"
+                )
         except Exception as e:
-            logger.error(f"Error loading overlay font: {e}", exc_info=True)
-            self.overlay_font = (
-                pygame.font.SysFont(None, SPECTRO_FONT_SIZE)
-                if pygame.font.get_init()
-                else None
+            logger.error(
+                f"SpectrometerScreen: Error loading general overlay font: {e}",
+                exc_info=True,
             )
+            # _load_font_safe already tries SysFont, so if it's None here, it's a critical failure for this font.
+            # self.overlay_font will remain None or be what _load_font_safe returned (potentially Pygame default).
+
+        # 2. Load the specific hint font for SpectrometerScreen
+        try:
+            hint_font_path = os.path.join(
+                assets_dir, HINT_FONT_FILENAME
+            )  # Uses HINT_FONT_FILENAME
+            self.spectro_hint_font = _load_font_safe(
+                hint_font_path, HINT_FONT_SIZE
+            )  # Uses HINT_FONT_SIZE
+            if self.spectro_hint_font:
+                logger.info(
+                    f"SpectrometerScreen: Loaded hint font: {HINT_FONT_FILENAME} (Size: {HINT_FONT_SIZE})"
+                )
+            else:  # Safeguard
+                raise RuntimeError(
+                    f"spectro_hint_font still None after _load_font_safe for {HINT_FONT_FILENAME}"
+                )
+        except Exception as e:
+            logger.error(
+                f"SpectrometerScreen: Error loading hint font: {e}", exc_info=True
+            )
+            # self.spectro_hint_font will remain None or be Pygame default from _load_font_safe.
+            # If it's critical for hints to always appear, more aggressive fallback or error handling here.
+            # For now, if it fails, hints might not draw or draw with a Pygame default.
 
     def _clear_frozen_data(self):
-        self._frozen_intensities = self._frozen_wavelengths = self._frozen_timestamp = (
-            None
-        )
-        self._frozen_integration_ms = self._frozen_capture_type = (
-            self._frozen_sample_collection_mode
-        ) = None
+        self._frozen_intensities = None
+        self._frozen_wavelengths = None
+        self._frozen_timestamp = None
+        self._frozen_integration_ms = None
+        self._frozen_capture_type = None
+        self._frozen_sample_collection_mode = None
+        self._raw_target_intensities_for_reflectance = None
         logger.debug("Cleared all frozen spectrum data.")
 
     def _cancel_auto_integration(self):
-        """Resets all auto-integration related state variables."""
         logger.debug("Cancelling and resetting auto-integration variables.")
         self._auto_integ_optimizing = False
         self._current_auto_integ_us = 0
@@ -1994,23 +2586,14 @@ class SpectrometerScreen:
         self._auto_integ_status_msg = ""
         self._last_peak_adc_value = 0.0
         self._previous_integ_adjustment_direction = 0
-        # Clear any spectrum data that might have been stored for confirm state display
         if self._frozen_capture_type == self.FROZEN_TYPE_AUTO_INTEG_RESULT:
             self._clear_frozen_data()
 
-    def _are_references_valid_for_reflectance(
-        self,
-    ) -> tuple[bool, str]:  # ADDED THIS MISSING METHOD
-        """Checks if stored Dark and White references are suitable for calculating live reflectance."""
+    def _are_references_valid_for_reflectance(self) -> tuple[bool, str]:
         assert (
             self.menu_system is not None
         ), "MenuSystem not available for reference validation"
-        # Wavelengths check is implicitly handled by checking array lengths against self.wavelengths if needed
-        # For now, we assume self.wavelengths is valid if spectrometer is initialized.
-
         current_integ_ms = self.menu_system.get_integration_time_ms()
-        # Default hint part, specific messages will be built by _draw_overlays
-        # This method just signals validity and a general reason type.
 
         dark_ok = False
         if (
@@ -2037,7 +2620,6 @@ class SpectrometerScreen:
         if not white_ok:
             return False, "No White ref"
 
-        # Both references exist, now check integration times
         dark_integ_ok = self._dark_reference_integration_ms == current_integ_ms
         white_integ_ok = self._white_reference_integration_ms == current_integ_ms
 
@@ -2047,8 +2629,34 @@ class SpectrometerScreen:
             return False, "Integ mismatch Dark"
         if not white_integ_ok:
             return False, "Integ mismatch White"
+        return True, ""
 
-        return True, ""  # All good
+    def _set_plotter_view_for_raw(self, y_label_override: str | None = None):
+        """Helper to configure PygamePlotter for a raw intensity view."""
+        self._current_y_max_for_plot = float(Y_AXIS_DEFAULT_MAX)
+        if self.pygame_plotter:
+            self.pygame_plotter.set_y_label(y_label_override or "Intensity (Counts)")
+            self.pygame_plotter.set_y_tick_format("{:.0f}")
+            self.pygame_plotter.set_y_limits(0, self._current_y_max_for_plot)
+
+    def _set_plotter_view_for_reflectance(self):
+        """Helper to configure PygamePlotter for a reflectance view."""
+        self._current_y_max_for_plot = float(Y_AXIS_REFLECTANCE_DEFAULT_MAX)
+        if self.pygame_plotter:
+            self.pygame_plotter.set_y_label("Reflectance")
+            self.pygame_plotter.set_y_tick_format(
+                "{:.1f}"
+            )  # Or {:.2f} if more precision desired
+            self.pygame_plotter.set_y_limits(0, self._current_y_max_for_plot)
+
+    def _set_plotter_view_for_live_mode(self):
+        """Configures plotter based on the current collection mode in MenuSystem."""
+        assert self.menu_system is not None
+        mode = self.menu_system.get_collection_mode()
+        if mode == MODE_REFLECTANCE:
+            self._set_plotter_view_for_reflectance()
+        else:  # MODE_RAW or other defaults
+            self._set_plotter_view_for_raw()
 
     def activate(self):
         logger.info("Activating Spectrometer Screen.")
@@ -2057,40 +2665,34 @@ class SpectrometerScreen:
         self._clear_frozen_data()
         self._cancel_auto_integration()
 
-        current_menu_mode = self.menu_system.get_collection_mode()
-        if (
-            self._current_state == self.STATE_LIVE_VIEW
-            and current_menu_mode == MODE_REFLECTANCE
-        ):
-            self._current_y_max = float(
-                Y_AXIS_REFLECTANCE_DEFAULT_MAX
-            )  # Default for reflectance
-        else:
-            self._current_y_max = float(Y_AXIS_DEFAULT_MAX)
+        if self.pygame_plotter and self.wavelengths is not None:
+            self.pygame_plotter.set_x_data_static(self.wavelengths)
+
+        self._set_plotter_view_for_live_mode()  # Sets Y-label, Y-limits, Y-tick-format
+        if self.pygame_plotter:
+            self.pygame_plotter.set_y_data(None)  # Clear any old data line
+
         logger.debug(
-            f"Activate: Y-axis max set to: {self._current_y_max} for state {self._current_state}, mode {current_menu_mode}"
+            f"Activate: Plotter Y-max set to: {self._current_y_max_for_plot} for state {self._current_state}"
         )
 
-        # Initialize scans_today_count (this part is fine as it reads existing logs)
-        # It does not attempt to save anything yet.
         try:
             dt_now = self.menu_system.get_timestamp_datetime()
             date_str = dt_now.strftime("%Y-%m-%d")
             daily_data_dir = os.path.join(DATA_DIR, date_str)
-            # No need to os.makedirs here in activate if _save_data handles it.
-            # Or, if you want the folder created on entering the screen:
-            # if self._is_spectrometer_ready(): # Only make dir if we might save
-            #     try: os.makedirs(daily_data_dir, exist_ok=True)
-            #     except OSError as e_dir: logger.error(f"Could not create data directory {daily_data_dir}: {e_dir}")
-
             csv_path = os.path.join(daily_data_dir, f"{date_str}_{CSV_BASE_FILENAME}")
             count = 0
-            if os.path.isfile(csv_path):  # Check if file exists before trying to open
+            if os.path.isfile(csv_path):
                 try:
                     with open(csv_path, "r", newline="") as f:
                         reader = csv.reader(f)
-                        next(reader, None)  # Skip header
-                        for row in reader:
+                        next(reader, None)
+                        for row_idx, row in enumerate(reader):
+                            if row_idx > 10000:
+                                logger.warning(
+                                    "Aborted reading scan count, file too large."
+                                )
+                                break
                             if len(row) > 1 and row[1] in [
                                 SPECTRA_TYPE_RAW,
                                 SPECTRA_TYPE_REFLECTANCE,
@@ -2099,14 +2701,6 @@ class SpectrometerScreen:
                     logger.info(
                         f"Found {count} existing OOI scans in today's log: {csv_path}"
                     )
-                except (
-                    FileNotFoundError
-                ):  # Should be caught by isfile, but good practice
-                    logger.info(
-                        f"Log file {csv_path} not found when counting scans (race condition?). Scan count 0."
-                    )
-                except StopIteration:  # Empty file
-                    logger.info(f"Log file {csv_path} is empty or has no header.")
                 except Exception as e_scan_read:
                     logger.error(
                         f"Error reading scan count from {csv_path}: {e_scan_read}",
@@ -2122,8 +2716,7 @@ class SpectrometerScreen:
             self._scans_today_count = 0
         logger.info(f"Scans today initialized to: {self._scans_today_count}")
 
-        # Attempt to open and configure spectrometer if it was initialized
-        if self.spectrometer:  # self.spectrometer is the hardware object from __init__
+        if self.spectrometer:
             try:
                 dev_proxy = getattr(self.spectrometer, "_dev", None)
                 if (
@@ -2131,27 +2724,14 @@ class SpectrometerScreen:
                     and hasattr(dev_proxy, "is_open")
                     and not dev_proxy.is_open
                 ):
-                    logger.info(
-                        f"Opening spectrometer connection: {self.spectrometer.serial_number}"
-                    )
                     self.spectrometer.open()
-                    logger.info("Spectrometer connection opened.")
-                elif dev_proxy and hasattr(dev_proxy, "is_open") and dev_proxy.is_open:
-                    logger.info("Spectrometer connection already open.")
-                # else: # Spectrometer object exists but no _dev or is_open
-                #     logger.warning("Spectrometer object present but seems malformed. Cannot open/configure.")
-                #     return # Cannot proceed with device config
 
-                # Sync integration time only if fully ready (includes being open)
                 if self._is_spectrometer_ready():
                     current_menu_integ_ms = self.menu_system.get_integration_time_ms()
                     integ_us = int(current_menu_integ_ms * 1000)
                     integ_us_clamped = max(
                         self._hw_min_integration_us,
                         min(integ_us, self._hw_max_integration_us),
-                    )
-                    logger.debug(
-                        f"ACTIVATE: Setting integration time to {integ_us_clamped} µs (target {current_menu_integ_ms} ms)"
                     )
                     self.spectrometer.integration_time_micros(integ_us_clamped)
                     self._last_integration_time_ms = current_menu_integ_ms
@@ -2169,7 +2749,7 @@ class SpectrometerScreen:
                 )
         else:
             logger.warning(
-                "SpectrometerScreen.activate: No spectrometer hardware object (self.spectrometer is None). Operations will be limited."
+                "SpectrometerScreen.activate: No spectrometer hardware object. Operations limited."
             )
 
     def deactivate(self):
@@ -2178,44 +2758,43 @@ class SpectrometerScreen:
         self._clear_frozen_data()
         self._cancel_auto_integration()
         self._current_state = self.STATE_LIVE_VIEW
+        if self.pygame_plotter:
+            self.pygame_plotter.set_y_data(None)
 
     def _start_auto_integration_setup(self):
-        """Prepares for auto-integration process."""
         logger.info("Starting Auto-Integration Setup.")
-        self._cancel_auto_integration()  # Reset all auto-integ variables
-        assert (
-            self.menu_system is not None
-        ), "MenuSystem not available for auto-integ setup"
+        self._cancel_auto_integration()
+        assert self.menu_system is not None
         current_menu_integ_ms = self.menu_system.get_integration_time_ms()
         self._current_auto_integ_us = int(current_menu_integ_ms * 1000)
-        # Clamp initial test integration time to hardware limits
         self._current_auto_integ_us = max(
             self._hw_min_integration_us,
             min(self._current_auto_integ_us, self._hw_max_integration_us),
         )
         self._auto_integ_status_msg = "Aim at white ref, then Start"
         self._current_state = self.STATE_AUTO_INTEG_SETUP
-        self._current_y_max = float(Y_AXIS_DEFAULT_MAX)  # Reset Y-axis for raw view
+
+        self._set_plotter_view_for_raw()  # Auto-integ setup always uses raw counts view
+        if self.pygame_plotter:
+            self.pygame_plotter.set_y_data(None)
         logger.debug(
             f"Auto-integ setup: Initial test integ set to {self._current_auto_integ_us} µs."
         )
 
     def handle_input(self) -> str | None:
-        assert self.button_handler is not None
+        assert self.button_handler is not None and self.menu_system is not None
         if (pg_evt_res := self.button_handler.process_pygame_events()) == "QUIT":
             return "QUIT"
 
         action_result: str | None = None
-        # Use our robust check for spectrometer readiness
         spectrometer_can_operate = self._is_spectrometer_ready()
-
         state = self._current_state
-        current_menu_mode = self.menu_system.get_collection_mode()
+        current_menu_mode_on_entry = self.menu_system.get_collection_mode()
 
         if state == self.STATE_LIVE_VIEW:
-            if self.button_handler.check_button(BTN_ENTER):  # A: Freeze Sample
+            if self.button_handler.check_button(BTN_ENTER):
                 if spectrometer_can_operate:
-                    if current_menu_mode == MODE_REFLECTANCE:
+                    if current_menu_mode_on_entry == MODE_REFLECTANCE:
                         valid_refs, _ = self._are_references_valid_for_reflectance()
                         if valid_refs:
                             self._perform_freeze_capture(self.FROZEN_TYPE_OOI)
@@ -2223,139 +2802,295 @@ class SpectrometerScreen:
                             logger.warning(
                                 "Freeze Sample in REFLECTANCE mode ignored: References invalid."
                             )
-                    else:  # MODE_RAW or other modes
+                    else:
                         self._perform_freeze_capture(self.FROZEN_TYPE_OOI)
                 else:
-                    logger.warning(
-                        "Freeze Sample ignored: Spectrometer not ready or not configured."
-                    )
-            elif self.button_handler.check_button(BTN_UP):  # X: Calib Menu
+                    logger.warning("Freeze Sample ignored: Spectrometer not ready.")
+            elif self.button_handler.check_button(BTN_UP):
                 self._current_state = self.STATE_CALIBRATE
-                self._current_y_max = float(Y_AXIS_DEFAULT_MAX)
-                logger.debug(
-                    f"Calib Entry: Y-axis set to {self._current_y_max} for raw display."
-                )
-            elif self.button_handler.check_button(BTN_DOWN):  # Y: Rescale
+                self._set_plotter_view_for_raw()
+            elif self.button_handler.check_button(BTN_DOWN):
                 if spectrometer_can_operate:
-                    self._rescale_y_axis(relative=False)
+                    self._rescale_y_axis()
                 else:
-                    logger.warning(
-                        "Rescale ignored: Spectrometer not ready or not configured."
-                    )
+                    logger.warning("Rescale ignored: Spectrometer not ready.")
             elif self.button_handler.check_button(BTN_BACK):
                 action_result = "BACK_TO_MENU"
 
         elif state == self.STATE_CALIBRATE:
-            if self.button_handler.check_button(BTN_ENTER):  # A: White Setup
+            if self.button_handler.check_button(BTN_ENTER):
                 self._current_state = self.STATE_WHITE_CAPTURE_SETUP
-                self._current_y_max = float(Y_AXIS_DEFAULT_MAX)
-                logger.debug(
-                    f"Entering White Setup: Y-axis set to {self._current_y_max}"
-                )
-            elif self.button_handler.check_button(BTN_UP):  # X: Dark Setup
+                # Plotter view already set for raw by entering CALIBRATE
+            elif self.button_handler.check_button(BTN_UP):
                 self._current_state = self.STATE_DARK_CAPTURE_SETUP
-                self._current_y_max = float(Y_AXIS_DEFAULT_MAX)
-                logger.debug(
-                    f"Entering Dark Setup: Y-axis set to {self._current_y_max}"
-                )
-            elif self.button_handler.check_button(BTN_DOWN):  # Y: Auto-Integ Setup
+            elif self.button_handler.check_button(BTN_DOWN):
                 if spectrometer_can_operate:
                     self._start_auto_integration_setup()
                 else:
-                    logger.warning(
-                        "Auto-Integ Setup ignored: Spectrometer not ready or not configured."
-                    )
+                    logger.warning("Auto-Integ Setup ignored: Spectrometer not ready.")
             elif self.button_handler.check_button(BTN_BACK):
                 self._current_state = self.STATE_LIVE_VIEW
-                # Adjust Y-axis if returning to live reflectance mode and refs are valid
-                if current_menu_mode == MODE_REFLECTANCE:
-                    valid_refs, _ = self._are_references_valid_for_reflectance()
-                    self._current_y_max = (
-                        float(Y_AXIS_REFLECTANCE_DEFAULT_MAX)
-                        if valid_refs
-                        else float(Y_AXIS_DEFAULT_MAX)
-                    )
-                else:  # Raw mode
-                    self._current_y_max = float(Y_AXIS_DEFAULT_MAX)
+                self._set_plotter_view_for_live_mode()
 
         elif state == self.STATE_DARK_CAPTURE_SETUP:
-            if self.button_handler.check_button(BTN_ENTER):  # A: Freeze Dark
+            if self.button_handler.check_button(BTN_ENTER):
                 if spectrometer_can_operate:
                     self._perform_freeze_capture(self.FROZEN_TYPE_DARK)
                 else:
-                    logger.warning(
-                        "Freeze Dark ignored: Spectrometer not ready or not configured."
-                    )
+                    logger.warning("Freeze Dark ignored: Spectrometer not ready.")
             elif self.button_handler.check_button(BTN_BACK):
                 self._current_state = self.STATE_CALIBRATE
+                # Plotter already set for raw
 
         elif state == self.STATE_WHITE_CAPTURE_SETUP:
-            if self.button_handler.check_button(BTN_ENTER):  # A: Freeze White
+            if self.button_handler.check_button(BTN_ENTER):
                 if spectrometer_can_operate:
                     self._perform_freeze_capture(self.FROZEN_TYPE_WHITE)
                 else:
-                    logger.warning(
-                        "Freeze White ignored: Spectrometer not ready or not configured."
-                    )
-            elif self.button_handler.check_button(BTN_DOWN):  # Y: Rescale
+                    logger.warning("Freeze White ignored: Spectrometer not ready.")
+            elif self.button_handler.check_button(BTN_DOWN):
                 if spectrometer_can_operate:
-                    self._rescale_y_axis(relative=False)
+                    self._rescale_y_axis()
                 else:
                     logger.warning(
-                        "Rescale White Setup ignored: Spectrometer not ready or not configured."
+                        "Rescale White Setup ignored: Spectrometer not ready."
                     )
             elif self.button_handler.check_button(BTN_BACK):
                 self._current_state = self.STATE_CALIBRATE
 
         elif state == self.STATE_FROZEN_VIEW:
-            # _frozen_capture_type is only set if a capture was successful
             assert self._frozen_capture_type is not None
-            if self.button_handler.check_button(BTN_ENTER):  # A: Save
+            # Plotter view set by _perform_freeze_capture
+            if self.button_handler.check_button(BTN_ENTER):
                 self._perform_save_frozen_data()
-            elif self.button_handler.check_button(BTN_BACK):  # B: Discard
+            elif self.button_handler.check_button(BTN_BACK):
                 self._perform_discard_frozen_data()
 
         elif state == self.STATE_AUTO_INTEG_SETUP:
-            if self.button_handler.check_button(BTN_ENTER):  # A: Start Auto-Integ
+            # Plotter view set by _start_auto_integration_setup
+            if self.button_handler.check_button(BTN_ENTER):
                 if spectrometer_can_operate:
-                    logger.info("Starting Auto-Integration RUNNING state.")
                     self._auto_integ_optimizing = True
                     self._auto_integ_iteration_count = 0
                     self._auto_integ_status_msg = "Running iteration 1..."
                     self._current_state = self.STATE_AUTO_INTEG_RUNNING
+                    # Y-axis for RUNNING is dynamic, handled in _update_plot_data_for_state
                 else:
-                    logger.warning(
-                        "Start Auto-Integ ignored: Spectrometer not ready or not configured."
-                    )
+                    logger.warning("Start Auto-Integ ignored: Spectrometer not ready.")
             elif self.button_handler.check_button(BTN_BACK):
                 self._cancel_auto_integration()
                 self._current_state = self.STATE_CALIBRATE
+                self._set_plotter_view_for_raw()
 
-        # STATE_AUTO_INTEG_RUNNING and STATE_AUTO_INTEG_CONFIRM are only reachable if spectrometer_can_operate was true
-        # So, their internal logic doesn't need extra checks for this.
         elif state == self.STATE_AUTO_INTEG_RUNNING:
-            if self.button_handler.check_button(BTN_BACK):  # B: Cancel Auto
-                logger.info("Auto-Integration cancelled by user during RUNNING state.")
+            if self.button_handler.check_button(BTN_BACK):
                 self._cancel_auto_integration()
                 self._current_state = self.STATE_CALIBRATE
+                self._set_plotter_view_for_raw()
 
         elif state == self.STATE_AUTO_INTEG_CONFIRM:
-            if self.button_handler.check_button(BTN_ENTER):  # A: Apply
+            # Plotter view set by _transition_to_confirm_pygame (in _run_auto_integration_step)
+            if self.button_handler.check_button(BTN_ENTER):
                 self._apply_auto_integration_result()
-            elif self.button_handler.check_button(BTN_BACK):  # B: Discard/Back
-                logger.info(
-                    "Auto-Integration result discarded by user. Returning to Calibrate Menu."
-                )
+            elif self.button_handler.check_button(BTN_BACK):
                 self._cancel_auto_integration()
                 self._current_state = self.STATE_CALIBRATE
+                self._set_plotter_view_for_raw()
         else:
             logger.error(f"Unhandled input state in SpectrometerScreen: {state}")
             self._current_state = self.STATE_LIVE_VIEW  # Fallback
+            self._set_plotter_view_for_live_mode()
 
         return action_result
 
+    def _update_plot_data_for_state(self):
+        if not self.pygame_plotter:
+            return
+
+        spectrometer_can_operate = self._is_spectrometer_ready()
+        state = self._current_state
+        current_menu_mode = self.menu_system.get_collection_mode()
+
+        plot_wl_data: np.ndarray | None = self.wavelengths
+        plot_inten_data_unfiltered: np.ndarray | None = (
+            None  # Store unfiltered data here
+        )
+
+        # This method primarily sets plot_inten_data_unfiltered.
+        # Y-label, Y-limits, Y-tick-format are managed by state transition logic in handle_input etc.
+
+        is_frozen_plot_state = state == self.STATE_FROZEN_VIEW or (
+            state == self.STATE_AUTO_INTEG_CONFIRM
+            and self._frozen_capture_type == self.FROZEN_TYPE_AUTO_INTEG_RESULT
+        )
+
+        if is_frozen_plot_state:
+            if (
+                self._frozen_intensities is not None
+                and self._frozen_wavelengths is not None
+            ):
+                plot_wl_data = self._frozen_wavelengths
+                plot_inten_data_unfiltered = self._frozen_intensities
+            else:
+                logger.error(
+                    "Frozen data missing for plot in a frozen state. Discarding."
+                )
+                self._perform_discard_frozen_data()  # Attempt to recover state
+                self.pygame_plotter.set_y_data(None)
+                return
+        elif spectrometer_can_operate:
+            try:
+                current_menu_integ_ms = self.menu_system.get_integration_time_ms()
+                integ_time_for_capture_us = (
+                    self._current_auto_integ_us
+                    if state == self.STATE_AUTO_INTEG_RUNNING
+                    else int(current_menu_integ_ms * 1000)
+                )
+
+                if (
+                    current_menu_integ_ms != self._last_integration_time_ms
+                    and state != self.STATE_AUTO_INTEG_RUNNING
+                ):
+                    self._last_integration_time_ms = current_menu_integ_ms
+
+                integ_us_clamped = max(
+                    self._hw_min_integration_us,
+                    min(integ_time_for_capture_us, self._hw_max_integration_us),
+                )
+                assert self.spectrometer is not None
+                self.spectrometer.integration_time_micros(integ_us_clamped)
+                raw_inten_capture = self.spectrometer.intensities(
+                    correct_dark_counts=True, correct_nonlinearity=True
+                )
+
+                if raw_inten_capture is None or len(raw_inten_capture) != len(
+                    self.wavelengths if self.wavelengths is not None else []
+                ):
+                    logger.warning(
+                        f"Failed live capture or length mismatch in state {state}."
+                    )
+                    self.pygame_plotter.set_y_data(None)
+                    return
+
+                is_calibration_raw_display_state = state in [
+                    self.STATE_CALIBRATE,
+                    self.STATE_DARK_CAPTURE_SETUP,
+                    self.STATE_WHITE_CAPTURE_SETUP,
+                    self.STATE_AUTO_INTEG_SETUP,
+                ]
+
+                if (
+                    is_calibration_raw_display_state
+                    or state == self.STATE_AUTO_INTEG_RUNNING
+                ):
+                    plot_inten_data_unfiltered = raw_inten_capture
+                    if (
+                        state == self.STATE_AUTO_INTEG_RUNNING
+                        and len(plot_inten_data_unfiltered) > 0
+                    ):  # Dynamic Y for this state
+                        # Apply smoothing *before* finding max for dynamic Y scale in this specific case
+                        data_for_dyn_y_max = plot_inten_data_unfiltered
+                        if (
+                            USE_LIVE_SMOOTHING
+                            and LIVE_SMOOTHING_WINDOW_SIZE > 1
+                            and data_for_dyn_y_max.size >= LIVE_SMOOTHING_WINDOW_SIZE
+                        ):
+                            win_s = LIVE_SMOOTHING_WINDOW_SIZE + (
+                                1 if LIVE_SMOOTHING_WINDOW_SIZE % 2 == 0 else 0
+                            )
+                            if win_s <= len(data_for_dyn_y_max) and win_s >= 3:
+                                w = np.ones(win_s) / float(win_s)
+                                data_for_dyn_y_max = np.convolve(data_for_dyn_y_max, w, mode="same")  # type: ignore
+
+                        current_max_val = np.max(data_for_dyn_y_max)
+                        temp_y_max_for_plot = max(
+                            float(Y_AXIS_MIN_CEILING),
+                            float(current_max_val * Y_AXIS_RESCALE_FACTOR),
+                        )
+                        temp_y_max_for_plot = min(
+                            temp_y_max_for_plot,
+                            float(self._hw_max_intensity_adc * Y_AXIS_RESCALE_FACTOR),
+                        )
+                        self.pygame_plotter.set_y_limits(
+                            0, temp_y_max_for_plot
+                        )  # Update plotter's Y limits directly
+
+                elif state == self.STATE_LIVE_VIEW:
+                    if current_menu_mode == MODE_REFLECTANCE:
+                        valid_refs, _ = self._are_references_valid_for_reflectance()
+                        if valid_refs:
+                            assert (
+                                self._dark_reference_intensities is not None
+                                and self._white_reference_intensities is not None
+                            )
+                            numerator = (
+                                raw_inten_capture - self._dark_reference_intensities
+                            )
+                            denominator = (
+                                self._white_reference_intensities
+                                - self._dark_reference_intensities
+                            )
+                            reflectance_values = np.full_like(raw_inten_capture, 0.0)
+                            valid_denom = np.abs(denominator) > DIVISION_EPSILON
+                            reflectance_values[valid_denom] = (
+                                numerator[valid_denom] / denominator[valid_denom]
+                            )
+                            plot_inten_data_unfiltered = np.clip(
+                                reflectance_values,
+                                0.0,
+                                Y_AXIS_REFLECTANCE_RESCALE_MAX_CEILING,
+                            )
+                        else:
+                            plot_inten_data_unfiltered = raw_inten_capture
+                    else:  # MODE_RAW in LIVE_VIEW
+                        plot_inten_data_unfiltered = raw_inten_capture
+                else:  # Fallback
+                    plot_inten_data_unfiltered = raw_inten_capture
+
+            except (sb.SeaBreezeError, (usb.core.USBError if usb else OSError), AttributeError, AssertionError, RuntimeError) as e_capture:  # type: ignore
+                logger.error(
+                    f"Error during live data capture for plot: {e_capture}",
+                    exc_info=False,
+                )
+                self.pygame_plotter.set_y_data(None)
+                return
+        else:
+            self.pygame_plotter.set_y_data(None)
+            return
+
+        # --- Apply Smoothing Filter FOR DISPLAY ONLY ---
+        plot_data_for_display = plot_inten_data_unfiltered  # Default to unsmoothed
+        if (
+            plot_inten_data_unfiltered is not None
+            and USE_LIVE_SMOOTHING
+            and LIVE_SMOOTHING_WINDOW_SIZE > 1
+        ):
+            if (
+                isinstance(plot_inten_data_unfiltered, np.ndarray)
+                and plot_inten_data_unfiltered.size >= LIVE_SMOOTHING_WINDOW_SIZE
+            ):
+                win_size = LIVE_SMOOTHING_WINDOW_SIZE + (
+                    1 if LIVE_SMOOTHING_WINDOW_SIZE % 2 == 0 else 0
+                )
+                if win_size <= len(plot_inten_data_unfiltered) and win_size >= 3:
+                    try:
+                        weights = np.ones(win_size) / float(win_size)
+                        smoothed_intensities = np.convolve(
+                            plot_inten_data_unfiltered, weights, mode="same"
+                        )
+                        plot_data_for_display = smoothed_intensities
+                        # logger.debug("Live smoothing applied to plot data for display.") # Can be verbose
+                    except Exception as e_smooth:
+                        logger.warning(
+                            f"Error applying smoothing: {e_smooth}. Using unsmoothed data."
+                        )
+            # else: logger.debug("Not enough data or not ndarray for smoothing. Using unsmoothed.")
+
+        if plot_wl_data is not None and self.pygame_plotter.x_data_static is None:
+            self.pygame_plotter.set_x_data_static(plot_wl_data)
+        self.pygame_plotter.set_y_data(plot_data_for_display)
+
     def _run_auto_integration_step(self):
-        """Performs one iteration of the auto-integration algorithm."""
         assert (
             self.spectrometer
             and hasattr(self.spectrometer, "_dev")
@@ -2366,36 +3101,38 @@ class SpectrometerScreen:
         ), "Auto-integ step called when not optimizing."
         assert np is not None, "NumPy (np) is required for auto-integration."
 
-        # --- Helper to transition to CONFIRM state with proper Y-axis scaling ---
-        def _transition_to_confirm(status_msg: str, pending_ms: int):
+        def _transition_to_confirm_pygame(status_msg: str, pending_ms: int):
             self._auto_integ_status_msg = status_msg
             self._pending_auto_integ_ms = pending_ms
-            self._auto_integ_optimizing = False  # Stop further iterations
+            self._auto_integ_optimizing = False
 
-            # Scale Y-axis for the confirm state based on the captured frozen spectrum
             if (
                 self._frozen_intensities is not None
                 and len(self._frozen_intensities) > 0
             ):
-                final_max_peak = np.max(
-                    self._frozen_intensities
-                )  # Intensities are from current/last capture
-                # THIS IS WHERE _current_y_max IS SET FOR THE CONFIRM SCREEN
-                self._current_y_max = max(
+                # For confirm screen, Y-max is based on the *unsmoothed* frozen data
+                final_max_peak = np.max(self._frozen_intensities)
+                self._current_y_max_for_plot = max(
                     float(Y_AXIS_MIN_CEILING),
                     float(final_max_peak * Y_AXIS_RESCALE_FACTOR),
                 )
-                self._current_y_max = min(
-                    self._current_y_max,
+                self._current_y_max_for_plot = min(
+                    self._current_y_max_for_plot,
                     float(self._hw_max_intensity_adc * Y_AXIS_RESCALE_FACTOR),
                 )
                 logger.debug(
-                    f"Auto-Integ (Confirm): Y-max set to {self._current_y_max:.1f} for peak {final_max_peak:.1f}"
+                    f"Auto-Integ (Confirm): SpectScreen's _current_y_max_for_plot set to {self._current_y_max_for_plot:.1f}"
                 )
-            else:  # Fallback if no valid frozen intensities (e.g., initial error before any capture)
-                self._current_y_max = float(Y_AXIS_DEFAULT_MAX)
+                if self.pygame_plotter:
+                    self.pygame_plotter.set_y_label(
+                        f"Raw Final ({pending_ms}ms)"
+                    )  # Specific label
+                    self.pygame_plotter.set_y_tick_format("{:.0f}")
+                    self.pygame_plotter.set_y_limits(0, self._current_y_max_for_plot)
+            else:  # Fallback
+                self._set_plotter_view_for_raw()  # Fallback to default raw view
                 logger.warning(
-                    "Auto-Integ (Confirm): No frozen intensities to scale Y-axis, using default."
+                    "Auto-Integ (Confirm): No frozen intensities for Y-axis, using default raw view."
                 )
 
             self._current_state = self.STATE_AUTO_INTEG_CONFIRM
@@ -2404,25 +3141,16 @@ class SpectrometerScreen:
             )
 
         if self._auto_integ_iteration_count >= AUTO_INTEG_MAX_ITERATIONS:
-            # Note: _frozen_intensities should hold the spectrum from the *last successful iteration*
-            # before hitting max iterations. The helper will use this.
-            _transition_to_confirm(
+            _transition_to_confirm_pygame(
                 f"Max iterations ({AUTO_INTEG_MAX_ITERATIONS}) reached.",
-                int(
-                    round(self._current_auto_integ_us / 1000.0)
-                ),  # Use the last attempted integration time
+                int(round(self._current_auto_integ_us / 1000.0)),
             )
             return
 
         self._auto_integ_iteration_count += 1
-        # Update status message here, before potential early exit if capture fails
         current_iter_msg = f"Running iter {self._auto_integ_iteration_count}/{AUTO_INTEG_MAX_ITERATIONS}..."
-        self._auto_integ_status_msg = (
-            current_iter_msg  # Keep this concise for the top status line
-        )
-        logger.debug(
-            f"Auto-Integ Step {self._auto_integ_iteration_count}: Current test integ {self._current_auto_integ_us} µs. {current_iter_msg}"
-        )
+        self._auto_integ_status_msg = current_iter_msg
+        # logger.debug(f"Auto-Integ Step {self._auto_integ_iteration_count}: Current test integ {self._current_auto_integ_us} µs.") # Can be verbose
 
         max_peak_adc = 0.0
         try:
@@ -2430,56 +3158,48 @@ class SpectrometerScreen:
                 self._hw_min_integration_us,
                 min(self._current_auto_integ_us, self._hw_max_integration_us),
             )
-            if clamped_current_us != self._current_auto_integ_us:
-                logger.debug(
-                    f"Auto-Integ: Clamped test integ from {self._current_auto_integ_us} to {clamped_current_us} µs for device."
-                )
-
             self.spectrometer.integration_time_micros(clamped_current_us)
-
-            intensities = self.spectrometer.intensities(
+            # Capture UNSMOOTHED data for algorithm decision and potential frozen storage
+            intensities_unfiltered = self.spectrometer.intensities(
                 correct_dark_counts=True, correct_nonlinearity=True
             )
             assert (
-                intensities is not None
+                intensities_unfiltered is not None
             ), "Spectrometer returned None for intensities."
-            if len(intensities) > 0:
-                max_peak_adc = np.max(intensities)
-            else:
-                logger.warning("Auto-Integ: Empty intensities array received.")
-                max_peak_adc = 0.0
 
-            # Store this spectrum and its integration time. This will be used by _transition_to_confirm.
-            self._frozen_intensities = (
-                intensities.copy() if intensities is not None else None
+            max_peak_adc = (
+                np.max(intensities_unfiltered)
+                if len(intensities_unfiltered) > 0
+                else 0.0
             )
+
+            # Store the *unfiltered* data if transitioning to confirm
+            self._frozen_intensities = intensities_unfiltered.copy()
             self._frozen_wavelengths = (
                 self.wavelengths.copy() if self.wavelengths is not None else None
             )
             self._frozen_capture_type = self.FROZEN_TYPE_AUTO_INTEG_RESULT
             self._frozen_integration_ms = int(round(clamped_current_us / 1000.0))
 
-        except (sb.SeaBreezeError, usb.core.USBError, AttributeError, AssertionError, RuntimeError) as e:  # type: ignore
+        except (sb.SeaBreezeError, (usb.core.USBError if usb else OSError), AttributeError, AssertionError, RuntimeError) as e:  # type: ignore
             logger.error(
                 f"Auto-Integ: Error during spectrum capture: {e}", exc_info=True
             )
-            _transition_to_confirm(
+            _transition_to_confirm_pygame(
                 "Capture Error. Aborting.",
                 int(round(self._current_auto_integ_us / 1000.0)),
             )
             return
 
         self._last_peak_adc_value = max_peak_adc
-        logger.debug(
-            f"Auto-Integ Step {self._auto_integ_iteration_count}: Max peak ADC {max_peak_adc:.1f} with {clamped_current_us} µs."
-        )
+        # logger.debug(f"Auto-Integ Step {self._auto_integ_iteration_count}: Max peak (unfiltered) ADC {max_peak_adc:.1f} with {clamped_current_us} µs.") # Can be verbose
 
         if (
             self._auto_integ_target_low_counts
             <= max_peak_adc
             <= self._auto_integ_target_high_counts
         ):
-            _transition_to_confirm(
+            _transition_to_confirm_pygame(
                 f"Optimal found: {max_peak_adc:.0f} counts.",
                 int(round(clamped_current_us / 1000.0)),
             )
@@ -2488,7 +3208,7 @@ class SpectrometerScreen:
             clamped_current_us <= self._hw_min_integration_us
             and max_peak_adc > self._auto_integ_target_high_counts
         ):
-            _transition_to_confirm(
+            _transition_to_confirm_pygame(
                 f"Saturated at min integ ({self._hw_min_integration_us / 1000.0:.1f} ms).",
                 int(round(self._hw_min_integration_us / 1000.0)),
             )
@@ -2497,13 +3217,12 @@ class SpectrometerScreen:
             clamped_current_us >= self._hw_max_integration_us
             and max_peak_adc < self._auto_integ_target_low_counts
         ):
-            _transition_to_confirm(
+            _transition_to_confirm_pygame(
                 f"Too dim at max integ ({self._hw_max_integration_us / 1000.0:.1f} ms).",
                 int(round(self._hw_max_integration_us / 1000.0)),
             )
             return
 
-        # Algorithm to calculate next integration time
         target_adc = (
             self._auto_integ_target_low_counts + self._auto_integ_target_high_counts
         ) / 2.0
@@ -2512,7 +3231,6 @@ class SpectrometerScreen:
         ideal_next_integ_us = clamped_current_us * adjustment_ratio
         change_us = ideal_next_integ_us - clamped_current_us
         damped_change_us = change_us * AUTO_INTEG_PROPORTIONAL_GAIN
-
         current_adjustment_direction = (
             1
             if damped_change_us > self._hw_integration_time_increment_us / 2.0
@@ -2530,9 +3248,6 @@ class SpectrometerScreen:
             == -self._previous_integ_adjustment_direction
         ):
             damped_change_us *= AUTO_INTEG_OSCILLATION_DAMPING_FACTOR
-            logger.debug(
-                f"Auto-Integ: Oscillation detected. Damping change to {damped_change_us:.0f} µs."
-            )
 
         if abs(damped_change_us) < AUTO_INTEG_MIN_ADJUSTMENT_US:
             min_adj = AUTO_INTEG_MIN_ADJUSTMENT_US
@@ -2540,9 +3255,6 @@ class SpectrometerScreen:
                 damped_change_us = min_adj
             elif max_peak_adc > self._auto_integ_target_high_counts:
                 damped_change_us = -min_adj
-            logger.debug(
-                f"Auto-Integ: Applying min adjustment of {damped_change_us:.0f} µs."
-            )
 
         new_test_integ_us = clamped_current_us + damped_change_us
         new_test_integ_us = max(
@@ -2561,33 +3273,22 @@ class SpectrometerScreen:
             <= max_peak_adc
             <= self._auto_integ_target_high_counts
         ):
-            _transition_to_confirm(
+            _transition_to_confirm_pygame(
                 "Algorithm stalled. No change.", int(round(clamped_current_us / 1000.0))
             )
             return
 
         self._current_auto_integ_us = new_test_integ_us
         self._previous_integ_adjustment_direction = current_adjustment_direction
-        # Update status for the next iteration (will be shown by _draw_overlays if still in RUNNING state)
         self._auto_integ_status_msg = (
             f"Peak:{max_peak_adc:.0f} Next:{self._current_auto_integ_us / 1000.0:.1f}ms"
         )
-        logger.debug(
-            f"Auto-Integ: Next test integration time: {self._current_auto_integ_us} µs. Status: {self._auto_integ_status_msg}"
-        )
 
     def _apply_auto_integration_result(self):
-        """Applies the confirmed auto-integration time to the MenuSystem."""
         logger.info("Applying auto-integration result.")
-        assert (
-            self.menu_system is not None
-        ), "MenuSystem not available to apply auto-integ result."
+        assert self.menu_system is not None
         if self._pending_auto_integ_ms is not None:
-            logger.info(
-                f"Setting integration time in menu to: {self._pending_auto_integ_ms} ms."
-            )
             self.menu_system.set_integration_time_ms(self._pending_auto_integ_ms)
-            # Update _last_integration_time_ms to reflect the newly set value (which might be clamped/aligned by MenuSystem)
             self._last_integration_time_ms = self.menu_system.get_integration_time_ms()
             logger.info(
                 f"Auto-integration successful. New active integration time: {self._last_integration_time_ms} ms."
@@ -2595,23 +3296,25 @@ class SpectrometerScreen:
         else:
             logger.warning("No pending auto-integration time to apply.")
 
-        self._cancel_auto_integration()  # Clean up auto-integration state variables
+        self._cancel_auto_integration()  # Clears auto-integ state including _frozen_data if it was auto-integ type
         self._current_state = self.STATE_LIVE_VIEW
+        self._set_plotter_view_for_live_mode()
         logger.info("Returned to Live View after auto-integration.")
 
-    def _perform_freeze_capture(
-        self, capture_type: str
-    ):  # MODIFIED - Corrected constant usage
+    def _perform_freeze_capture(self, capture_type: str):
+        # Corrected assertion:
         assert (
-            self.menu_system is not None
-            and self.spectrometer is not None
-            and self.wavelengths is not None
-        )
+            self.menu_system is not None  # Check for existence
+            and self.spectrometer is not None # Check for existence
+            and self.wavelengths is not None  # Check for existence
+            and self.wavelengths.size > 0  # Explicitly check if the NumPy array has elements
+        ), "Dependencies missing for freeze capture or wavelengths empty"
+        
         assert capture_type in [
             self.FROZEN_TYPE_OOI,
             self.FROZEN_TYPE_DARK,
             self.FROZEN_TYPE_WHITE,
-        ], f"Invalid capture_type '{capture_type}'"
+        ]
 
         dev_proxy = getattr(self.spectrometer, "_dev", None)
         if not (dev_proxy and hasattr(dev_proxy, "is_open") and dev_proxy.is_open):
@@ -2622,7 +3325,6 @@ class SpectrometerScreen:
         try:
             current_menu_integ_ms = self.menu_system.get_integration_time_ms()
             current_menu_mode = self.menu_system.get_collection_mode()
-            assert isinstance(current_menu_integ_ms, int) and current_menu_integ_ms > 0
 
             if current_menu_integ_ms != self._last_integration_time_ms:
                 integ_us = int(current_menu_integ_ms * 1000)
@@ -2630,22 +3332,29 @@ class SpectrometerScreen:
                     self._hw_min_integration_us,
                     min(integ_us, self._hw_max_integration_us),
                 )
-                logger.debug(
-                    f"FREEZE ({capture_type}): Setting integ to {integ_us_clamped} µs (target {current_menu_integ_ms} ms)"
-                )
                 self.spectrometer.integration_time_micros(integ_us_clamped)
-            self._last_integration_time_ms = (
-                current_menu_integ_ms  # Capture with this integration time
-            )
+            self._last_integration_time_ms = current_menu_integ_ms
 
             raw_intensities_capture = self.spectrometer.intensities(
                 correct_dark_counts=True, correct_nonlinearity=True
             )
+            # Ensure wavelengths is not None before using len on it for the assertion
+            assert self.wavelengths is not None
             assert raw_intensities_capture is not None and len(
                 raw_intensities_capture
             ) == len(self.wavelengths)
 
-            self._clear_frozen_data()
+            self._clear_frozen_data()  # Clear previous before setting new
+
+            # Ensure wavelengths is not None before copying
+            assert self.wavelengths is not None
+            self._frozen_wavelengths = self.wavelengths.copy()
+            self._frozen_timestamp = self.menu_system.get_timestamp_datetime()
+            self._frozen_integration_ms = self._last_integration_time_ms
+            self._frozen_capture_type = capture_type
+
+            y_label_for_frozen: str = "Intensity (Frozen)"
+            y_tick_fmt_for_frozen: str = "{:.0f}"
 
             if capture_type == self.FROZEN_TYPE_OOI:
                 self._frozen_sample_collection_mode = current_menu_mode
@@ -2653,15 +3362,19 @@ class SpectrometerScreen:
                     valid_refs, _ = self._are_references_valid_for_reflectance()
                     assert (
                         valid_refs
-                    ), "Freeze Reflectance called with invalid references - input handling should prevent this."
+                    ), "Freeze Reflectance called with invalid references."
                     assert (
                         self._dark_reference_intensities is not None
                         and self._white_reference_intensities is not None
+                        and raw_intensities_capture is not None # Added for safety
                     )
-
                     self._raw_target_intensities_for_reflectance = (
                         raw_intensities_capture.copy()
                     )
+                    # Ensure all operands for subtraction are ndarrays
+                    assert isinstance(self._raw_target_intensities_for_reflectance, np.ndarray)
+                    assert isinstance(self._dark_reference_intensities, np.ndarray)
+                    assert isinstance(self._white_reference_intensities, np.ndarray)
 
                     numerator = (
                         self._raw_target_intensities_for_reflectance
@@ -2671,7 +3384,6 @@ class SpectrometerScreen:
                         self._white_reference_intensities
                         - self._dark_reference_intensities
                     )
-
                     reflectance_values = np.full_like(
                         self._raw_target_intensities_for_reflectance, 0.0
                     )
@@ -2679,20 +3391,30 @@ class SpectrometerScreen:
                     reflectance_values[valid_indices] = (
                         numerator[valid_indices] / denominator[valid_indices]
                     )
-
-                    # Use Y_AXIS_REFLECTANCE_RESCALE_MAX_CEILING for clipping the stored frozen data too
                     self._frozen_intensities = np.clip(
                         reflectance_values, 0.0, Y_AXIS_REFLECTANCE_RESCALE_MAX_CEILING
                     )
-                else:
-                    self._frozen_intensities = raw_intensities_capture
-            else:
-                self._frozen_intensities = raw_intensities_capture
+                    self._current_y_max_for_plot = float(Y_AXIS_REFLECTANCE_DEFAULT_MAX)
+                    y_label_for_frozen = "Reflectance (Frozen)"
+                    y_tick_fmt_for_frozen = "{:.1f}"
+                else:  # Raw OOI
+                    assert raw_intensities_capture is not None # Added for safety
+                    self._frozen_intensities = (
+                        raw_intensities_capture.copy()
+                    )  # Store copy
+                    self._current_y_max_for_plot = float(Y_AXIS_DEFAULT_MAX)
+                    y_label_for_frozen = "Intensity (Raw Frozen)"
+            else:  # Dark or White reference capture
+                assert raw_intensities_capture is not None # Added for safety
+                self._frozen_intensities = raw_intensities_capture.copy()  # Store copy
+                self._frozen_sample_collection_mode = MODE_RAW  # Refs are always raw
+                self._current_y_max_for_plot = float(Y_AXIS_DEFAULT_MAX)
+                y_label_for_frozen = f"{capture_type.capitalize()} (Frozen)"
 
-            self._frozen_wavelengths = self.wavelengths.copy()
-            self._frozen_timestamp = self.menu_system.get_timestamp_datetime()
-            self._frozen_integration_ms = self._last_integration_time_ms
-            self._frozen_capture_type = capture_type
+            if self.pygame_plotter:
+                self.pygame_plotter.set_y_label(y_label_for_frozen)
+                self.pygame_plotter.set_y_tick_format(y_tick_fmt_for_frozen)
+                self.pygame_plotter.set_y_limits(0, self._current_y_max_for_plot)
 
             display_mode_log = (
                 self._frozen_sample_collection_mode
@@ -2717,150 +3439,94 @@ class SpectrometerScreen:
         ), "Frozen data assertion failed before saving."
 
         spectra_type_csv = ""
-        # Determine the spectra type string for the CSV based on the capture type
         if self._frozen_capture_type == self.FROZEN_TYPE_OOI:
-            assert (
-                self._frozen_sample_collection_mode is not None
-            ), "Frozen sample collection mode missing for OOI type."
+            assert self._frozen_sample_collection_mode is not None
             spectra_type_csv = self._frozen_sample_collection_mode.upper()
         elif self._frozen_capture_type in [
             self.FROZEN_TYPE_DARK,
             self.FROZEN_TYPE_WHITE,
         ]:
-            spectra_type_csv = self._frozen_capture_type  # e.g., "DARK" or "WHITE"
+            spectra_type_csv = self._frozen_capture_type
         else:
             logger.error(
-                f"Unknown frozen_capture_type: {self._frozen_capture_type}. Cannot save data."
+                f"Unknown frozen_capture_type: {self._frozen_capture_type}. Cannot save."
             )
-            self._perform_discard_frozen_data()  # Discard invalid data
+            self._perform_discard_frozen_data()
             return
 
         logger.info(f"Attempting to save frozen data as {spectra_type_csv}...")
+        should_save_plot_png = self._frozen_capture_type == self.FROZEN_TYPE_OOI
 
-        # Determine if a plot should be saved (only for OOI/Sample captures, not for Dark/White refs by default here)
-        should_save_plot = self._frozen_capture_type == self.FROZEN_TYPE_OOI
-
+        # Save the *unfiltered* self._frozen_intensities
         save_success = self._save_data(
-            intensities=self._frozen_intensities,
+            intensities=self._frozen_intensities,  # This is the original, unfiltered data
             wavelengths=self._frozen_wavelengths,
             timestamp=self._frozen_timestamp,
             integration_ms=self._frozen_integration_ms,
             spectra_type=spectra_type_csv,
-            save_plot=should_save_plot,
+            save_plot=should_save_plot_png,
         )
 
         if save_success:
             logger.info(
-                f"Frozen {self._frozen_capture_type} (saved to CSV as {spectra_type_csv}) successful."
+                f"Frozen {self._frozen_capture_type} (saved as {spectra_type_csv}) successful."
             )
-
-            # --- Crucial Fix: Update internal references if a Dark or White spectrum was saved ---
             if self._frozen_capture_type == self.FROZEN_TYPE_DARK:
-                assert (
-                    self._frozen_intensities is not None
-                    and self._frozen_integration_ms is not None
-                ), "Dark frozen data became None before internal update."
                 self._dark_reference_intensities = self._frozen_intensities.copy()
                 self._dark_reference_integration_ms = self._frozen_integration_ms
-                logger.info(
-                    f"Internal Dark reference updated. Integ: {self._dark_reference_integration_ms} ms, {len(self._dark_reference_intensities)} points."
-                )
             elif self._frozen_capture_type == self.FROZEN_TYPE_WHITE:
-                assert (
-                    self._frozen_intensities is not None
-                    and self._frozen_integration_ms is not None
-                ), "White frozen data became None before internal update."
                 self._white_reference_intensities = self._frozen_intensities.copy()
                 self._white_reference_integration_ms = self._frozen_integration_ms
-                logger.info(
-                    f"Internal White reference updated. Integ: {self._white_reference_integration_ms} ms, {len(self._white_reference_intensities)} points."
-                )
-            # --- End of Fix ---
 
-            # Specific handling for saving raw target data when a REFLECTANCE OOI spectrum is saved
             if (
                 self._frozen_capture_type == self.FROZEN_TYPE_OOI
                 and self._frozen_sample_collection_mode == MODE_REFLECTANCE
                 and self._raw_target_intensities_for_reflectance is not None
             ):
-                logger.info(
-                    f"Saving associated RAW_REFLECTANCE target for the Reflectance OOI spectrum..."
+                # Save the *unfiltered* raw target
+                self._save_data(
+                    intensities=self._raw_target_intensities_for_reflectance,  # Original raw
+                    wavelengths=self._frozen_wavelengths,
+                    timestamp=self._frozen_timestamp,
+                    integration_ms=self._frozen_integration_ms,
+                    spectra_type=SPECTRA_TYPE_RAW_TARGET_FOR_REFLECTANCE,
+                    save_plot=False,
                 )
-                # Save the raw target spectrum that was used to calculate this reflectance value
-                # Note: save_plot is False for this auxiliary raw data.
-                # Scan count is typically incremented by the main REFLECTANCE save, not for this raw component.
-                # However, current _save_data increments for all. This is fine if consistent.
-                raw_target_save_success = self._save_data(
-                    intensities=self._raw_target_intensities_for_reflectance,
-                    wavelengths=self._frozen_wavelengths,  # Wavelengths are the same
-                    timestamp=self._frozen_timestamp,  # Timestamp is the same
-                    integration_ms=self._frozen_integration_ms,  # Integration time is the same
-                    spectra_type=SPECTRA_TYPE_RAW_TARGET_FOR_REFLECTANCE,  # Specific type for this raw data
-                    save_plot=False,  # Typically no plot for this auxiliary raw data
-                )
-                if raw_target_save_success:
-                    logger.info("RAW_REFLECTANCE target spectrum saved successfully.")
-                else:
-                    logger.error("Failed to save RAW_REFLECTANCE target spectrum.")
-                self._raw_target_intensities_for_reflectance = (
-                    None  # Clear after saving
-                )
-
         else:
             logger.error(
                 f"Failed to save frozen {self._frozen_capture_type} (intended as {spectra_type_csv})."
             )
 
-        # State transition logic after save attempt
-        if self._frozen_capture_type in [
-            self.FROZEN_TYPE_OOI,
-            self.FROZEN_TYPE_DARK,
-            self.FROZEN_TYPE_WHITE,
-        ]:
-            self._current_state = (
-                self.STATE_LIVE_VIEW
-            )  # Always return to live view after any save
-            if self._frozen_capture_type != self.FROZEN_TYPE_OOI:  # i.e., DARK or WHITE
-                logger.info(
-                    f"{self._frozen_capture_type} reference saved action complete. Returning to main live view."
-                )
-        else:
-            # This case should ideally not be reached if all frozen_capture_types are handled above
-            logger.warning(
-                f"Unhandled frozen_capture_type '{self._frozen_capture_type}' for state transition after save. Defaulting to LIVE_VIEW."
-            )
-            self._current_state = self.STATE_LIVE_VIEW
-
-        self._clear_frozen_data()  # Clear all temporary frozen data variables
-        logger.info(
-            f"Returned to state: {self._current_state} after processing frozen data save."
-        )
+        self._current_state = self.STATE_LIVE_VIEW
+        self._set_plotter_view_for_live_mode()  # Set plotter for live view
+        self._clear_frozen_data()
 
     def _perform_discard_frozen_data(self):
         assert self._frozen_capture_type is not None
         logger.info(f"Discarding frozen {self._frozen_capture_type} spectrum.")
         original_frozen_type = self._frozen_capture_type
-        self._clear_frozen_data()  # Clears type, so use original_frozen_type for logic
 
         if original_frozen_type == self.FROZEN_TYPE_OOI:
             self._current_state = self.STATE_LIVE_VIEW
+            self._set_plotter_view_for_live_mode()
         elif original_frozen_type == self.FROZEN_TYPE_DARK:
             self._current_state = self.STATE_DARK_CAPTURE_SETUP
+            self._set_plotter_view_for_raw()  # Dark setup shows raw
         elif original_frozen_type == self.FROZEN_TYPE_WHITE:
             self._current_state = self.STATE_WHITE_CAPTURE_SETUP
-        elif (
-            original_frozen_type == self.FROZEN_TYPE_AUTO_INTEG_RESULT
-        ):  # Discarding from auto-integ confirm
-            self._cancel_auto_integration()  # Full reset of auto-integ vars
-            self._current_state = self.STATE_CALIBRATE  # Go back to calib menu
-            logger.info(
-                "Frozen auto-integ result discarded. Returning to Calibrate Menu."
-            )
+            self._set_plotter_view_for_raw()  # White setup shows raw
+        elif original_frozen_type == self.FROZEN_TYPE_AUTO_INTEG_RESULT:
+            self._cancel_auto_integration()
+            self._current_state = self.STATE_CALIBRATE
+            self._set_plotter_view_for_raw()  # Calibrate menu shows raw
         else:
             logger.error(
                 f"Unknown frozen_type '{original_frozen_type}' during discard."
             )
-            self._current_state = self.STATE_LIVE_VIEW
+            self._current_state = self.STATE_LIVE_VIEW  # Fallback
+            self._set_plotter_view_for_live_mode()
+
+        self._clear_frozen_data()
         logger.info(f"Returned to state: {self._current_state} after discarding.")
 
     def _save_data(
@@ -2872,10 +3538,8 @@ class SpectrometerScreen:
         spectra_type: str,
         save_plot: bool = True,
     ) -> bool:
-        # This method is only called if _perform_freeze_capture was successful,
-        # which implies the spectrometer was ready at the time of capture.
-        # No need for an additional _is_spectrometer_ready() check here.
-
+        # This method does not need changes regarding PygamePlotter
+        # It saves the provided `intensities` (which should be unfiltered)
         assert (
             intensities is not None
             and wavelengths is not None
@@ -2883,8 +3547,6 @@ class SpectrometerScreen:
             and spectra_type
             and self.menu_system
         ), "_save_data called with invalid parameters"
-
-        # Ensure we only save actual measurement types, not internal/temporary ones.
         valid_spectra_types_for_save = [
             SPECTRA_TYPE_RAW,
             SPECTRA_TYPE_REFLECTANCE,
@@ -2894,22 +3556,18 @@ class SpectrometerScreen:
         ]
         if spectra_type not in valid_spectra_types_for_save:
             logger.warning(
-                f"_save_data called with non-standard spectra_type: '{spectra_type}'. Data will not be saved."
+                f"_save_data called with non-standard spectra_type: '{spectra_type}'. Not saved."
             )
             return False
 
         logger.info(f"Preparing to save data of type: {spectra_type}")
-
         daily_folder = os.path.join(DATA_DIR, timestamp.strftime("%Y-%m-%d"))
         try:
-            os.makedirs(
-                daily_folder, exist_ok=True
-            )  # Create folder if it doesn't exist
-            logger.debug(f"Ensured daily data folder exists: {daily_folder}")
+            os.makedirs(daily_folder, exist_ok=True)
         except OSError as e_mkdir:
             logger.error(f"Could not create data directory {daily_folder}: {e_mkdir}")
             return False
-        except Exception as e_mkdir_general:  # Catch any other makedirs error
+        except Exception as e_mkdir_general:
             logger.error(
                 f"Unexpected error creating data directory {daily_folder}: {e_mkdir_general}"
             )
@@ -2920,89 +3578,55 @@ class SpectrometerScreen:
         )
         ts_utc_str = timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
         lens_str = self.menu_system.get_lens_type()
-        assert isinstance(lens_str, str)
-
-        current_temp_c_val_for_csv = ""  # Initialize to empty string for CSV
-
+        current_temp_c_val_for_csv = ""
         if self.temp_sensor_info:
-            temp_reading = (
-                self.temp_sensor_info.get_temperature_c()
-            )  # float, str, or None
+            temp_reading = self.temp_sensor_info.get_temperature_c()
             if isinstance(temp_reading, float):
                 current_temp_c_val_for_csv = f"{temp_reading:.2f}"
-
-        temp_value_for_log_display = (
-            current_temp_c_val_for_csv
-            if current_temp_c_val_for_csv
-            else "MISSING/ERROR"
-        )
-
-        logger.debug(
-            f"Saving data (Type: {spectra_type}, Lens: {lens_str}, Temp CSV: '{current_temp_c_val_for_csv}', Temp Log: '{temp_value_for_log_display}') to CSV: {csv_path}"
-        )  # Log both values for clarity during debugging
 
         try:
             hdr_needed = not (
                 os.path.isfile(csv_path) and os.path.getsize(csv_path) > 0
             )
-            with open(
-                csv_path, "a", newline=""
-            ) as csvf:  # newline='' is important for csv
+            with open(csv_path, "a", newline="") as csvf:
                 writer = csv.writer(csvf)
                 header_row = [
                     "timestamp_utc",
                     "spectra_type",
                     "lens_type",
                     "integration_time_ms",
-                    "temperature_c",  # Column name
+                    "temperature_c",
                 ]
-                header_row.extend(
-                    [f"{float(wl):.2f}" for wl in wavelengths]
-                )  # Assuming wl can be float()
-
+                header_row.extend([f"{float(wl):.2f}" for wl in wavelengths])
                 if hdr_needed:
                     writer.writerow(header_row)
-
                 data_row = [
                     ts_utc_str,
                     spectra_type,
                     lens_str,
                     integration_ms,
-                    current_temp_c_val_for_csv,  # Writes "" or formatted float
+                    current_temp_c_val_for_csv,
                 ]
-                data_row.extend(
-                    [f"{float(i):.4f}" for i in intensities]
-                )  # Assuming i can be float()
+                data_row.extend([f"{float(i):.4f}" for i in intensities])
                 writer.writerow(data_row)
 
-            # Only increment scan count for "OOI" type captures (RAW or REFLECTANCE)
-            # Dark/White refs or RAW_TARGET_FOR_REFLECTANCE should not increment the main scan count.
             if spectra_type in [SPECTRA_TYPE_RAW, SPECTRA_TYPE_REFLECTANCE]:
                 self._scans_today_count += 1
-                logger.info(
-                    f"Scan count today incremented to: {self._scans_today_count}"
-                )
-            else:
-                logger.info(
-                    f"Reference/Auxiliary data type '{spectra_type}' saved, scan count not incremented."
-                )
 
-            if (
-                save_plot and plt and Image
-            ):  # save_plot is usually True for OOI, False for refs
+            if save_plot and plt and Image:
                 plot_ts_local = timestamp.strftime("%Y-%m-%d-%H%M%S")
-                # Use PLOT_SAVE_DIR (which is DATA_DIR) and then daily_folder
                 plot_file = os.path.join(
                     daily_folder,
                     f"spectrum_{spectra_type}_{lens_str}_{plot_ts_local}.png",
                 )
-                logger.debug(f"Attempting to save plot: {plot_file}")
                 fig_temp, ax_temp = None, None
                 try:
                     fig_temp, ax_temp = plt.subplots(figsize=(8, 6))
                     if not fig_temp or not ax_temp:
                         raise RuntimeError("Failed temp fig/axes for plot save.")
-                    ax_temp.plot(wavelengths, intensities)
+                    ax_temp.plot(
+                        wavelengths, intensities
+                    )  # Plot the unfiltered intensities
                     title_scan_count = (
                         self._scans_today_count
                         if spectra_type in [SPECTRA_TYPE_RAW, SPECTRA_TYPE_REFLECTANCE]
@@ -3021,10 +3645,11 @@ class SpectrometerScreen:
                     ax_temp.grid(True, linestyle="--", alpha=0.7)
                     fig_temp.tight_layout()
                     fig_temp.savefig(plot_file, dpi=150)
-                    logger.info(f"Plot image saved: {plot_file}")
+                    logger.info(f"Matplotlib Plot image saved: {plot_file}")
                 except Exception as e_plot:
                     logger.error(
-                        f"Error saving plot {plot_file}: {e_plot}", exc_info=True
+                        f"Error saving Matplotlib plot {plot_file}: {e_plot}",
+                        exc_info=True,
                     )
                 finally:
                     if fig_temp and plt and plt.fignum_exists(fig_temp.number):
@@ -3034,27 +3659,20 @@ class SpectrometerScreen:
             logger.error(f"Error saving data to CSV {csv_path}: {e_csv}", exc_info=True)
             return False
 
-    def _rescale_y_axis(
-        self, relative: bool = False
-    ):  # `relative` param is unused in current logic
+    def _rescale_y_axis(self):
         assert (
-            self.menu_system is not None
-            and np is not None
-            and self.spectrometer is not None
+            self.menu_system and np and self.spectrometer
         ), "Dependencies missing for _rescale_y_axis"
-
         if not self._is_spectrometer_ready():
             logger.warning("Spectrometer not ready for Y-axis rescale.")
+            if self.pygame_plotter:
+                self.pygame_plotter.set_y_data(None)
             return
 
-        logger.info(
-            f"Attempting to rescale Y-axis (based on smoothed data if enabled)..."
-        )
+        logger.info("Attempting to rescale Y-axis...")
         try:
             current_menu_integ_ms = self.menu_system.get_integration_time_ms()
             current_menu_mode = self.menu_system.get_collection_mode()
-            assert isinstance(current_menu_integ_ms, int) and current_menu_integ_ms > 0
-            assert isinstance(current_menu_mode, str)
 
             if current_menu_integ_ms != self._last_integration_time_ms:
                 integ_us = int(current_menu_integ_ms * 1000)
@@ -3062,25 +3680,20 @@ class SpectrometerScreen:
                     self._hw_min_integration_us,
                     min(integ_us, self._hw_max_integration_us),
                 )
-                logger.debug(
-                    f"RESCALE_Y: Setting integ to {integ_us_clamped} µs (target {current_menu_integ_ms} ms)"
-                )
                 self.spectrometer.integration_time_micros(integ_us_clamped)
             self._last_integration_time_ms = current_menu_integ_ms
 
-            intensities_for_rescale_raw = self.spectrometer.intensities(
+            intensities_for_rescale_unfiltered = self.spectrometer.intensities(
                 correct_dark_counts=True, correct_nonlinearity=True
             )
-            assert (
-                intensities_for_rescale_raw is not None
-            ), "Spectrometer returned None for intensities"
-            if len(intensities_for_rescale_raw) == 0:
-                logger.warning(
-                    "Empty intensities array received during rescale, cannot proceed."
-                )
+            assert intensities_for_rescale_unfiltered is not None
+            if len(intensities_for_rescale_unfiltered) == 0:
+                logger.warning("Empty intensities array received during rescale.")
+                if self.pygame_plotter:
+                    self.pygame_plotter.set_y_data(None)
                 return
 
-            data_for_max_finding: np.ndarray | None = None
+            data_source_for_scaling: np.ndarray | None = None
             is_reflectance_plot_for_rescale = False
 
             if current_menu_mode == MODE_REFLECTANCE:
@@ -3089,378 +3702,123 @@ class SpectrometerScreen:
                     assert (
                         self._dark_reference_intensities is not None
                         and self._white_reference_intensities is not None
-                        and self.wavelengths is not None
-                        and len(intensities_for_rescale_raw) == len(self.wavelengths)
-                        and len(self._dark_reference_intensities)
-                        == len(self.wavelengths)
-                        and len(self._white_reference_intensities)
-                        == len(self.wavelengths)
-                    ), "Reference length mismatch or None during rescale, despite valid_refs=True check"
-
+                    )
                     is_reflectance_plot_for_rescale = True
                     numerator = (
-                        intensities_for_rescale_raw - self._dark_reference_intensities
+                        intensities_for_rescale_unfiltered
+                        - self._dark_reference_intensities
                     )
                     denominator = (
                         self._white_reference_intensities
                         - self._dark_reference_intensities
                     )
-
                     reflectance_values = np.full_like(
-                        intensities_for_rescale_raw, 0.0, dtype=float
+                        intensities_for_rescale_unfiltered, 0.0, dtype=float
                     )
                     valid_indices = np.where(np.abs(denominator) > DIVISION_EPSILON)
                     reflectance_values[valid_indices] = (
                         numerator[valid_indices] / denominator[valid_indices]
                     )
-                    data_for_max_finding = reflectance_values
+                    data_source_for_scaling = reflectance_values
                 else:
                     logger.warning(
-                        f"Rescaling in Reflectance mode, but references are not valid ({reason_code}). Using raw data for scaling."
+                        f"Rescaling in Reflectance mode, but refs not valid ({reason_code}). Using raw data."
                     )
-                    data_for_max_finding = intensities_for_rescale_raw
-            else:  # MODE_RAW or other modes
-                data_for_max_finding = intensities_for_rescale_raw
+                    data_source_for_scaling = intensities_for_rescale_unfiltered
+            else:  # MODE_RAW
+                data_source_for_scaling = intensities_for_rescale_unfiltered
 
-            assert (
-                data_for_max_finding is not None
-            ), "data_for_max_finding was not assigned"
-            if len(data_for_max_finding) == 0:
-                logger.warning("Data for max finding is empty. Cannot rescale.")
+            assert data_source_for_scaling is not None
+            if len(data_source_for_scaling) == 0:
+                logger.warning("Data for max finding is empty in rescale.")
+                if self.pygame_plotter:
+                    self.pygame_plotter.set_y_data(None)
                 return
 
-            # --- MODIFICATION: Apply smoothing before finding max ---
-            smoothed_data_for_scaling = data_for_max_finding  # Default to unsmoothed
+            # Apply smoothing FOR SCALING DECISION ONLY, if enabled
+            data_to_find_max_from = data_source_for_scaling
             if (
                 USE_LIVE_SMOOTHING
                 and LIVE_SMOOTHING_WINDOW_SIZE > 1
-                # and isinstance(data_for_max_finding, np.ndarray) # Already asserted by type hint essentially
-                and data_for_max_finding.size >= LIVE_SMOOTHING_WINDOW_SIZE
+                and data_source_for_scaling.size >= LIVE_SMOOTHING_WINDOW_SIZE
             ):
-                # Ensure window size is odd for symmetrical convolution
                 win_size = LIVE_SMOOTHING_WINDOW_SIZE + (
                     1 if LIVE_SMOOTHING_WINDOW_SIZE % 2 == 0 else 0
                 )
-                # Check if window size is valid for the data length and at least 3
-                if win_size <= len(data_for_max_finding) and win_size >= 3:
+                if win_size <= len(data_source_for_scaling) and win_size >= 3:
                     weights = np.ones(win_size) / float(win_size)
                     try:
-                        smoothed_data_for_scaling = np.convolve(
-                            data_for_max_finding, weights, mode="same"
-                        )
-                        logger.debug(
-                            "Applied smoothing to data before finding max for Y-axis rescale."
+                        data_to_find_max_from = np.convolve(
+                            data_source_for_scaling, weights, mode="same"
                         )
                     except Exception as e_smooth:
                         logger.warning(
-                            f"Error applying smoothing during rescale: {e_smooth}. Using unsmoothed data."
+                            f"Error smoothing for rescale max finding: {e_smooth}"
                         )
-                        # smoothed_data_for_scaling remains data_for_max_finding
-                else:
-                    logger.debug(
-                        "Smoothing window size invalid for current data length during rescale. Using unsmoothed."
-                    )
-            # --- END MODIFICATION ---
 
-            max_val_for_scaling = 0.0
-            if len(smoothed_data_for_scaling) > 0:
-                max_val_for_scaling = np.max(smoothed_data_for_scaling)
-            else:
-                logger.warning(
-                    "Smoothed data for scaling is empty. Cannot determine max value."
-                )
-                # Potentially use a default or the unsmoothed max if smoothing somehow failed and emptied it
-                if (
-                    len(data_for_max_finding) > 0
-                ):  # Fallback to unsmoothed if smoothed is empty
-                    max_val_for_scaling = np.max(data_for_max_finding)
-                else:  # Should not happen if initial checks pass
-                    logger.error(
-                        "Critical: Both raw and smoothed data are empty in rescale. Aborting rescale."
-                    )
-                    return
+            max_val_for_scaling = (
+                np.max(data_to_find_max_from) if len(data_to_find_max_from) > 0 else 0.0
+            )
 
-            new_y_max = 0.0
+            new_y_max_val = 0.0
             if is_reflectance_plot_for_rescale:
-                new_y_max = max(
+                new_y_max_val = max(
                     float(Y_AXIS_REFLECTANCE_RESCALE_MIN_CEILING),
                     float(max_val_for_scaling * Y_AXIS_RESCALE_FACTOR),
                 )
-                new_y_max = min(
-                    new_y_max, float(Y_AXIS_REFLECTANCE_RESCALE_MAX_CEILING)
+                new_y_max_val = min(
+                    new_y_max_val, float(Y_AXIS_REFLECTANCE_RESCALE_MAX_CEILING)
                 )
-            else:  # Raw data scaling
-                new_y_max = max(
+            else:  # Raw
+                new_y_max_val = max(
                     float(Y_AXIS_MIN_CEILING),
                     float(max_val_for_scaling * Y_AXIS_RESCALE_FACTOR),
                 )
-                new_y_max = min(
-                    new_y_max, float(self._hw_max_intensity_adc * Y_AXIS_RESCALE_FACTOR)
+                new_y_max_val = min(
+                    new_y_max_val,
+                    float(self._hw_max_intensity_adc * Y_AXIS_RESCALE_FACTOR),
                 )
 
-            self._current_y_max = new_y_max
-            logger.info(
-                f"Y-axis max rescaled to: {self._current_y_max:.2f} (based on {'smoothed ' if USE_LIVE_SMOOTHING else ''}peak val: {max_val_for_scaling:.2f}, type: {'Reflectance' if is_reflectance_plot_for_rescale else 'Raw'})"
-            )
+            self._current_y_max_for_plot = new_y_max_val
+            if self.pygame_plotter:
+                self.pygame_plotter.set_y_limits(0, self._current_y_max_for_plot)
+                # Update tick format based on the new scale and mode
+                if is_reflectance_plot_for_rescale:
+                    self.pygame_plotter.set_y_tick_format(
+                        "{:.2f}"
+                        if new_y_max_val < 2.0 and new_y_max_val > 0
+                        else "{:.1f}"
+                    )
+                else:  # Raw
+                    self.pygame_plotter.set_y_tick_format("{:.0f}")
+            logger.info(f"Y-axis max rescaled to: {self._current_y_max_for_plot:.2f}")
 
         except AssertionError as ae:
             logger.error(f"AssertionError during Y-axis rescale: {ae}", exc_info=True)
         except Exception as e:
             logger.error(f"Error rescaling Y-axis: {e}", exc_info=True)
 
-    def _capture_and_plot(self) -> pygame.Surface | None:
-        # Initial check for plotting library
-        if not (self.plot_fig and self.plot_ax and self.plot_line and plt and Image):
-            logger.warning(
-                "_capture_and_plot: Plotting components not initialized or Matplotlib/Pillow missing."
-            )
-            return None  # Cannot plot
-
-        spectrometer_can_operate = self._is_spectrometer_ready()
-        state = self._current_state
-        current_menu_mode = self.menu_system.get_collection_mode()
-
-        plot_wl: np.ndarray | None = None
-        plot_inten: np.ndarray | None = None
-        y_label_str = "Intensity"
-
-        # --- Handle states that display FROZEN data first ---
-        is_frozen_plot_state = state == self.STATE_FROZEN_VIEW or (
-            state == self.STATE_AUTO_INTEG_CONFIRM
-            and self._frozen_capture_type == self.FROZEN_TYPE_AUTO_INTEG_RESULT
-        )
-
-        if is_frozen_plot_state:
-            if (
-                self._frozen_intensities is not None
-                and self._frozen_wavelengths is not None
-                and self._frozen_integration_ms is not None
-            ):
-                plot_wl, plot_inten = self._frozen_wavelengths, self._frozen_intensities
-                if state == self.STATE_FROZEN_VIEW:
-                    assert self._frozen_capture_type is not None
-                    if self._frozen_capture_type == self.FROZEN_TYPE_OOI:
-                        assert self._frozen_sample_collection_mode is not None
-                        y_label_str = f"{self._frozen_sample_collection_mode.capitalize()} (Frozen)"
-                    else:  # DARK, WHITE
-                        y_label_str = (
-                            f"{self._frozen_capture_type.capitalize()} (Frozen)"
-                        )
-                elif state == self.STATE_AUTO_INTEG_CONFIRM:
-                    y_label_str = f"Raw Final ({self._frozen_integration_ms}ms)"
-            else:
-                logger.error(
-                    "Frozen data missing for plot in a frozen state. Discarding stale state."
-                )
-                self._perform_discard_frozen_data()  # Go back to a valid non-frozen state
-                return None  # No plot this frame
-        # --- Handle LIVE data capture and plotting ---
-        elif spectrometer_can_operate:
-            # This block executes for live_view, calibrate, dark_setup, white_setup, auto_integ_setup, auto_integ_running
-            # if the spectrometer is ready.
-            try:
-                current_menu_integ_ms = self.menu_system.get_integration_time_ms()
-                integ_time_for_capture_us = (
-                    self._current_auto_integ_us
-                    if state == self.STATE_AUTO_INTEG_RUNNING
-                    else int(current_menu_integ_ms * 1000)
-                )
-
-                if (
-                    current_menu_integ_ms != self._last_integration_time_ms
-                    and state != self.STATE_AUTO_INTEG_RUNNING
-                ):
-                    self._last_integration_time_ms = current_menu_integ_ms
-
-                integ_us_clamped = max(
-                    self._hw_min_integration_us,
-                    min(integ_time_for_capture_us, self._hw_max_integration_us),
-                )
-                self.spectrometer.integration_time_micros(integ_us_clamped)
-
-                raw_inten_capture = self.spectrometer.intensities(
-                    correct_dark_counts=True, correct_nonlinearity=True
-                )
-
-                if raw_inten_capture is None or len(raw_inten_capture) != len(
-                    self.wavelengths
-                ):
-                    logger.warning(
-                        f"Failed live capture or length mismatch in state {state}."
-                    )
-                    return None  # No plot this frame
-
-                plot_wl = (
-                    self.wavelengths
-                )  # Wavelengths are from the ready spectrometer
-
-                # Determine plot_inten and y_label based on state and mode
-                is_calibration_raw_display_state = state in [
-                    self.STATE_CALIBRATE,
-                    self.STATE_DARK_CAPTURE_SETUP,
-                    self.STATE_WHITE_CAPTURE_SETUP,
-                    self.STATE_AUTO_INTEG_SETUP,
-                ]
-
-                if (
-                    is_calibration_raw_display_state
-                    or state == self.STATE_AUTO_INTEG_RUNNING
-                ):
-                    plot_inten = raw_inten_capture
-                    y_label_str = "Intensity (Counts)"
-                    if state == self.STATE_AUTO_INTEG_RUNNING:
-                        y_label_str = f"Raw Auto ({integ_us_clamped/1000.0:.1f}ms)"
-                    # Ensure Y-axis is suitable for raw counts
-                    if self._current_y_max < Y_AXIS_MIN_CEILING * 0.9 or (
-                        current_menu_mode == MODE_REFLECTANCE
-                        and self._current_y_max
-                        <= Y_AXIS_REFLECTANCE_RESCALE_MAX_CEILING * 1.1
-                    ):
-                        self._current_y_max = Y_AXIS_DEFAULT_MAX
-                elif state == self.STATE_LIVE_VIEW:
-                    if current_menu_mode == MODE_REFLECTANCE:
-                        valid_refs, _ = self._are_references_valid_for_reflectance()
-                        if valid_refs:
-                            assert (
-                                self._dark_reference_intensities is not None
-                                and self._white_reference_intensities is not None
-                            )
-                            numerator = (
-                                raw_inten_capture - self._dark_reference_intensities
-                            )
-                            denominator = (
-                                self._white_reference_intensities
-                                - self._dark_reference_intensities
-                            )
-                            reflectance_values = np.full_like(raw_inten_capture, 0.0)
-                            valid_indices = np.where(np.abs(denominator) > DIVISION_EPSILON)  # type: ignore
-                            reflectance_values[valid_indices] = (
-                                numerator[valid_indices] / denominator[valid_indices]
-                            )
-                            plot_inten = np.clip(
-                                reflectance_values,
-                                0.0,
-                                Y_AXIS_REFLECTANCE_RESCALE_MAX_CEILING,
-                            )
-                            y_label_str = "Reflectance"
-                            if (
-                                self._current_y_max
-                                > Y_AXIS_REFLECTANCE_RESCALE_MAX_CEILING * 1.1
-                            ):
-                                self._current_y_max = Y_AXIS_REFLECTANCE_DEFAULT_MAX
-                        else:  # Reflectance mode but refs not valid for current settings
-                            plot_inten = raw_inten_capture  # Show raw data
-                            y_label_str = "Intensity (Ref Mode - No Valid Refs)"
-                            if self._current_y_max < Y_AXIS_MIN_CEILING * 0.9:
-                                self._current_y_max = Y_AXIS_DEFAULT_MAX
-                    else:  # MODE_RAW in LIVE_VIEW
-                        plot_inten = raw_inten_capture
-                        y_label_str = "Intensity (Counts)"
-                        if self._current_y_max < Y_AXIS_MIN_CEILING * 0.9:
-                            self._current_y_max = Y_AXIS_DEFAULT_MAX
-                else:  # Should not be reached if states are handled, fallback
-                    plot_inten = raw_inten_capture
-                    y_label_str = f"Intensity ({state})"
-
-            except (
-                sb.SeaBreezeError,
-                (usb.core.USBError if usb else OSError),
-                AttributeError,
-                AssertionError,
-                RuntimeError,
-            ) as e_capture:
-                logger.error(
-                    f"Error during live data capture for plot: {e_capture}",
-                    exc_info=False,
-                )
-                return None  # No plot this frame
-        else:
-            # Spectrometer is NOT ready, and we are NOT in a frozen data display state.
-            # This means we are in a live view or setup state, but hardware is unavailable.
-            logger.debug(
-                "_capture_and_plot: Spectrometer not ready, and not in a frozen display state. No data to plot."
-            )
-            return None  # No data to plot. The draw() method will handle showing "Not Ready".
-
-        # --- Common Plot Rendering Logic (if plot_wl and plot_inten have data) ---
+    def _draw_overlays(self):
+        # Ensure self.overlay_font is used for general status,
+        # and self.spectro_hint_font (if loaded) is used for the hint text.
         if (
-            plot_wl is None
-            or plot_inten is None
-            or len(plot_wl) == 0
-            or len(plot_inten) == 0
-        ):
-            logger.debug(
-                "_capture_and_plot: No valid wavelength or intensity data to render."
-            )
-            return None
-
-        try:
-            display_intensities = plot_inten
-            # Smoothing logic (as before)
-            if (
-                USE_LIVE_SMOOTHING
-                and LIVE_SMOOTHING_WINDOW_SIZE > 1
-                and np
-                and isinstance(plot_inten, np.ndarray)
-                and plot_inten.size >= LIVE_SMOOTHING_WINDOW_SIZE
-            ):
-                win_size = LIVE_SMOOTHING_WINDOW_SIZE + (
-                    1 if LIVE_SMOOTHING_WINDOW_SIZE % 2 == 0 else 0
-                )
-                if win_size <= len(plot_inten) and win_size >= 3:
-                    weights = np.ones(win_size) / float(win_size)
-                    display_intensities = np.convolve(plot_inten, weights, mode="same")  # type: ignore
-
-            self.plot_line.set_data(plot_wl, display_intensities)
-            self.plot_ax.set_ylabel(y_label_str, fontsize=9, color="white")
-            self.plot_ax.set_xlim(min(plot_wl), max(plot_wl))
-
-            if state == self.STATE_AUTO_INTEG_RUNNING and len(display_intensities) > 0:
-                current_max_val = np.max(display_intensities)
-                dynamic_y_max = max(
-                    float(Y_AXIS_MIN_CEILING),
-                    float(current_max_val * Y_AXIS_RESCALE_FACTOR),
-                )
-                dynamic_y_max = min(
-                    dynamic_y_max,
-                    float(self._hw_max_intensity_adc * Y_AXIS_RESCALE_FACTOR),
-                )
-                self.plot_ax.set_ylim(0, dynamic_y_max)
-            else:
-                self.plot_ax.set_ylim(0, self._current_y_max)
-
-            plot_buffer = io.BytesIO()
-            self.plot_fig.savefig(
-                plot_buffer,
-                format="png",
-                dpi=self.plot_fig.get_dpi(),
-                bbox_inches="tight",
-                pad_inches=0.05,
-            )
-            plot_buffer.seek(0)
-            if plot_buffer.getbuffer().nbytes == 0:
-                raise RuntimeError("Plot buffer is empty after savefig.")
-            plot_surface = pygame.image.load(plot_buffer, "png")
-            if plot_surface is None:
-                raise RuntimeError("pygame.image.load returned None from buffer.")
-            plot_buffer.close()
-            return plot_surface
-
-        except Exception as render_err:
-            logger.error(f"Error rendering plot data: {render_err}", exc_info=True)
-            if "plot_buffer" in locals() and plot_buffer:
-                plot_buffer.close()
-            return None
-
-    def _draw_overlays(self):  # MODIFIED for 6 hint states
-        if not self.overlay_font or not self.menu_system or not self.screen:
-            logger.warning("Overlay dependencies missing in _draw_overlays.")
+            not self.screen or not self.menu_system
+        ):  # Removed self.overlay_font from this primary check
+            logger.warning("Screen or MenuSystem missing in _draw_overlays.")
             return
+
+        # Check for general overlay font (used for most text)
+        if not self.overlay_font:
+            logger.warning(
+                "General overlay_font missing in _draw_overlays. Some text may not appear."
+            )
+            # Decide on behavior: either return, or try to proceed without this font.
+            # For now, we'll let it proceed and individual render calls might fail or use None.
 
         state = self._current_state
         current_menu_mode = self.menu_system.get_collection_mode()
         current_menu_integ_ms = self.menu_system.get_integration_time_ms()
-        disp_integ_ms = DEFAULT_INTEGRATION_TIME_MS
+        disp_integ_ms = current_menu_integ_ms
 
         try:
             if (
@@ -3475,146 +3833,141 @@ class SpectrometerScreen:
                 and self._pending_auto_integ_ms is not None
             ):
                 disp_integ_ms = self._pending_auto_integ_ms
-            else:  # For live states, use current menu integration
-                disp_integ_ms = current_menu_integ_ms
         except Exception as e_integ_disp:
             logger.warning(
                 f"Could not get integration time for overlay: {e_integ_disp}"
             )
 
-        try:
-            top_y_pos = 5
-            left_x_pos_start = 5
-            right_margin = 5
-            text_spacing = 10
-            current_x_pos = left_x_pos_start
+        top_y_pos, left_x_pos_start, right_margin, text_spacing = 5, 5, 5, 10
+        current_x_pos = left_x_pos_start
 
-            integ_text_str = f"Integ: {disp_integ_ms} ms"
-            integ_surf = self.overlay_font.render(integ_text_str, True, YELLOW)
-            self.screen.blit(integ_surf, (current_x_pos, top_y_pos))
-            current_x_pos += integ_surf.get_width() + text_spacing
+        # Render with self.overlay_font
+        if self.overlay_font:
+            try:
+                integ_surf = self.overlay_font.render(
+                    f"Integ: {disp_integ_ms} ms", True, YELLOW
+                )
+                self.screen.blit(integ_surf, (current_x_pos, top_y_pos))
+                current_x_pos += integ_surf.get_width() + text_spacing
 
-            scans_text_str = f"Scans: {self._scans_today_count}"
-            scans_surf = self.overlay_font.render(scans_text_str, True, YELLOW)
-            self.screen.blit(scans_surf, (current_x_pos, top_y_pos))
+                scans_surf = self.overlay_font.render(
+                    f"Scans: {self._scans_today_count}", True, YELLOW
+                )
+                self.screen.blit(scans_surf, (current_x_pos, top_y_pos))
+            except Exception as e_render_status:
+                logger.error(f"Error rendering status overlays: {e_render_status}")
 
-            mode_txt_l1, mode_color_l1, hint_txt = "", YELLOW, ""
-
-            if state == self.STATE_LIVE_VIEW:
-                mode_txt_l1 = f"Mode: {current_menu_mode.upper()}"
-                mode_color_l1 = YELLOW
-
-                if current_menu_mode == MODE_REFLECTANCE:
-                    valid_refs_overall, reason_code = (
-                        self._are_references_valid_for_reflectance()
-                    )
-
-                    if not valid_refs_overall:
-                        hint_base = "-> X:Calib | B:Menu"
-                        # Build hint based on reason_code from _are_references_valid_for_reflectance
-                        if reason_code == "No Dark/White refs":
-                            hint_txt = "No Dark/White refs " + hint_base
-                        elif reason_code == "No Dark ref":
-                            hint_txt = "No Dark ref " + hint_base
-                        elif reason_code == "No White ref":
-                            hint_txt = "No White ref " + hint_base
-                        elif reason_code == "Integ mismatch D&W":
-                            hint_txt = "Integ mismatch D&W " + hint_base
-                        elif reason_code == "Integ mismatch Dark":
-                            hint_txt = "Integ mismatch Dark " + hint_base
-                        elif reason_code == "Integ mismatch White":
-                            hint_txt = "Integ mismatch White " + hint_base
-                        else:
-                            hint_txt = "Ref Problem " + hint_base  # Fallback
-                    else:  # Reflectance mode, refs are valid
-                        hint_txt = "A:Freeze | X:Calib | Y:Rescale | B:Menu"
-                else:  # e.g., MODE_RAW
+        mode_txt_l1, mode_color_l1, hint_txt = "", YELLOW, ""
+        if state == self.STATE_LIVE_VIEW:
+            mode_txt_l1 = f"Mode: {current_menu_mode.upper()}"
+            if current_menu_mode == MODE_REFLECTANCE:
+                valid_refs_overall, reason_code = (
+                    self._are_references_valid_for_reflectance()
+                )
+                hint_base = "-> X:Calib | B:Menu"
+                if not valid_refs_overall:
+                    if reason_code == "No Dark/White refs":
+                        hint_txt = "No Dark/White refs " + hint_base
+                    elif reason_code == "No Dark ref":
+                        hint_txt = "No Dark ref " + hint_base
+                    elif reason_code == "No White ref":
+                        hint_txt = "No White ref " + hint_base
+                    elif reason_code == "Integ mismatch D&W":
+                        hint_txt = "Integ mismatch D&W " + hint_base
+                    elif reason_code == "Integ mismatch Dark":
+                        hint_txt = "Integ mismatch Dark " + hint_base
+                    elif reason_code == "Integ mismatch White":
+                        hint_txt = "Integ mismatch White " + hint_base
+                    else:
+                        hint_txt = "Ref Problem " + hint_base
+                else:
                     hint_txt = "A:Freeze | X:Calib | Y:Rescale | B:Menu"
-
-            elif state == self.STATE_FROZEN_VIEW:
-                mode_txt_l1 = "Mode: REVIEW"
-                mode_color_l1 = BLUE
-                hint_txt = "A:Save Frozen | B:Discard Frozen"
-
-            elif state == self.STATE_CALIBRATE:
-                mode_txt_l1 = "CALIBRATION MENU"
-                mode_color_l1 = GREEN
-                hint_txt = "A:White | X:Dark | Y:Auto | B:Back"
-            elif state == self.STATE_DARK_CAPTURE_SETUP:
-                mode_txt_l1 = "Mode: DARK SETUP"
-                mode_color_l1 = RED
-                hint_txt = "A:Freeze Dark | B:Back (Calib)"
-            elif state == self.STATE_WHITE_CAPTURE_SETUP:
-                mode_txt_l1 = "Mode: WHITE SETUP"
-                mode_color_l1 = CYAN
-                hint_txt = "A:Freeze White | Y:Rescale | B:Back (Calib)"
-            elif state == self.STATE_AUTO_INTEG_SETUP:
-                mode_txt_l1 = "AUTO INTEG SETUP"
-                mode_color_l1 = MAGENTA
-                hint_txt = "Aim White Ref -> A:Start | B:Back (Calib)"
-            elif state == self.STATE_AUTO_INTEG_RUNNING:
-                mode_txt_l1 = f"AUTO RUN iter:{self._auto_integ_iteration_count}"
-                mode_color_l1 = MAGENTA
-                hint_txt = "B:Cancel Auto-Integration"
-            elif state == self.STATE_AUTO_INTEG_CONFIRM:
-                mode_txt_l1 = "AUTO INTEG CONFIRM"
-                mode_color_l1 = MAGENTA
-                hint_txt = "A:Apply Result | B:Back (Calib)"
             else:
-                mode_txt_l1 = f"Mode: {state.upper()} (ERROR)"  # Should not happen with corrected handle_input
-                logger.error(f"Overlay: Unhandled state '{state}' for mode text.")
+                hint_txt = "A:Freeze | X:Calib | Y:Rescale | B:Menu"
+        elif state == self.STATE_FROZEN_VIEW:
+            mode_txt_l1, mode_color_l1, hint_txt = (
+                "Mode: REVIEW",
+                BLUE,
+                "A:Save Frozen | B:Discard Frozen",
+            )
+        elif state == self.STATE_CALIBRATE:
+            mode_txt_l1, mode_color_l1, hint_txt = (
+                "CALIBRATION MENU",
+                GREEN,
+                "A:White | X:Dark | Y:Auto | B:Back",
+            )
+        elif state == self.STATE_DARK_CAPTURE_SETUP:
+            mode_txt_l1, mode_color_l1, hint_txt = (
+                "Mode: DARK SETUP",
+                RED,
+                "A:Freeze Dark | B:Back (Calib)",
+            )
+        elif state == self.STATE_WHITE_CAPTURE_SETUP:
+            mode_txt_l1, mode_color_l1, hint_txt = (
+                "Mode: WHITE SETUP",
+                CYAN,
+                "A:Freeze White | Y:Rescale | B:Back (Calib)",
+            )
+        elif state == self.STATE_AUTO_INTEG_SETUP:
+            mode_txt_l1, mode_color_l1, hint_txt = (
+                "AUTO INTEG SETUP",
+                MAGENTA,
+                "Aim White Ref -> A:Start | B:Back (Calib)",
+            )
+        elif state == self.STATE_AUTO_INTEG_RUNNING:
+            mode_txt_l1, mode_color_l1, hint_txt = (
+                f"AUTO RUN iter:{self._auto_integ_iteration_count}",
+                MAGENTA,
+                "B:Cancel Auto-Integration",
+            )
+        elif state == self.STATE_AUTO_INTEG_CONFIRM:
+            mode_txt_l1, mode_color_l1, hint_txt = (
+                "AUTO INTEG CONFIRM",
+                MAGENTA,
+                "A:Apply Result | B:Back (Calib)",
+            )
+        else:
+            mode_txt_l1 = f"Mode: {state.upper()} (ERROR)"
 
-            if mode_txt_l1:
+        # Render Mode text with self.overlay_font
+        if mode_txt_l1 and self.overlay_font:
+            try:
                 mode_surf_l1 = self.overlay_font.render(
                     mode_txt_l1, True, mode_color_l1
                 )
-                mode_rect = mode_surf_l1.get_rect(
-                    right=SCREEN_WIDTH - right_margin, top=top_y_pos
-                )
-                scan_text_width_plus_spacing = (
-                    scans_surf.get_width() + text_spacing if scans_surf else 0
-                )
-
-                # Check for potential overlap with scan count if mode text is very long
-                # (though it's generally shorter now for error states)
-                # A more robust placement would be to ensure mode_rect.left > current_x_pos + scan_text_width_plus_spacing
-                # For simplicity, this right-aligns it if it's too long to fit after scans.
-                if (
-                    mode_rect.left < current_x_pos + scan_text_width_plus_spacing
-                ):  # Heuristic check
-                    mode_rect.right = (
-                        SCREEN_WIDTH - right_margin
-                    )  # Keep it right aligned
-                else:
-                    # If it fits, try to place it after scans, but still prefer right alignment
-                    # This can be tricky. Let's keep it simple: right align it.
-                    pass  # mode_rect is already right-aligned by default above
-
-                self.screen.blit(mode_surf_l1, mode_rect)
-
-            if hint_txt:
-                hint_surf = self.overlay_font.render(hint_txt, True, YELLOW)
                 self.screen.blit(
-                    hint_surf,
-                    hint_surf.get_rect(
-                        centerx=SCREEN_WIDTH // 2, bottom=SCREEN_HEIGHT - 5
+                    mode_surf_l1,
+                    mode_surf_l1.get_rect(
+                        right=SCREEN_WIDTH - right_margin, top=top_y_pos
                     ),
                 )
+            except Exception as e_render_mode:
+                logger.error(f"Error rendering mode overlay: {e_render_mode}")
 
-        except pygame.error as e_render_overlay_final:
-            logger.error(
-                f"Pygame error rendering overlays: {e_render_overlay_final}",
-                exc_info=True,
-            )
-        except AssertionError as e_assert_overlay_final:
-            logger.error(
-                f"AssertionError rendering overlays: {e_assert_overlay_final}",
-                exc_info=True,
-            )
-        except Exception as e_overlay_final:
-            logger.error(
-                f"Unexpected error rendering overlays: {e_overlay_final}", exc_info=True
-            )
+        # Render Hint text with self.spectro_hint_font (NEW)
+        if hint_txt:
+            font_to_use_for_hint = self.spectro_hint_font  # Use the specific hint font
+            if not font_to_use_for_hint:  # Fallback if spectro_hint_font failed to load
+                logger.warning(
+                    "SpectrometerScreen hint font not loaded, attempting to use general overlay_font for hint."
+                )
+                font_to_use_for_hint = self.overlay_font
+
+            if font_to_use_for_hint:  # If any font is available
+                try:
+                    hint_surf = font_to_use_for_hint.render(hint_txt, True, YELLOW)
+                    self.screen.blit(
+                        hint_surf,
+                        hint_surf.get_rect(
+                            centerx=SCREEN_WIDTH // 2, bottom=SCREEN_HEIGHT - 5
+                        ),
+                    )
+                except Exception as e_render_hint:
+                    logger.error(f"Error rendering hint overlay: {e_render_hint}")
+            else:
+                logger.error(
+                    "SpectrometerScreen: No font available to render hint text."
+                )
 
     def draw(self):
         if self.screen is None:
@@ -3622,10 +3975,9 @@ class SpectrometerScreen:
             return
         self.screen.fill(BLACK)
 
-        spectrometer_can_operate = self._is_spectrometer_ready()  # True if HW is ok
-        plot_surface = None
+        self._update_plot_data_for_state()  # This prepares data for PygamePlotter
 
-        # Determine if we are in a state that should display previously frozen data
+        spectrometer_can_operate = self._is_spectrometer_ready()
         is_frozen_data_display_state = (
             self._current_state == self.STATE_FROZEN_VIEW
             or (
@@ -3635,73 +3987,56 @@ class SpectrometerScreen:
             )
         )
 
-        if spectrometer_can_operate or is_frozen_data_display_state:
-            # Attempt to capture and plot if spectrometer is ready OR if we have frozen data to show
-            if self.plot_fig:  # Check if plot components are initialized
-                plot_surface = self._capture_and_plot()
+        if self.pygame_plotter:
+            if spectrometer_can_operate or is_frozen_data_display_state:
+                self.pygame_plotter.draw()
             else:
-                logger.warning("Plotting components not initialized, cannot draw plot.")
-
-        if plot_surface:
-            plot_rect = plot_surface.get_rect(
-                centerx=SCREEN_WIDTH // 2, top=25
-            )  # Position of plot
-            plot_rect.clamp_ip(
-                self.screen.get_rect()
-            )  # Ensure it's within screen bounds
-            self.screen.blit(plot_surface, plot_rect)
-        else:
-            # No plot surface available (either error, or spectrometer not ready and no frozen data)
-            if self.overlay_font:
-                status_txt = (
-                    "Plot Error"  # Default if plot_surface is None for unknown reason
-                )
-                if not USE_SPECTROMETER:  # Configured off
+                if self.overlay_font:
                     status_txt = "Spectrometer Disabled"
-                elif not self.spectrometer:  # Failed to init Spectrometer object
-                    status_txt = "Spectrometer Not Found"
-                elif not spectrometer_can_operate and not is_frozen_data_display_state:
-                    # Hardware not ready and no frozen data to show (e.g. live view with no device)
-                    status_txt = "Spectrometer Not Ready"
-                elif self.plot_fig is None:
-                    status_txt = "Plotting System Error"
+                    if not USE_SPECTROMETER:
+                        status_txt = "Spectrometer Disabled"
+                    elif not self.spectrometer:
+                        status_txt = "Spectrometer Not Found"
+                    else:
+                        status_txt = "Spectrometer Not Ready"
 
+                    self.screen.fill(
+                        self.pygame_plotter.bg_color,
+                        self.pygame_plotter.plot_widget_rect,
+                    )
+                    status_surf = self.overlay_font.render(status_txt, True, RED)
+                    text_rect = status_surf.get_rect(
+                        center=self.pygame_plotter.plot_widget_rect.center
+                    )
+                    self.screen.blit(status_surf, text_rect)
+        else:
+            if self.overlay_font:
                 status_surf = self.overlay_font.render(
-                    status_txt,
-                    True,
-                    RED if "Not Ready" in status_txt or "Error" in status_txt else GRAY,
+                    "Plotter System Error", True, RED
                 )
                 text_rect = status_surf.get_rect(
                     center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
                 )
                 self.screen.blit(status_surf, text_rect)
 
-        self._draw_overlays()  # Draw status text, hints, etc.
-        update_hardware_display(self.screen, self.display_hat)  # Actual screen update
+        self._draw_overlays()
+        update_hardware_display(self.screen, self.display_hat)
 
     def run_loop(self) -> str:
         logger.info(
             f"Starting Spectrometer screen loop (Initial State: {self._current_state})."
         )
-        assert (
-            self.menu_system is not None
-        ), "MenuSystem not available in SpectrometerScreen run_loop"
+        assert self.menu_system is not None
 
         while self.is_active and not g_shutdown_flag.is_set():
-            # --- MODIFICATION: Check for leak flag within SpectrometerScreen's loop ---
             if g_leak_detected_flag.is_set():
                 logger.warning(
-                    "Leak detected while SpectrometerScreen is active. Returning to main for handling."
+                    "Leak detected while SpectrometerScreen active. Returning."
                 )
-                self.deactivate()  # Properly deactivate this screen
-                return (
-                    "BACK"  # Signal main loop to take over (it will then see the leak)
-                )
-            # --- END MODIFICATION ---
+                self.deactivate()
+                return "BACK"
 
-            action = (
-                self.handle_input()
-            )  # Processes Pygame events, button states for spectrometer screen
+            action = self.handle_input()
             if action == "QUIT":
                 self.deactivate()
                 return "QUIT"
@@ -3712,63 +4047,40 @@ class SpectrometerScreen:
             if (
                 self._current_state == self.STATE_AUTO_INTEG_RUNNING
                 and self._auto_integ_optimizing
-                and self._is_spectrometer_ready()  # Ensure spec is still ready for this step
+                and self._is_spectrometer_ready()
             ):
-                self._run_auto_integration_step()  # This might change state if an error occurs or completes
+                self._run_auto_integration_step()
 
-            self.draw()  # Draws the spectrometer screen content
+            self.draw()
 
             wait_ms = int(SPECTRO_LOOP_DELAY_S * 1000)
             try:
-                # Dynamic wait time calculation
                 if self._current_state not in [
                     self.STATE_FROZEN_VIEW,
                     self.STATE_CALIBRATE,
                     self.STATE_AUTO_INTEG_CONFIRM,
                 ]:
-                    integ_ms_for_wait = 0
-                    if self._current_state == self.STATE_AUTO_INTEG_RUNNING:
-                        # current_auto_integ_us is already clamped in its usage
-                        integ_ms_for_wait = int(
-                            round(self._current_auto_integ_us / 1000.0)
-                        )
-                    else:  # live_view, dark_setup, white_setup, auto_integ_setup
-                        integ_ms_for_wait = self.menu_system.get_integration_time_ms()
-
-                    assert (
-                        isinstance(integ_ms_for_wait, int) and integ_ms_for_wait >= 0
-                    ), f"Invalid integration time for wait: {integ_ms_for_wait}"
-
+                    integ_ms_for_wait = (
+                        self._current_auto_integ_us // 1000
+                        if self._current_state == self.STATE_AUTO_INTEG_RUNNING
+                        else self.menu_system.get_integration_time_ms()
+                    )
+                    assert isinstance(integ_ms_for_wait, int) and integ_ms_for_wait >= 0
                     if integ_ms_for_wait > 0:
                         target_wait_s = (
                             integ_ms_for_wait / 1000.0
                         ) + SPECTRO_REFRESH_OVERHEAD_S
-                        # Ensure wait_ms is at least the base loop delay
                         wait_ms = int(max(SPECTRO_LOOP_DELAY_S, target_wait_s) * 1000)
-            except AssertionError as ae_wait:  # Catch assertion from integ_ms_for_wait
-                logger.warning(
-                    f"Assertion error calculating dynamic wait time: {ae_wait}. Using default."
-                )
             except Exception as e_wait:
-                logger.warning(
-                    f"Error calculating dynamic wait time: {e_wait}. Using default."
-                )
+                logger.warning(f"Error calculating dynamic wait: {e_wait}")
 
-            assert (
-                isinstance(wait_ms, int) and wait_ms >= 0
-            ), f"Invalid final wait_ms: {wait_ms}"
+            assert isinstance(wait_ms, int) and wait_ms >= 0
             pygame.time.wait(wait_ms)
 
-        # Loop exited (either by shutdown, leak, or normal screen exit)
-        if (
-            self.is_active
-        ):  # If loop exited due to shutdown/leak but screen was technically still active
+        if self.is_active:
             self.deactivate()
-
         logger.info("Spectrometer screen loop finished.")
-        return (
-            "QUIT" if g_shutdown_flag.is_set() else "BACK"
-        )  # Default return if not explicitly set earlier
+        return "QUIT" if g_shutdown_flag.is_set() else "BACK"
 
     def cleanup(self):
         logger.info("Cleaning up SpectrometerScreen resources...")
@@ -3777,19 +4089,10 @@ class SpectrometerScreen:
                 dev_proxy = getattr(self.spectrometer, "_dev", None)
                 if dev_proxy and hasattr(dev_proxy, "is_open") and dev_proxy.is_open:
                     self.spectrometer.close()
-                    logger.info(
-                        f"Spectrometer {self.spectrometer.serial_number} closed."
-                    )
             except Exception as e:
                 logger.error(f"Error closing spectrometer: {e}", exc_info=True)
         self.spectrometer = None
-        if self.plot_fig and plt and plt.fignum_exists(self.plot_fig.number):
-            try:
-                plt.close(self.plot_fig)
-                logger.info("Matplotlib plot figure closed.")
-            except Exception as e:
-                logger.error(f"Error closing Matplotlib plot: {e}", exc_info=True)
-        self.plot_fig = self.plot_ax = self.plot_line = None
+        self.pygame_plotter = None
         logger.info("SpectrometerScreen cleanup complete.")
 
 
@@ -4161,6 +4464,72 @@ def update_hardware_display(
             )
 
 
+def _load_font_safe(font_name_or_path: str | None, size: int) -> pygame.font.Font:
+    """
+    Loads a Pygame font, falling back to default system font if specified font is not found.
+    """
+    assert isinstance(size, int) and size > 0, "Font size must be a positive integer."
+
+    loaded_font: pygame.font.Font | None = None
+
+    if font_name_or_path is None:  # Request for default font
+        try:
+            loaded_font = pygame.font.Font(None, size)
+            logger.debug(
+                f"PygamePlotter: Loaded Pygame default font, size {size}."
+            )  # Consider a more generic logger message if used by other classes
+        except Exception as e:
+            logger.error(
+                f"_load_font_safe: Failed to load Pygame default font, size {size}: {e}"
+            )
+            raise
+        return loaded_font
+
+    # Try loading as a direct file path first
+    try:
+        loaded_font = pygame.font.Font(font_name_or_path, size)
+        logger.debug(
+            f"_load_font_safe: Successfully loaded font '{font_name_or_path}', size {size}."
+        )
+        return loaded_font
+    except pygame.error as e:
+        logger.warning(
+            f"_load_font_safe: Font file '{font_name_or_path}' not found or error loading: {e}. Trying to match system font."
+        )
+
+    # If direct load fails, try matching font name
+    try:
+        base_font_name = os.path.splitext(os.path.basename(font_name_or_path))[0]
+        system_font_path = pygame.font.match_font(base_font_name)
+        if system_font_path:
+            logger.info(
+                f"_load_font_safe: Matched system font '{base_font_name}' to '{system_font_path}'."
+            )
+            loaded_font = pygame.font.Font(system_font_path, size)
+            return loaded_font
+        else:
+            logger.warning(
+                f"_load_font_safe: System font for '{base_font_name}' not matched."
+            )
+    except Exception as e_match:
+        logger.warning(
+            f"_load_font_safe: Error during system font matching for '{font_name_or_path}': {e_match}"
+        )
+
+    # Final fallback to Pygame's default font
+    logger.warning(
+        f"_load_font_safe: Falling back to Pygame default font for '{font_name_or_path}', size {size}."
+    )
+    try:
+        loaded_font = pygame.font.Font(None, size)
+    except Exception as e_default:
+        logger.error(
+            f"_load_font_safe: CRITICAL - Failed to load Pygame default font as final fallback: {e_default}"
+        )
+        raise
+    return loaded_font
+
+
 # --- Main Application ---
 def main():
     logger.info(
@@ -4291,7 +4660,6 @@ def main():
         temp_sensor_info = TempSensorInfo(mcp9808_physical_sensor)
 
         # --- Initialize Core Components ---
-        # ... (No changes to this section up to spec_screen instantiation) ...
         logger.info("Initializing core components...")
         net_info = NetworkInfo()
         # Pass display_hat only if it's active and of the correct type
@@ -4394,7 +4762,6 @@ def main():
         logger.info("Starting main application loop...")
         current_scr_state = "MENU"
         while not g_shutdown_flag.is_set():
-            # --- MODIFICATION FOR ISSUE 1: Prioritize leak check ---
             if g_leak_detected_flag.is_set():
                 logger.critical("Leak detected! Switching to leak warning screen.")
                 # Pass the active display_hat object
@@ -4419,7 +4786,6 @@ def main():
                 # If flag was cleared, normal operation resumes.
                 logger.info("Leak warning screen exited. Re-evaluating flags.")
                 continue  # Restart the main while loop to re-check flags
-            # --- END MODIFICATION ---
 
             # State-specific logic:
             if current_scr_state == "MENU":
@@ -4434,7 +4800,7 @@ def main():
                         spec_screen.activate()
                         current_scr_state = "SPECTROMETER"
                         logger.info("Transitioning to Spectrometer screen.")
-                        if not spectrometer_hardware_ok:  # This check is informative
+                        if not spectrometer_hardware_ok:
                             logger.warning(
                                 "Spectrometer hardware not ready, operations will be limited on Spectrometer screen."
                             )
@@ -4450,7 +4816,7 @@ def main():
                 assert (
                     spec_screen is not None
                 ), "SpectrometerScreen is None in SPECTROMETER state"
-                spec_status = spec_screen.run_loop()  # This is a blocking loop
+                spec_status = spec_screen.run_loop()
 
                 if spec_status == "QUIT":
                     logger.info("Spectrometer screen signaled QUIT.")
