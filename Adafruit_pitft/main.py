@@ -11,6 +11,8 @@ Features:
 - Configuration flags for optional hardware components.
 - Display of system status (time, network).
 - Spectrometer operations (Live view, capture, auto-integration - planned).
+
+sudo systemctl restart pysb-app.service
 """
 
 import os
@@ -25,6 +27,8 @@ import io  # For in-memory plot rendering
 import csv  # For future data saving
 import numpy as np  # Might need later for data manipulation
 import smbus2
+import hashlib  # For FastSpectralRenderer caching
+
 
 # --- Configuration Flags ---
 # Set these flags based on the hardware connected.
@@ -335,8 +339,10 @@ GRAY = (128, 128, 128)
 CYAN = (0, 255, 255)
 MAGENTA = (255, 0, 255)
 
-# Menu Layout
+
+# Menu Layout Constants
 FONT_SIZE = 16
+MENU_FONT_SIZE = 16
 TITLE_FONT_SIZE = 22
 HINT_FONT_SIZE = 16
 DISCLAIMER_FONT_SIZE = 14
@@ -347,13 +353,17 @@ SPECTRO_FONT_SIZE = 14
 PLOTTER_TICK_LABEL_FONT_SIZE = 12
 PLOTTER_AXIS_LABEL_FONT_SIZE = 14
 
+
 # --- Font Filenames
 TITLE_FONT_FILENAME = "ChakraPetch-Medium.ttf"
 MAIN_FONT_FILENAME = "Segoe UI.ttf"
 HINT_FONT_FILENAME = "Segoe UI.ttf"
 SPECTRO_FONT_FILENAME = "Segoe UI.ttf"
-PLOTTER_AXIS_LABEL_FONT_FILENAME = "Segoe UI.ttf"
-PLOTTER_TICK_LABEL_FONT_FILENAME = "Segoe UI Semilight.ttf"
+PLOTTER_AXIS_LABEL_FONT_FILENAME = "Segoe UI.ttf"  # For OptimizedPygamePlotter
+PLOTTER_TICK_LABEL_FONT_FILENAME = (
+    "Segoe UI Semilight.ttf"  # For OptimizedPygamePlotter
+)
+
 
 # Timing
 DEBOUNCE_DELAY_S = 0.2
@@ -1099,6 +1109,7 @@ class MenuSystem:
             False,
             None,
         )
+        self._menu_font_size = MENU_FONT_SIZE
         self.font, self.title_font, self.hint_font = None, None, None
         self._value_start_offset_x = 120
         self._load_fonts()
@@ -1116,31 +1127,29 @@ class MenuSystem:
             assert pygame.font.get_init(), "Pygame font module failed to initialize"
 
             logger.info("Loading fonts from assets folder...")
-            # Corrected assignment: define s_dir first
             script_dir = os.path.dirname(os.path.abspath(__file__))
-            assets_dir = os.path.join(script_dir, "assets")  # Now use script_dir
+            assets_dir = os.path.join(script_dir, "assets")
 
             paths = {
                 "title": os.path.join(assets_dir, TITLE_FONT_FILENAME),
-                "main": os.path.join(assets_dir, MAIN_FONT_FILENAME),
+                "main": os.path.join(
+                    assets_dir, MAIN_FONT_FILENAME
+                ),  # Use MENU_FONT_SIZE instead of FONT_SIZE
                 "hint": os.path.join(assets_dir, HINT_FONT_FILENAME),
             }
             sizes = {
                 "title": TITLE_FONT_SIZE,
-                "main": FONT_SIZE,
+                "main": MENU_FONT_SIZE,  # Changed from FONT_SIZE to MENU_FONT_SIZE
                 "hint": HINT_FONT_SIZE,
             }
             fonts_loaded: dict[str, pygame.font.Font | None] = {
                 "title": None,
                 "main": None,
                 "hint": None,
-            }  # Explicitly type
+            }
 
             # Loop is bounded by the number of entries in paths (fixed at 3)
-            for (
-                name,
-                path_str,
-            ) in paths.items():  # Renamed path to path_str to avoid conflict
+            for name, path_str in paths.items():
                 assert isinstance(path_str, str), f"{name} font path is not a string"
                 font_size = sizes[name]
                 assert (
@@ -1158,16 +1167,12 @@ class MenuSystem:
                             f"Loaded {name} font: {path_str} (Size: {font_size})"
                         )
 
-                    if (
-                        fonts_loaded[name] is None
-                    ):  # Should not happen with SysFont fallback, but good check
+                    if fonts_loaded[name] is None:
                         raise RuntimeError(
                             f"Font loading returned None for {name} even after SysFont fallback attempt."
                         )
 
-                except (
-                    pygame.error
-                ) as e_pygame:  # Catch Pygame-specific font loading errors
+                except pygame.error as e_pygame:
                     logger.error(
                         f"Pygame error loading {name} font '{path_str}' (Size: {font_size}): {e_pygame}. Using SysFont fallback.",
                         exc_info=True,
@@ -1180,11 +1185,11 @@ class MenuSystem:
                         logger.critical(
                             f"CRITICAL: SysFont fallback also failed for {name} font: {e_sysfont_fallback}"
                         )
-                        fonts_loaded[name] = None  # Ensure it's None
-                except RuntimeError as e_rt:  # Catch our explicit RuntimeError
+                        fonts_loaded[name] = None
+                except RuntimeError as e_rt:
                     logger.error(f"Runtime error for {name} font: {e_rt}")
                     fonts_loaded[name] = None
-                except Exception as e_general:  # Catch any other unexpected errors
+                except Exception as e_general:
                     logger.error(
                         f"Unexpected error loading {name} font '{path_str}': {e_general}. Using SysFont fallback.",
                         exc_info=True,
@@ -1205,11 +1210,11 @@ class MenuSystem:
             self.font = fonts_loaded["main"]
             self.hint_font = fonts_loaded["hint"]
 
-            if not self.font:  # Critical check for the main font
+            if not self.font:
                 logger.critical(
                     "Essential main font (self.font) failed to load, even with fallbacks. Application may not display correctly."
                 )
-            # Assertions on final types (can be None if loading failed critically)
+
             assert isinstance(
                 self.title_font, (pygame.font.Font, type(None))
             ), "Title font has invalid type post-load"
@@ -1220,14 +1225,10 @@ class MenuSystem:
                 self.hint_font, (pygame.font.Font, type(None))
             ), "Hint font has invalid type post-load"
 
-        except AssertionError as ae:  # Catch assertion errors within this function
+        except AssertionError as ae:
             logger.critical(f"AssertionError during font loading: {ae}", exc_info=True)
-            self.font = self.title_font = self.hint_font = (
-                None  # Ensure all are None on failure
-            )
-        except (
-            Exception
-        ) as e:  # Catch any other top-level errors during font init/setup
+            self.font = self.title_font = self.hint_font = None
+        except Exception as e:
             logger.critical(
                 f"Critical error during Pygame font initialization/loading setup: {e}",
                 exc_info=True,
@@ -1555,7 +1556,7 @@ class MenuSystem:
     def _draw_title(self):
         assert self.title_font
         surf = self.title_font.render("OPEN SPECTRO MENU", True, YELLOW)
-        self.screen.blit(surf, surf.get_rect(centerx=SCREEN_WIDTH // 2, top=10))
+        self.screen.blit(surf, surf.get_rect(centerx=SCREEN_WIDTH // 2, top=8))
 
     def _draw_menu_items(self):
         assert self.font
@@ -1658,18 +1659,33 @@ class MenuSystem:
                     f_str, off_str = fmt_t[0:2], ""
                 elif self._editing_field == self.FIELD_MINUTE:
                     f_str, off_str = fmt_t[3:5], fmt_t[0:3]
+
             if f_str:
                 f_w, off_w = self.font.size(f_str)[0], self.font.size(off_str)[0]
-                pad = 1
+
+                # Get actual font metrics for proper positioning
+                font_height = self.font.get_height()
+
+                # Dynamic padding based on menu spacing and font size
+                vertical_pad = max(1, int(MENU_SPACING * 0.05))  # 5% of menu spacing
+                horizontal_pad = max(1, int(MENU_FONT_SIZE * 0.1))  # 10% of font size
+
+                # Calculate proper vertical positioning
+                # In pygame, y_pos represents the TOP of the text when blitting
+                # So the box should start slightly above y_pos and extend down
+                box_top = y_pos - vertical_pad
+                box_height = font_height + (2 * vertical_pad)
+
                 rect = pygame.Rect(
-                    val_start_x + off_w - pad,
-                    y_pos - pad,
-                    f_w + 2 * pad,
-                    FONT_SIZE + 2 * pad,
+                    val_start_x + off_w - horizontal_pad,
+                    box_top,
+                    f_w + (2 * horizontal_pad),
+                    box_height,
                 )
         except Exception as e:
             logger.error(f"Error calculating highlight: {e}", exc_info=True)
             return
+
         if rect:
             pygame.draw.rect(self.screen, BLUE, rect, 1)
 
@@ -1686,570 +1702,11 @@ class MenuSystem:
         )
 
 
-class PygamePlotter:
-    """
-    A simple plotter using Pygame's drawing primitives for live spectra display.
-    Manages its own sub-surfaces for optimized redrawing of axes and plot lines.
-    Loads its own fonts based on globally defined constants from the main script.
-    """
-
-    def __init__(
-        self,
-        parent_surface: pygame.Surface,
-        plot_widget_rect: pygame.Rect,
-        initial_x_data: np.ndarray | None,
-        x_label_text: str = "Wavelength (nm)",
-        y_label_text: str = "Intensity",
-        bg_color: tuple[int, int, int] = BLACK,  # Uses global BLACK
-        axis_color: tuple[int, int, int] = GRAY,  # Uses global GRAY
-        plot_color: tuple[int, int, int] = CYAN,  # Uses global CYAN
-        text_color: tuple[int, int, int] = WHITE,  # Uses global WHITE
-        grid_color: tuple[int, int, int] = (40, 40, 40),
-        num_x_ticks: int = 5,
-        num_y_ticks: int = 5,
-    ):
-
-        assert (
-            parent_surface is not None
-        ), "PygamePlotter: parent_surface cannot be None"
-        assert (
-            plot_widget_rect is not None
-        ), "PygamePlotter: plot_widget_rect cannot be None"
-        assert (
-            pygame.font.get_init()
-        ), "PygamePlotter: Pygame font system not initialized."
-
-        self.parent_surface = parent_surface
-        self.plot_widget_rect = plot_widget_rect
-
-        # --- Font Loading using Global Constants from main.py ---
-        # Determine the absolute path to the 'assets' directory relative to main.py
-        # __file__ in main.py refers to main.py itself.
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        assets_dir = os.path.join(script_dir, "assets")
-
-        axis_font_path = os.path.join(assets_dir, PLOTTER_AXIS_LABEL_FONT_FILENAME)
-        tick_font_path = os.path.join(assets_dir, PLOTTER_TICK_LABEL_FONT_FILENAME)
-
-        # Load fonts using the globally defined _load_font_safe function
-        # and global size constants
-        self.axis_label_font = _load_font_safe(
-            axis_font_path, PLOTTER_AXIS_LABEL_FONT_SIZE
-        )
-        self.tick_label_font = _load_font_safe(
-            tick_font_path, PLOTTER_TICK_LABEL_FONT_SIZE
-        )
-        # --- End Font Loading ---
-
-        self.x_label_text = x_label_text
-        self.y_label_text = y_label_text
-        self.bg_color = bg_color
-        self.axis_color = axis_color
-        self.plot_color = plot_color
-        self.text_color = text_color
-        self.grid_color = grid_color
-        self.num_x_ticks = max(0, num_x_ticks)
-        self.num_y_ticks = max(0, num_y_ticks)
-        self.y_tick_format_str: str = "{:.1f}"
-
-        # --- Layout Customization Constants ---
-        self.LAYOUT_GAP_WIDGET_EDGE_TO_Y_TITLE = 1
-        self.LAYOUT_GAP_Y_TITLE_TO_Y_TICKS = 4
-        self.LAYOUT_GAP_Y_TICKS_TO_Y_AXIS_LINE = 5
-        self.LAYOUT_GAP_X_TICK_LABEL_RIGHT_MARGIN = 4
-
-        self.LAYOUT_PLOT_AREA_TOP_MARGIN = 2
-        self.LAYOUT_PLOT_AREA_BOTTOM_MARGIN = 2
-
-        self.LAYOUT_X_TICK_MARK_LENGTH = 5
-        self.LAYOUT_X_TICK_LABEL_MARGIN_FROM_MARK = 2
-        self.LAYOUT_X_AXIS_LABEL_MARGIN_FROM_X_TICK_LABELS = 2
-
-        # Calculate padding based on font sizes and layout constants
-        # Ensure fonts were loaded successfully before using get_height() or size()
-        if not self.axis_label_font or not self.tick_label_font:
-            logger.critical(
-                "PygamePlotter: Essential fonts (axis_label_font or tick_label_font) not loaded. Layout will be incorrect. Raising error."
-            )
-            # This is a critical failure. Application cannot proceed meaningfully.
-            # Alternatively, could try to use Pygame's default font if these are None,
-            # but _load_font_safe should have already done that.
-            # If they are None here, it means even the Pygame default font failed.
-            raise RuntimeError("PygamePlotter critical font loading failure.")
-
-        y_axis_title_width_rotated = self.axis_label_font.get_height()
-
-        example_y_tick_label_str = "1000"
-        if self.y_tick_format_str == "{:.0f}":
-            example_y_tick_label_str = "16383"
-        max_y_tick_label_width = self.tick_label_font.size(example_y_tick_label_str)[0]
-
-        self.padding_left = int(
-            self.LAYOUT_GAP_WIDGET_EDGE_TO_Y_TITLE
-            + y_axis_title_width_rotated
-            + self.LAYOUT_GAP_Y_TITLE_TO_Y_TICKS
-            + max_y_tick_label_width
-            + self.LAYOUT_GAP_Y_TICKS_TO_Y_AXIS_LINE
-        )
-
-        example_x_tick_label_str = "812"
-        max_x_tick_label_width = self.tick_label_font.size(example_x_tick_label_str)[0]
-        self.padding_right = int(
-            (max_x_tick_label_width / 2) + self.LAYOUT_GAP_X_TICK_LABEL_RIGHT_MARGIN
-        )
-
-        self.padding_top = int(
-            (self.tick_label_font.get_height() / 2) + self.LAYOUT_PLOT_AREA_TOP_MARGIN
-        )
-
-        self.padding_bottom = int(
-            self.LAYOUT_X_TICK_MARK_LENGTH
-            + self.LAYOUT_X_TICK_LABEL_MARGIN_FROM_MARK
-            + self.tick_label_font.get_height()
-            + self.LAYOUT_X_AXIS_LABEL_MARGIN_FROM_X_TICK_LABELS
-            + self.axis_label_font.get_height()
-            + self.LAYOUT_PLOT_AREA_BOTTOM_MARGIN
-        )
-
-        self.graph_area = pygame.Rect(
-            self.plot_widget_rect.left + self.padding_left,
-            self.plot_widget_rect.top + self.padding_top,
-            max(
-                20, self.plot_widget_rect.width - self.padding_left - self.padding_right
-            ),
-            max(
-                20,
-                self.plot_widget_rect.height - self.padding_top - self.padding_bottom,
-            ),
-        )
-
-        if self.graph_area.width < 20 or self.graph_area.height < 20:
-            logger.warning(
-                f"PygamePlotter: Graph area {self.graph_area} is very small. "
-                f"Widget: {self.plot_widget_rect}, Paddings LTRB: {self.padding_left}, "
-                f"{self.padding_right}, {self.padding_top}, {self.padding_bottom}."
-            )
-
-        self.x_data_static: np.ndarray | None = None
-        self.y_data_current: np.ndarray | None = None
-        self.screen_x_coords_static: list[float] = []
-
-        self.x_min_val: float = 0.0
-        self.x_max_val: float = 1.0
-        self.y_min_val_display: float = 0.0
-        self.y_max_val_display: float = 1.0
-
-        self._bg_surface: pygame.Surface = pygame.Surface(self.plot_widget_rect.size)
-        self._static_x_elements_surface: pygame.Surface = pygame.Surface(
-            self.plot_widget_rect.size, pygame.SRCALPHA
-        )
-        self._dynamic_y_elements_surface: pygame.Surface = pygame.Surface(
-            self.plot_widget_rect.size, pygame.SRCALPHA
-        )
-        self._plot_line_surface: pygame.Surface = pygame.Surface(
-            self.plot_widget_rect.size, pygame.SRCALPHA
-        )
-
-        self._needs_render_bg = True
-        self._needs_render_static_x = True
-        self._needs_render_dynamic_y = True
-        self._needs_render_plot_line = True
-
-        if initial_x_data is not None and len(initial_x_data) > 0:
-            self.set_x_data_static(initial_x_data)
-        else:
-            self.set_x_data_static(np.array([0.0, 1.0]))
-            logger.debug("PygamePlotter: Initialized with dummy X data.")
-
-        self._render_background()
-        self._render_static_x_elements()
-        self._render_dynamic_y_elements()
-        self._render_plot_line()
-
-    def set_y_tick_format(self, format_str: str):
-        """Sets the format string for Y-axis tick labels (e.g., '{:.0f}', '{:.2f}')."""
-        assert isinstance(format_str, str), "Format string must be a string."
-        if self.y_tick_format_str != format_str:
-            self.y_tick_format_str = format_str
-            self._needs_render_dynamic_y = True
-
-    def _map_value(
-        self,
-        value: float,
-        from_min: float,
-        from_max: float,
-        to_min: float,
-        to_max: float,
-    ) -> float:
-        assert (
-            from_max >= from_min
-        ), f"from_max ({from_max}) must be >= from_min ({from_min})"
-        if (from_max - from_min) == 0:
-            return to_min
-        return to_min + (value - from_min) * (to_max - to_min) / (from_max - from_min)
-
-    def set_x_data_static(self, x_data: np.ndarray):
-        assert (
-            isinstance(x_data, np.ndarray) and x_data.ndim == 1 and len(x_data) > 0
-        ), "Invalid static X data"
-        self.x_data_static = x_data.copy()
-        self.x_min_val = float(np.min(self.x_data_static))
-        self.x_max_val = float(np.max(self.x_data_static))
-        if self.x_max_val == self.x_min_val:
-            self.x_max_val = self.x_min_val + 1.0
-
-        self._precalculate_screen_x_coords()
-        self._needs_render_static_x = True
-
-    def _precalculate_screen_x_coords(self):
-        self.screen_x_coords_static = []
-        if (
-            self.x_data_static is None
-            or len(self.x_data_static) == 0
-            or self.graph_area.width <= 0
-        ):
-            return
-
-        for val in self.x_data_static:
-            self.screen_x_coords_static.append(
-                self._map_value(
-                    val,
-                    self.x_min_val,
-                    self.x_max_val,
-                    float(self.graph_area.left),
-                    float(self.graph_area.right),
-                )
-            )
-
-    def set_y_data(self, y_data: np.ndarray | None):
-        if y_data is not None:
-            assert isinstance(y_data, np.ndarray) and y_data.ndim == 1, "Invalid Y data"
-            if self.x_data_static is not None and len(y_data) != len(
-                self.x_data_static
-            ):
-                logger.error(
-                    f"PygamePlotter: Y data length ({len(y_data)}) "
-                    f"mismatches X data ({len(self.x_data_static)}). Plotting skipped."
-                )
-                self.y_data_current = None
-            else:
-                self.y_data_current = y_data.copy()
-        else:
-            self.y_data_current = None
-        self._needs_render_plot_line = True
-
-    def set_y_limits(self, y_min: float, y_max: float):
-        assert isinstance(y_min, (int, float)) and isinstance(
-            y_max, (int, float)
-        ), "Y limits must be numeric"
-        y_min_f, y_max_f = float(y_min), float(y_max)
-
-        if y_max_f == y_min_f:
-            y_max_f = y_min_f + 1.0
-        if y_max_f < y_min_f:
-            logger.warning(
-                f"PygamePlotter: Y_max {y_max_f} < Y_min {y_min_f}. Swapping."
-            )
-            y_min_f, y_max_f = y_max_f, y_min_f
-
-        if self.y_min_val_display != y_min_f or self.y_max_val_display != y_max_f:
-            self.y_min_val_display = y_min_f
-            self.y_max_val_display = y_max_f
-            self._needs_render_dynamic_y = True
-            self._needs_render_plot_line = True
-
-    def set_y_label(self, label: str):
-        assert isinstance(label, str), "Y label must be a string"
-        if self.y_label_text != label:
-            self.y_label_text = label
-            self._needs_render_dynamic_y = True
-
-    def _render_background(self):
-        if not self._needs_render_bg:
-            return
-        self._bg_surface.fill(self.bg_color)
-        self._needs_render_bg = False
-
-    def _render_static_x_elements(self):
-        if not self._needs_render_static_x:
-            return
-        self._static_x_elements_surface.fill((0, 0, 0, 0))
-
-        if (
-            self.x_data_static is None
-            or self.axis_label_font is None  # Added check
-            or self.tick_label_font is None  # Added check
-            or self.graph_area.width <= 0
-            or self.graph_area.height <= 0
-        ):
-            self._needs_render_static_x = False
-            return
-
-        graph_left_rel = self.graph_area.left - self.plot_widget_rect.left
-        graph_right_rel = self.graph_area.right - self.plot_widget_rect.left
-        graph_bottom_rel = self.graph_area.bottom - self.plot_widget_rect.top
-
-        pygame.draw.line(
-            self._static_x_elements_surface,
-            self.axis_color,
-            (graph_left_rel, graph_bottom_rel),
-            (graph_right_rel, graph_bottom_rel),
-            1,
-        )
-
-        if self.num_x_ticks > 0 and self.x_max_val > self.x_min_val:
-            tick_values = np.linspace(
-                self.x_min_val, self.x_max_val, self.num_x_ticks + 1
-            )
-            for val in tick_values:
-                x_pos_rel = self._map_value(
-                    val, self.x_min_val, self.x_max_val, graph_left_rel, graph_right_rel
-                )
-                pygame.draw.line(
-                    self._static_x_elements_surface,
-                    self.axis_color,
-                    (x_pos_rel, graph_bottom_rel),
-                    (x_pos_rel, graph_bottom_rel + self.LAYOUT_X_TICK_MARK_LENGTH),
-                    1,
-                )
-                try:
-                    label_surf = self.tick_label_font.render(
-                        f"{val:.0f}", True, self.text_color
-                    )
-                    tick_label_top_y = (
-                        graph_bottom_rel
-                        + self.LAYOUT_X_TICK_MARK_LENGTH
-                        + self.LAYOUT_X_TICK_LABEL_MARGIN_FROM_MARK
-                    )
-                    self._static_x_elements_surface.blit(
-                        label_surf,
-                        label_surf.get_rect(centerx=x_pos_rel, top=tick_label_top_y),
-                    )
-                except pygame.error as e:
-                    logger.error(f"PygamePlotter: Error rendering X tick label: {e}")
-                except Exception as e_render:
-                    logger.error(
-                        f"PygamePlotter: Unexpected error rendering X tick label: {e_render}"
-                    )
-
-        if self.x_label_text:
-            try:
-                label_surf = self.axis_label_font.render(
-                    self.x_label_text, True, self.text_color
-                )
-                center_x_rel = graph_left_rel + (graph_right_rel - graph_left_rel) / 2
-                x_axis_label_top_y = (
-                    graph_bottom_rel
-                    + self.LAYOUT_X_TICK_MARK_LENGTH
-                    + self.LAYOUT_X_TICK_LABEL_MARGIN_FROM_MARK
-                    + self.tick_label_font.get_height()
-                    + self.LAYOUT_X_AXIS_LABEL_MARGIN_FROM_X_TICK_LABELS
-                )
-                self._static_x_elements_surface.blit(
-                    label_surf,
-                    label_surf.get_rect(centerx=center_x_rel, top=x_axis_label_top_y),
-                )
-            except pygame.error as e:
-                logger.error(f"PygamePlotter: Error rendering X axis title: {e}")
-            except Exception as e_render:
-                logger.error(
-                    f"PygamePlotter: Unexpected error rendering X axis title: {e_render}"
-                )
-
-        self._needs_render_static_x = False
-
-    def _render_dynamic_y_elements(self):
-        if not self._needs_render_dynamic_y:
-            return
-        self._dynamic_y_elements_surface.fill((0, 0, 0, 0))
-
-        if (
-            self.axis_label_font is None  # Added check
-            or self.tick_label_font is None  # Added check
-            or self.graph_area.width <= 0
-            or self.graph_area.height <= 0
-        ):
-            self._needs_render_dynamic_y = False
-            return
-
-        graph_left_rel = self.graph_area.left - self.plot_widget_rect.left
-        graph_right_rel = self.graph_area.right - self.plot_widget_rect.left
-        graph_bottom_rel = self.graph_area.bottom - self.plot_widget_rect.top
-        graph_top_rel = self.graph_area.top - self.plot_widget_rect.top
-
-        pygame.draw.line(
-            self._dynamic_y_elements_surface,
-            self.axis_color,
-            (graph_left_rel, graph_top_rel),
-            (graph_left_rel, graph_bottom_rel),
-            1,
-        )
-
-        if self.num_y_ticks > 0 and self.y_max_val_display > self.y_min_val_display:
-            tick_values = np.linspace(
-                self.y_min_val_display, self.y_max_val_display, self.num_y_ticks + 1
-            )
-            for val in tick_values:
-                y_pos_rel = self._map_value(
-                    val,
-                    self.y_min_val_display,
-                    self.y_max_val_display,
-                    graph_bottom_rel,
-                    graph_top_rel,
-                )
-                pygame.draw.line(
-                    self._dynamic_y_elements_surface,
-                    self.axis_color,
-                    (graph_left_rel - 5, y_pos_rel),
-                    (graph_left_rel, y_pos_rel),
-                    1,
-                )
-                pygame.draw.line(
-                    self._dynamic_y_elements_surface,
-                    self.grid_color,
-                    (graph_left_rel + 1, y_pos_rel),
-                    (graph_right_rel, y_pos_rel),
-                    1,
-                )
-                try:
-                    label_str = self.y_tick_format_str.format(val)
-                    label_surf = self.tick_label_font.render(
-                        label_str, True, self.text_color
-                    )
-                    tick_label_right_x = (
-                        graph_left_rel - self.LAYOUT_GAP_Y_TICKS_TO_Y_AXIS_LINE
-                    )
-                    self._dynamic_y_elements_surface.blit(
-                        label_surf,
-                        label_surf.get_rect(
-                            right=tick_label_right_x, centery=y_pos_rel
-                        ),
-                    )
-                except pygame.error as e:
-                    logger.error(f"PygamePlotter: Error rendering Y tick label: {e}")
-                except (ValueError, TypeError) as e_fmt:
-                    logger.error(
-                        f"PygamePlotter: Invalid Y tick format ('{self.y_tick_format_str}') or value ({val}): {e_fmt}"
-                    )
-                except Exception as e_render:
-                    logger.error(
-                        f"PygamePlotter: Unexpected error rendering Y tick label: {e_render}"
-                    )
-
-        if self.y_label_text:
-            try:
-                label_surf_orig = self.axis_label_font.render(
-                    self.y_label_text, True, self.text_color
-                )
-                label_surf_rotated = pygame.transform.rotate(label_surf_orig, 90)
-                title_center_x_rel = self.LAYOUT_GAP_WIDGET_EDGE_TO_Y_TITLE + (
-                    self.axis_label_font.get_height() / 2
-                )
-                title_center_y_rel = (
-                    graph_top_rel + (graph_bottom_rel - graph_top_rel) / 2
-                )
-                self._dynamic_y_elements_surface.blit(
-                    label_surf_rotated,
-                    label_surf_rotated.get_rect(
-                        centerx=title_center_x_rel, centery=title_center_y_rel
-                    ),
-                )
-            except pygame.error as e:
-                logger.error(f"PygamePlotter: Error rendering Y axis title: {e}")
-            except Exception as e_render:
-                logger.error(
-                    f"PygamePlotter: Unexpected error rendering Y axis title: {e_render}"
-                )
-
-        self._needs_render_dynamic_y = False
-
-    def _render_plot_line(self):
-        if not self._needs_render_plot_line:
-            return
-        self._plot_line_surface.fill((0, 0, 0, 0))
-
-        if (
-            self.x_data_static is None
-            or self.y_data_current is None
-            or len(self.screen_x_coords_static) == 0
-            or len(self.y_data_current) == 0
-            or len(self.screen_x_coords_static) != len(self.y_data_current)
-            or self.graph_area.width <= 0
-            or self.graph_area.height <= 0
-            or self.y_max_val_display == self.y_min_val_display
-        ):
-            self._needs_render_plot_line = False
-            return
-
-        points_for_drawing_rel: list[tuple[float, float]] = []
-        num_points_to_plot = min(
-            len(self.screen_x_coords_static), len(self.y_data_current)
-        )
-
-        for i in range(num_points_to_plot):
-            sx_rel = self.screen_x_coords_static[i] - self.plot_widget_rect.left
-            sy_abs = self._map_value(
-                self.y_data_current[i],
-                self.y_min_val_display,
-                self.y_max_val_display,
-                float(self.graph_area.bottom),
-                float(self.graph_area.top),
-            )
-            sy_abs_clipped = max(
-                self.graph_area.top, min(self.graph_area.bottom, sy_abs)
-            )
-            sy_rel = sy_abs_clipped - self.plot_widget_rect.top
-            points_for_drawing_rel.append((sx_rel, sy_rel))
-
-        if len(points_for_drawing_rel) > 1:
-            clip_rect_rel = pygame.Rect(
-                self.graph_area.left - self.plot_widget_rect.left,
-                self.graph_area.top - self.plot_widget_rect.top,
-                self.graph_area.width,
-                self.graph_area.height,
-            )
-            try:
-                self._plot_line_surface.set_clip(clip_rect_rel)
-                pygame.draw.lines(
-                    self._plot_line_surface,
-                    self.plot_color,
-                    False,
-                    points_for_drawing_rel,
-                    1,
-                )
-            except Exception as e:
-                logger.error(f"PygamePlotter: Error during pygame.draw.lines: {e}")
-            finally:
-                self._plot_line_surface.set_clip(None)
-
-        self._needs_render_plot_line = False
-
-    def draw(self):
-        """Draws the plot onto the parent surface."""
-        if self._needs_render_bg:
-            self._render_background()
-        if self._needs_render_static_x:
-            self._render_static_x_elements()
-        if self._needs_render_dynamic_y:
-            self._render_dynamic_y_elements()
-        if self._needs_render_plot_line:
-            self._render_plot_line()
-
-        self.parent_surface.blit(self._bg_surface, self.plot_widget_rect.topleft)
-        self.parent_surface.blit(
-            self._static_x_elements_surface, self.plot_widget_rect.topleft
-        )
-        self.parent_surface.blit(
-            self._dynamic_y_elements_surface, self.plot_widget_rect.topleft
-        )
-        self.parent_surface.blit(self._plot_line_surface, self.plot_widget_rect.topleft)
-
-
 class SpectrometerScreen:
     """
     Handles the spectrometer live view, capture, saving, and state management.
     Calibration (Dark/White/Auto-Integration) follows a setup-run-confirm/save model.
-    Uses PygamePlotter for live plotting.
+    Uses FastSpectralRenderer for live plotting.
     """
 
     # --- Internal State Flags ---
@@ -2309,20 +1766,19 @@ class SpectrometerScreen:
                 "SpectrometerScreen: USE_SPECTROMETER is False, skipping device initialization."
             )
 
-        self.pygame_plotter: PygamePlotter | None = None
+        self.fast_renderer: FastSpectralRenderer | None = (
+            None  # Changed from pygame_plotter
+        )
 
         # Initialize font attributes
         self.overlay_font: pygame.font.Font | None = None
-        self.spectro_hint_font: pygame.font.Font | None = (
-            None  # NEW attribute for hint font
-        )
-        self._load_spectro_screen_fonts()  # MODIFIED: Call new font loading method
+        self.spectro_hint_font: pygame.font.Font | None = None
+        self._load_spectro_screen_fonts()
 
-        if self.overlay_font is None:  # Check for the general overlay font
+        if self.overlay_font is None:
             logger.critical(
                 "SpectrometerScreen: General overlay font (overlay_font) failed to load. Overlays will be impaired."
             )
-            # Fallback for overlay_font if critical
             if pygame.font.get_init():
                 try:
                     self.overlay_font = pygame.font.SysFont(None, SPECTRO_FONT_SIZE)
@@ -2334,13 +1790,12 @@ class SpectrometerScreen:
                     logger.critical(
                         f"Final fallback for overlay_font failed: {e_font_final_fallback}"
                     )
-                    self.overlay_font = None  # Ensure it's None
+                    self.overlay_font = None
             else:
                 logger.critical(
                     "Pygame font module not initialized, cannot create any font."
                 )
 
-        # Log if hint font specifically failed
         if self.spectro_hint_font is None:
             logger.warning(
                 "SpectrometerScreen: Hint font (spectro_hint_font) failed to load. Hints on this screen might be missing or use fallback."
@@ -2353,34 +1808,32 @@ class SpectrometerScreen:
             SCREEN_HEIGHT - plot_widget_top_margin - plot_widget_bottom_margin
         )
 
-        # PygamePlotter initialization does NOT depend on self.overlay_font
-        # It loads its own fonts based on PLOTTER_... global constants
         plot_display_rect = pygame.Rect(
             plot_widget_horizontal_margin,
             plot_widget_top_margin,
             SCREEN_WIDTH - (2 * plot_widget_horizontal_margin),
             plot_widget_height,
         )
-        if (
-            plot_display_rect.width > 20 and plot_display_rect.height > 20
-        ):  # Min sensible size
-            self.pygame_plotter = PygamePlotter(
+
+        if plot_display_rect.width > 20 and plot_display_rect.height > 20:
+            self.fast_renderer = FastSpectralRenderer(
                 parent_surface=self.screen,
-                plot_widget_rect=plot_display_rect,
-                initial_x_data=self.wavelengths,
-                # No font argument passed here, PygamePlotter handles its own
-                x_label_text="Wavelength (nm)",
-                y_label_text="Intensity",
-                plot_color=YELLOW,
+                plot_rect=plot_display_rect,
+                target_fps=30,
+                max_display_points=min(300, plot_display_rect.width),
             )
-            if self.wavelengths is None and self.pygame_plotter:
-                logger.warning(
-                    "SpectrometerScreen: PygamePlotter initialized without initial wavelengths."
-                )
+
+            if self.wavelengths is not None:
+                self.fast_renderer.set_wavelengths(self.wavelengths)
+
+            logger.info(
+                f"FastSpectralRenderer initialized with {self.fast_renderer.max_display_points} display points"
+            )
         else:
             logger.error(
-                f"SpectrometerScreen: Cannot initialize PygamePlotter, plot_display_rect too small: {plot_display_rect}"
+                f"Cannot initialize FastSpectralRenderer, plot_display_rect too small: {plot_display_rect}"
             )
+            self.fast_renderer = None
 
         self.is_active = False
         self._current_state = self.STATE_LIVE_VIEW
@@ -2531,7 +1984,7 @@ class SpectrometerScreen:
                 logger.info(
                     f"SpectrometerScreen: Loaded overlay font: {SPECTRO_FONT_FILENAME} (Size: {SPECTRO_FONT_SIZE})"
                 )
-            else:  # Should be caught by _load_font_safe, but as a safeguard
+            else:
                 raise RuntimeError(
                     f"overlay_font still None after _load_font_safe for {SPECTRO_FONT_FILENAME}"
                 )
@@ -2540,22 +1993,16 @@ class SpectrometerScreen:
                 f"SpectrometerScreen: Error loading general overlay font: {e}",
                 exc_info=True,
             )
-            # _load_font_safe already tries SysFont, so if it's None here, it's a critical failure for this font.
-            # self.overlay_font will remain None or be what _load_font_safe returned (potentially Pygame default).
 
         # 2. Load the specific hint font for SpectrometerScreen
         try:
-            hint_font_path = os.path.join(
-                assets_dir, HINT_FONT_FILENAME
-            )  # Uses HINT_FONT_FILENAME
-            self.spectro_hint_font = _load_font_safe(
-                hint_font_path, HINT_FONT_SIZE
-            )  # Uses HINT_FONT_SIZE
+            hint_font_path = os.path.join(assets_dir, HINT_FONT_FILENAME)
+            self.spectro_hint_font = _load_font_safe(hint_font_path, HINT_FONT_SIZE)
             if self.spectro_hint_font:
                 logger.info(
                     f"SpectrometerScreen: Loaded hint font: {HINT_FONT_FILENAME} (Size: {HINT_FONT_SIZE})"
                 )
-            else:  # Safeguard
+            else:
                 raise RuntimeError(
                     f"spectro_hint_font still None after _load_font_safe for {HINT_FONT_FILENAME}"
                 )
@@ -2563,9 +2010,6 @@ class SpectrometerScreen:
             logger.error(
                 f"SpectrometerScreen: Error loading hint font: {e}", exc_info=True
             )
-            # self.spectro_hint_font will remain None or be Pygame default from _load_font_safe.
-            # If it's critical for hints to always appear, more aggressive fallback or error handling here.
-            # For now, if it fails, hints might not draw or draw with a Pygame default.
 
     def _clear_frozen_data(self):
         self._frozen_intensities = None
@@ -2632,22 +2076,20 @@ class SpectrometerScreen:
         return True, ""
 
     def _set_plotter_view_for_raw(self, y_label_override: str | None = None):
-        """Helper to configure PygamePlotter for a raw intensity view."""
+        """Helper to configure renderer for a raw intensity view."""
         self._current_y_max_for_plot = float(Y_AXIS_DEFAULT_MAX)
-        if self.pygame_plotter:
-            self.pygame_plotter.set_y_label(y_label_override or "Intensity (Counts)")
-            self.pygame_plotter.set_y_tick_format("{:.0f}")
-            self.pygame_plotter.set_y_limits(0, self._current_y_max_for_plot)
+        if self.fast_renderer:
+            self.fast_renderer.set_y_label(y_label_override or "Intensity (Counts)")
+            self.fast_renderer.set_y_tick_format("{:.0f}")
+            self.fast_renderer.set_y_limits(0, self._current_y_max_for_plot)
 
     def _set_plotter_view_for_reflectance(self):
-        """Helper to configure PygamePlotter for a reflectance view."""
+        """Helper to configure renderer for a reflectance view."""
         self._current_y_max_for_plot = float(Y_AXIS_REFLECTANCE_DEFAULT_MAX)
-        if self.pygame_plotter:
-            self.pygame_plotter.set_y_label("Reflectance")
-            self.pygame_plotter.set_y_tick_format(
-                "{:.1f}"
-            )  # Or {:.2f} if more precision desired
-            self.pygame_plotter.set_y_limits(0, self._current_y_max_for_plot)
+        if self.fast_renderer:
+            self.fast_renderer.set_y_label("Reflectance")
+            self.fast_renderer.set_y_tick_format("{:.1f}")
+            self.fast_renderer.set_y_limits(0, self._current_y_max_for_plot)
 
     def _set_plotter_view_for_live_mode(self):
         """Configures plotter based on the current collection mode in MenuSystem."""
@@ -2655,7 +2097,7 @@ class SpectrometerScreen:
         mode = self.menu_system.get_collection_mode()
         if mode == MODE_REFLECTANCE:
             self._set_plotter_view_for_reflectance()
-        else:  # MODE_RAW or other defaults
+        else:
             self._set_plotter_view_for_raw()
 
     def activate(self):
@@ -2665,12 +2107,23 @@ class SpectrometerScreen:
         self._clear_frozen_data()
         self._cancel_auto_integration()
 
-        if self.pygame_plotter and self.wavelengths is not None:
-            self.pygame_plotter.set_x_data_static(self.wavelengths)
+        # Setup plotter FIRST, before any clearing
+        if self.fast_renderer and self.wavelengths is not None:
+            logger.debug(
+                f"Setting up FastSpectralRenderer with {len(self.wavelengths)} wavelength points"
+            )
+            self.fast_renderer.set_wavelengths(self.wavelengths)
+            self.fast_renderer.configure_smoothing(
+                enabled=USE_LIVE_SMOOTHING, window_size=LIVE_SMOOTHING_WINDOW_SIZE
+            )
 
-        self._set_plotter_view_for_live_mode()  # Sets Y-label, Y-limits, Y-tick-format
-        if self.pygame_plotter:
-            self.pygame_plotter.set_y_data(None)  # Clear any old data line
+            # Verify setup worked
+            if self.fast_renderer.plotter.original_x_data is None:
+                logger.error("Failed to setup wavelengths in FastSpectralRenderer!")
+            else:
+                logger.debug("FastSpectralRenderer setup successful")
+
+        self._set_plotter_view_for_live_mode()
 
         logger.debug(
             f"Activate: Plotter Y-max set to: {self._current_y_max_for_plot} for state {self._current_state}"
@@ -2758,8 +2211,8 @@ class SpectrometerScreen:
         self._clear_frozen_data()
         self._cancel_auto_integration()
         self._current_state = self.STATE_LIVE_VIEW
-        if self.pygame_plotter:
-            self.pygame_plotter.set_y_data(None)
+        # if self.fast_renderer:
+        #     self.fast_renderer.plotter.clear_data()
 
     def _start_auto_integration_setup(self):
         logger.info("Starting Auto-Integration Setup.")
@@ -2774,9 +2227,9 @@ class SpectrometerScreen:
         self._auto_integ_status_msg = "Aim at white ref, then Start"
         self._current_state = self.STATE_AUTO_INTEG_SETUP
 
-        self._set_plotter_view_for_raw()  # Auto-integ setup always uses raw counts view
-        if self.pygame_plotter:
-            self.pygame_plotter.set_y_data(None)
+        self._set_plotter_view_for_raw()
+        if self.fast_renderer:
+            self.fast_renderer.plotter.clear_data()
         logger.debug(
             f"Auto-integ setup: Initial test integ set to {self._current_auto_integ_us} µs."
         )
@@ -2820,7 +2273,6 @@ class SpectrometerScreen:
         elif state == self.STATE_CALIBRATE:
             if self.button_handler.check_button(BTN_ENTER):
                 self._current_state = self.STATE_WHITE_CAPTURE_SETUP
-                # Plotter view already set for raw by entering CALIBRATE
             elif self.button_handler.check_button(BTN_UP):
                 self._current_state = self.STATE_DARK_CAPTURE_SETUP
             elif self.button_handler.check_button(BTN_DOWN):
@@ -2840,7 +2292,6 @@ class SpectrometerScreen:
                     logger.warning("Freeze Dark ignored: Spectrometer not ready.")
             elif self.button_handler.check_button(BTN_BACK):
                 self._current_state = self.STATE_CALIBRATE
-                # Plotter already set for raw
 
         elif state == self.STATE_WHITE_CAPTURE_SETUP:
             if self.button_handler.check_button(BTN_ENTER):
@@ -2860,21 +2311,18 @@ class SpectrometerScreen:
 
         elif state == self.STATE_FROZEN_VIEW:
             assert self._frozen_capture_type is not None
-            # Plotter view set by _perform_freeze_capture
             if self.button_handler.check_button(BTN_ENTER):
                 self._perform_save_frozen_data()
             elif self.button_handler.check_button(BTN_BACK):
                 self._perform_discard_frozen_data()
 
         elif state == self.STATE_AUTO_INTEG_SETUP:
-            # Plotter view set by _start_auto_integration_setup
             if self.button_handler.check_button(BTN_ENTER):
                 if spectrometer_can_operate:
                     self._auto_integ_optimizing = True
                     self._auto_integ_iteration_count = 0
                     self._auto_integ_status_msg = "Running iteration 1..."
                     self._current_state = self.STATE_AUTO_INTEG_RUNNING
-                    # Y-axis for RUNNING is dynamic, handled in _update_plot_data_for_state
                 else:
                     logger.warning("Start Auto-Integ ignored: Spectrometer not ready.")
             elif self.button_handler.check_button(BTN_BACK):
@@ -2889,7 +2337,6 @@ class SpectrometerScreen:
                 self._set_plotter_view_for_raw()
 
         elif state == self.STATE_AUTO_INTEG_CONFIRM:
-            # Plotter view set by _transition_to_confirm_pygame (in _run_auto_integration_step)
             if self.button_handler.check_button(BTN_ENTER):
                 self._apply_auto_integration_result()
             elif self.button_handler.check_button(BTN_BACK):
@@ -2898,26 +2345,23 @@ class SpectrometerScreen:
                 self._set_plotter_view_for_raw()
         else:
             logger.error(f"Unhandled input state in SpectrometerScreen: {state}")
-            self._current_state = self.STATE_LIVE_VIEW  # Fallback
+            self._current_state = self.STATE_LIVE_VIEW
             self._set_plotter_view_for_live_mode()
 
         return action_result
 
     def _update_plot_data_for_state(self):
-        if not self.pygame_plotter:
+        """Enhanced plotting with COMPLETE cycle timing"""
+        if not self.fast_renderer:
             return
+
+        # START TOTAL CYCLE TIMING HERE
+        cycle_start_time = time.perf_counter()
+        timing_info = {}
 
         spectrometer_can_operate = self._is_spectrometer_ready()
         state = self._current_state
         current_menu_mode = self.menu_system.get_collection_mode()
-
-        plot_wl_data: np.ndarray | None = self.wavelengths
-        plot_inten_data_unfiltered: np.ndarray | None = (
-            None  # Store unfiltered data here
-        )
-
-        # This method primarily sets plot_inten_data_unfiltered.
-        # Y-label, Y-limits, Y-tick-format are managed by state transition logic in handle_input etc.
 
         is_frozen_plot_state = state == self.STATE_FROZEN_VIEW or (
             state == self.STATE_AUTO_INTEG_CONFIRM
@@ -2925,19 +2369,46 @@ class SpectrometerScreen:
         )
 
         if is_frozen_plot_state:
+            # Frozen data - no capture time, just display time
             if (
                 self._frozen_intensities is not None
                 and self._frozen_wavelengths is not None
             ):
-                plot_wl_data = self._frozen_wavelengths
-                plot_inten_data_unfiltered = self._frozen_intensities
+                display_start = time.perf_counter()
+
+                # Check if wavelengths differ from what renderer currently has
+                current_renderer_original_wl = (
+                    self.fast_renderer.plotter.original_x_data
+                )
+                if current_renderer_original_wl is None or not np.array_equal(
+                    current_renderer_original_wl, self._frozen_wavelengths
+                ):
+                    self.fast_renderer.set_wavelengths(self._frozen_wavelengths)
+
+                success = self.fast_renderer.update_spectrum(
+                    self._frozen_intensities,
+                    apply_smoothing=False,  # No smoothing for frozen review
+                    force_update=True,  # Always re-render frozen data
+                )
+
+                timing_info["display_time_ms"] = (
+                    time.perf_counter() - display_start
+                ) * 1000
+                timing_info["capture_time_ms"] = 0  # No capture for frozen data
+                timing_info["processing_time_ms"] = 0  # No processing for frozen data
+                timing_info["total_cycle_ms"] = (
+                    time.perf_counter() - cycle_start_time
+                ) * 1000
+                timing_info["integration_time_ms"] = self._frozen_integration_ms or 0
+                timing_info["is_frozen"] = True
+
             else:
                 logger.error(
                     "Frozen data missing for plot in a frozen state. Discarding."
                 )
-                self._perform_discard_frozen_data()  # Attempt to recover state
-                self.pygame_plotter.set_y_data(None)
+                self._perform_discard_frozen_data()
                 return
+
         elif spectrometer_can_operate:
             try:
                 current_menu_integ_ms = self.menu_system.get_integration_time_ms()
@@ -2957,138 +2428,133 @@ class SpectrometerScreen:
                     self._hw_min_integration_us,
                     min(integ_time_for_capture_us, self._hw_max_integration_us),
                 )
+
+                # SPECTROMETER CAPTURE TIMING
+                capture_start = time.perf_counter()
+
                 assert self.spectrometer is not None
                 self.spectrometer.integration_time_micros(integ_us_clamped)
-                raw_inten_capture = self.spectrometer.intensities(
+
+                raw_intensities = self.spectrometer.intensities(
                     correct_dark_counts=True, correct_nonlinearity=True
                 )
 
-                if raw_inten_capture is None or len(raw_inten_capture) != len(
+                capture_time = time.perf_counter() - capture_start
+                timing_info["capture_time_ms"] = capture_time * 1000
+                timing_info["integration_time_ms"] = integ_us_clamped / 1000.0
+
+                if raw_intensities is None or len(raw_intensities) != len(
                     self.wavelengths if self.wavelengths is not None else []
                 ):
                     logger.warning(
                         f"Failed live capture or length mismatch in state {state}."
                     )
-                    self.pygame_plotter.set_y_data(None)
                     return
 
-                is_calibration_raw_display_state = state in [
-                    self.STATE_CALIBRATE,
-                    self.STATE_DARK_CAPTURE_SETUP,
-                    self.STATE_WHITE_CAPTURE_SETUP,
-                    self.STATE_AUTO_INTEG_SETUP,
-                ]
+                # DATA PROCESSING TIMING
+                processing_start = time.perf_counter()
 
+                processed_intensities = raw_intensities  # Default to raw
+
+                # Collection mode processing
                 if (
-                    is_calibration_raw_display_state
-                    or state == self.STATE_AUTO_INTEG_RUNNING
+                    state == self.STATE_LIVE_VIEW
+                    and current_menu_mode == MODE_REFLECTANCE
                 ):
-                    plot_inten_data_unfiltered = raw_inten_capture
+                    valid_refs, _ = self._are_references_valid_for_reflectance()
+                    if valid_refs:
+                        assert self._dark_reference_intensities is not None
+                        assert self._white_reference_intensities is not None
+
+                        numerator = raw_intensities - self._dark_reference_intensities
+                        denominator = (
+                            self._white_reference_intensities
+                            - self._dark_reference_intensities
+                        )
+                        reflectance_values = np.full_like(
+                            raw_intensities, 0.0, dtype=float
+                        )
+                        valid_denom = np.abs(denominator) > DIVISION_EPSILON
+                        reflectance_values[valid_denom] = (
+                            numerator[valid_denom] / denominator[valid_denom]
+                        )
+                        processed_intensities = np.clip(
+                            reflectance_values,
+                            0.0,
+                            Y_AXIS_REFLECTANCE_RESCALE_MAX_CEILING,
+                        )
+
+                processing_time = time.perf_counter() - processing_start
+                timing_info["processing_time_ms"] = processing_time * 1000
+
+                # Dynamic Y-scaling for auto-integration
+                if state == self.STATE_AUTO_INTEG_RUNNING:
+                    temp_data_for_scaling = processed_intensities
                     if (
-                        state == self.STATE_AUTO_INTEG_RUNNING
-                        and len(plot_inten_data_unfiltered) > 0
-                    ):  # Dynamic Y for this state
-                        # Apply smoothing *before* finding max for dynamic Y scale in this specific case
-                        data_for_dyn_y_max = plot_inten_data_unfiltered
-                        if (
-                            USE_LIVE_SMOOTHING
-                            and LIVE_SMOOTHING_WINDOW_SIZE > 1
-                            and data_for_dyn_y_max.size >= LIVE_SMOOTHING_WINDOW_SIZE
-                        ):
-                            win_s = LIVE_SMOOTHING_WINDOW_SIZE + (
-                                1 if LIVE_SMOOTHING_WINDOW_SIZE % 2 == 0 else 0
-                            )
-                            if win_s <= len(data_for_dyn_y_max) and win_s >= 3:
-                                w = np.ones(win_s) / float(win_s)
-                                data_for_dyn_y_max = np.convolve(data_for_dyn_y_max, w, mode="same")  # type: ignore
-
-                        current_max_val = np.max(data_for_dyn_y_max)
-                        temp_y_max_for_plot = max(
-                            float(Y_AXIS_MIN_CEILING),
-                            float(current_max_val * Y_AXIS_RESCALE_FACTOR),
+                        USE_LIVE_SMOOTHING
+                        and len(temp_data_for_scaling) > LIVE_SMOOTHING_WINDOW_SIZE
+                    ):
+                        temp_data_for_scaling = apply_fast_smoothing(
+                            temp_data_for_scaling, LIVE_SMOOTHING_WINDOW_SIZE
                         )
-                        temp_y_max_for_plot = min(
-                            temp_y_max_for_plot,
-                            float(self._hw_max_intensity_adc * Y_AXIS_RESCALE_FACTOR),
-                        )
-                        self.pygame_plotter.set_y_limits(
-                            0, temp_y_max_for_plot
-                        )  # Update plotter's Y limits directly
 
-                elif state == self.STATE_LIVE_VIEW:
-                    if current_menu_mode == MODE_REFLECTANCE:
-                        valid_refs, _ = self._are_references_valid_for_reflectance()
-                        if valid_refs:
-                            assert (
-                                self._dark_reference_intensities is not None
-                                and self._white_reference_intensities is not None
-                            )
-                            numerator = (
-                                raw_inten_capture - self._dark_reference_intensities
-                            )
-                            denominator = (
-                                self._white_reference_intensities
-                                - self._dark_reference_intensities
-                            )
-                            reflectance_values = np.full_like(raw_inten_capture, 0.0)
-                            valid_denom = np.abs(denominator) > DIVISION_EPSILON
-                            reflectance_values[valid_denom] = (
-                                numerator[valid_denom] / denominator[valid_denom]
-                            )
-                            plot_inten_data_unfiltered = np.clip(
-                                reflectance_values,
-                                0.0,
-                                Y_AXIS_REFLECTANCE_RESCALE_MAX_CEILING,
-                            )
-                        else:
-                            plot_inten_data_unfiltered = raw_inten_capture
-                    else:  # MODE_RAW in LIVE_VIEW
-                        plot_inten_data_unfiltered = raw_inten_capture
-                else:  # Fallback
-                    plot_inten_data_unfiltered = raw_inten_capture
+                    current_max_val = (
+                        np.max(temp_data_for_scaling)
+                        if len(temp_data_for_scaling) > 0
+                        else 0.0
+                    )
+                    temp_y_max_for_plot = max(
+                        float(Y_AXIS_MIN_CEILING),
+                        float(current_max_val * Y_AXIS_RESCALE_FACTOR),
+                    )
+                    temp_y_max_for_plot = min(
+                        temp_y_max_for_plot,
+                        float(self._hw_max_intensity_adc * Y_AXIS_RESCALE_FACTOR),
+                    )
+                    self.fast_renderer.set_y_limits(0, temp_y_max_for_plot)
 
-            except (sb.SeaBreezeError, (usb.core.USBError if usb else OSError), AttributeError, AssertionError, RuntimeError) as e_capture:  # type: ignore
+                # Wavelengths should be set once on activate or if they change
+                if self.wavelengths is not None:
+                    current_renderer_original_wl = (
+                        self.fast_renderer.plotter.original_x_data
+                    )
+                    if current_renderer_original_wl is None or not np.array_equal(
+                        current_renderer_original_wl, self.wavelengths
+                    ):
+                        self.fast_renderer.set_wavelengths(self.wavelengths)
+
+                # DISPLAY UPDATE TIMING
+                display_start = time.perf_counter()
+
+                success = self.fast_renderer.update_spectrum(
+                    processed_intensities,
+                    apply_smoothing=USE_LIVE_SMOOTHING,
+                    force_update=False,
+                )
+
+                display_time = time.perf_counter() - display_start
+                timing_info["display_time_ms"] = display_time * 1000
+
+                # TOTAL CYCLE TIME
+                total_cycle_time = time.perf_counter() - cycle_start_time
+                timing_info["total_cycle_ms"] = total_cycle_time * 1000
+                timing_info["is_frozen"] = False
+
+                if not success:
+                    logger.warning("FastSpectralRenderer update failed")
+
+            except Exception as e_capture:
                 logger.error(
                     f"Error during live data capture for plot: {e_capture}",
                     exc_info=False,
                 )
-                self.pygame_plotter.set_y_data(None)
                 return
-        else:
-            self.pygame_plotter.set_y_data(None)
+
+        else:  # Spectrometer not operable and not frozen state
             return
 
-        # --- Apply Smoothing Filter FOR DISPLAY ONLY ---
-        plot_data_for_display = plot_inten_data_unfiltered  # Default to unsmoothed
-        if (
-            plot_inten_data_unfiltered is not None
-            and USE_LIVE_SMOOTHING
-            and LIVE_SMOOTHING_WINDOW_SIZE > 1
-        ):
-            if (
-                isinstance(plot_inten_data_unfiltered, np.ndarray)
-                and plot_inten_data_unfiltered.size >= LIVE_SMOOTHING_WINDOW_SIZE
-            ):
-                win_size = LIVE_SMOOTHING_WINDOW_SIZE + (
-                    1 if LIVE_SMOOTHING_WINDOW_SIZE % 2 == 0 else 0
-                )
-                if win_size <= len(plot_inten_data_unfiltered) and win_size >= 3:
-                    try:
-                        weights = np.ones(win_size) / float(win_size)
-                        smoothed_intensities = np.convolve(
-                            plot_inten_data_unfiltered, weights, mode="same"
-                        )
-                        plot_data_for_display = smoothed_intensities
-                        # logger.debug("Live smoothing applied to plot data for display.") # Can be verbose
-                    except Exception as e_smooth:
-                        logger.warning(
-                            f"Error applying smoothing: {e_smooth}. Using unsmoothed data."
-                        )
-            # else: logger.debug("Not enough data or not ndarray for smoothing. Using unsmoothed.")
-
-        if plot_wl_data is not None and self.pygame_plotter.x_data_static is None:
-            self.pygame_plotter.set_x_data_static(plot_wl_data)
-        self.pygame_plotter.set_y_data(plot_data_for_display)
+        # STORE TIMING INFO FOR DISPLAY
+        self._last_cycle_timing = timing_info
 
     def _run_auto_integration_step(self):
         assert (
@@ -3110,7 +2576,6 @@ class SpectrometerScreen:
                 self._frozen_intensities is not None
                 and len(self._frozen_intensities) > 0
             ):
-                # For confirm screen, Y-max is based on the *unsmoothed* frozen data
                 final_max_peak = np.max(self._frozen_intensities)
                 self._current_y_max_for_plot = max(
                     float(Y_AXIS_MIN_CEILING),
@@ -3123,14 +2588,12 @@ class SpectrometerScreen:
                 logger.debug(
                     f"Auto-Integ (Confirm): SpectScreen's _current_y_max_for_plot set to {self._current_y_max_for_plot:.1f}"
                 )
-                if self.pygame_plotter:
-                    self.pygame_plotter.set_y_label(
-                        f"Raw Final ({pending_ms}ms)"
-                    )  # Specific label
-                    self.pygame_plotter.set_y_tick_format("{:.0f}")
-                    self.pygame_plotter.set_y_limits(0, self._current_y_max_for_plot)
-            else:  # Fallback
-                self._set_plotter_view_for_raw()  # Fallback to default raw view
+                if self.fast_renderer:
+                    self.fast_renderer.set_y_label(f"Raw Final ({pending_ms}ms)")
+                    self.fast_renderer.set_y_tick_format("{:.0f}")
+                    self.fast_renderer.set_y_limits(0, self._current_y_max_for_plot)
+            else:
+                self._set_plotter_view_for_raw()
                 logger.warning(
                     "Auto-Integ (Confirm): No frozen intensities for Y-axis, using default raw view."
                 )
@@ -3150,7 +2613,6 @@ class SpectrometerScreen:
         self._auto_integ_iteration_count += 1
         current_iter_msg = f"Running iter {self._auto_integ_iteration_count}/{AUTO_INTEG_MAX_ITERATIONS}..."
         self._auto_integ_status_msg = current_iter_msg
-        # logger.debug(f"Auto-Integ Step {self._auto_integ_iteration_count}: Current test integ {self._current_auto_integ_us} µs.") # Can be verbose
 
         max_peak_adc = 0.0
         try:
@@ -3159,7 +2621,6 @@ class SpectrometerScreen:
                 min(self._current_auto_integ_us, self._hw_max_integration_us),
             )
             self.spectrometer.integration_time_micros(clamped_current_us)
-            # Capture UNSMOOTHED data for algorithm decision and potential frozen storage
             intensities_unfiltered = self.spectrometer.intensities(
                 correct_dark_counts=True, correct_nonlinearity=True
             )
@@ -3173,7 +2634,6 @@ class SpectrometerScreen:
                 else 0.0
             )
 
-            # Store the *unfiltered* data if transitioning to confirm
             self._frozen_intensities = intensities_unfiltered.copy()
             self._frozen_wavelengths = (
                 self.wavelengths.copy() if self.wavelengths is not None else None
@@ -3192,7 +2652,6 @@ class SpectrometerScreen:
             return
 
         self._last_peak_adc_value = max_peak_adc
-        # logger.debug(f"Auto-Integ Step {self._auto_integ_iteration_count}: Max peak (unfiltered) ADC {max_peak_adc:.1f} with {clamped_current_us} µs.") # Can be verbose
 
         if (
             self._auto_integ_target_low_counts
@@ -3296,20 +2755,19 @@ class SpectrometerScreen:
         else:
             logger.warning("No pending auto-integration time to apply.")
 
-        self._cancel_auto_integration()  # Clears auto-integ state including _frozen_data if it was auto-integ type
+        self._cancel_auto_integration()
         self._current_state = self.STATE_LIVE_VIEW
         self._set_plotter_view_for_live_mode()
         logger.info("Returned to Live View after auto-integration.")
 
     def _perform_freeze_capture(self, capture_type: str):
-        # Corrected assertion:
         assert (
-            self.menu_system is not None  # Check for existence
-            and self.spectrometer is not None # Check for existence
-            and self.wavelengths is not None  # Check for existence
-            and self.wavelengths.size > 0  # Explicitly check if the NumPy array has elements
+            self.menu_system is not None
+            and self.spectrometer is not None
+            and self.wavelengths is not None
+            and self.wavelengths.size > 0
         ), "Dependencies missing for freeze capture or wavelengths empty"
-        
+
         assert capture_type in [
             self.FROZEN_TYPE_OOI,
             self.FROZEN_TYPE_DARK,
@@ -3338,15 +2796,13 @@ class SpectrometerScreen:
             raw_intensities_capture = self.spectrometer.intensities(
                 correct_dark_counts=True, correct_nonlinearity=True
             )
-            # Ensure wavelengths is not None before using len on it for the assertion
             assert self.wavelengths is not None
             assert raw_intensities_capture is not None and len(
                 raw_intensities_capture
             ) == len(self.wavelengths)
 
-            self._clear_frozen_data()  # Clear previous before setting new
+            self._clear_frozen_data()
 
-            # Ensure wavelengths is not None before copying
             assert self.wavelengths is not None
             self._frozen_wavelengths = self.wavelengths.copy()
             self._frozen_timestamp = self.menu_system.get_timestamp_datetime()
@@ -3366,13 +2822,14 @@ class SpectrometerScreen:
                     assert (
                         self._dark_reference_intensities is not None
                         and self._white_reference_intensities is not None
-                        and raw_intensities_capture is not None # Added for safety
+                        and raw_intensities_capture is not None
                     )
                     self._raw_target_intensities_for_reflectance = (
                         raw_intensities_capture.copy()
                     )
-                    # Ensure all operands for subtraction are ndarrays
-                    assert isinstance(self._raw_target_intensities_for_reflectance, np.ndarray)
+                    assert isinstance(
+                        self._raw_target_intensities_for_reflectance, np.ndarray
+                    )
                     assert isinstance(self._dark_reference_intensities, np.ndarray)
                     assert isinstance(self._white_reference_intensities, np.ndarray)
 
@@ -3397,24 +2854,22 @@ class SpectrometerScreen:
                     self._current_y_max_for_plot = float(Y_AXIS_REFLECTANCE_DEFAULT_MAX)
                     y_label_for_frozen = "Reflectance (Frozen)"
                     y_tick_fmt_for_frozen = "{:.1f}"
-                else:  # Raw OOI
-                    assert raw_intensities_capture is not None # Added for safety
-                    self._frozen_intensities = (
-                        raw_intensities_capture.copy()
-                    )  # Store copy
+                else:
+                    assert raw_intensities_capture is not None
+                    self._frozen_intensities = raw_intensities_capture.copy()
                     self._current_y_max_for_plot = float(Y_AXIS_DEFAULT_MAX)
                     y_label_for_frozen = "Intensity (Raw Frozen)"
-            else:  # Dark or White reference capture
-                assert raw_intensities_capture is not None # Added for safety
-                self._frozen_intensities = raw_intensities_capture.copy()  # Store copy
-                self._frozen_sample_collection_mode = MODE_RAW  # Refs are always raw
+            else:
+                assert raw_intensities_capture is not None
+                self._frozen_intensities = raw_intensities_capture.copy()
+                self._frozen_sample_collection_mode = MODE_RAW
                 self._current_y_max_for_plot = float(Y_AXIS_DEFAULT_MAX)
                 y_label_for_frozen = f"{capture_type.capitalize()} (Frozen)"
 
-            if self.pygame_plotter:
-                self.pygame_plotter.set_y_label(y_label_for_frozen)
-                self.pygame_plotter.set_y_tick_format(y_tick_fmt_for_frozen)
-                self.pygame_plotter.set_y_limits(0, self._current_y_max_for_plot)
+            if self.fast_renderer:
+                self.fast_renderer.set_y_label(y_label_for_frozen)
+                self.fast_renderer.set_y_tick_format(y_tick_fmt_for_frozen)
+                self.fast_renderer.set_y_limits(0, self._current_y_max_for_plot)
 
             display_mode_log = (
                 self._frozen_sample_collection_mode
@@ -3457,9 +2912,8 @@ class SpectrometerScreen:
         logger.info(f"Attempting to save frozen data as {spectra_type_csv}...")
         should_save_plot_png = self._frozen_capture_type == self.FROZEN_TYPE_OOI
 
-        # Save the *unfiltered* self._frozen_intensities
         save_success = self._save_data(
-            intensities=self._frozen_intensities,  # This is the original, unfiltered data
+            intensities=self._frozen_intensities,
             wavelengths=self._frozen_wavelengths,
             timestamp=self._frozen_timestamp,
             integration_ms=self._frozen_integration_ms,
@@ -3483,9 +2937,8 @@ class SpectrometerScreen:
                 and self._frozen_sample_collection_mode == MODE_REFLECTANCE
                 and self._raw_target_intensities_for_reflectance is not None
             ):
-                # Save the *unfiltered* raw target
                 self._save_data(
-                    intensities=self._raw_target_intensities_for_reflectance,  # Original raw
+                    intensities=self._raw_target_intensities_for_reflectance,
                     wavelengths=self._frozen_wavelengths,
                     timestamp=self._frozen_timestamp,
                     integration_ms=self._frozen_integration_ms,
@@ -3498,7 +2951,7 @@ class SpectrometerScreen:
             )
 
         self._current_state = self.STATE_LIVE_VIEW
-        self._set_plotter_view_for_live_mode()  # Set plotter for live view
+        self._set_plotter_view_for_live_mode()
         self._clear_frozen_data()
 
     def _perform_discard_frozen_data(self):
@@ -3511,19 +2964,19 @@ class SpectrometerScreen:
             self._set_plotter_view_for_live_mode()
         elif original_frozen_type == self.FROZEN_TYPE_DARK:
             self._current_state = self.STATE_DARK_CAPTURE_SETUP
-            self._set_plotter_view_for_raw()  # Dark setup shows raw
+            self._set_plotter_view_for_raw()
         elif original_frozen_type == self.FROZEN_TYPE_WHITE:
             self._current_state = self.STATE_WHITE_CAPTURE_SETUP
-            self._set_plotter_view_for_raw()  # White setup shows raw
+            self._set_plotter_view_for_raw()
         elif original_frozen_type == self.FROZEN_TYPE_AUTO_INTEG_RESULT:
             self._cancel_auto_integration()
             self._current_state = self.STATE_CALIBRATE
-            self._set_plotter_view_for_raw()  # Calibrate menu shows raw
+            self._set_plotter_view_for_raw()
         else:
             logger.error(
                 f"Unknown frozen_type '{original_frozen_type}' during discard."
             )
-            self._current_state = self.STATE_LIVE_VIEW  # Fallback
+            self._current_state = self.STATE_LIVE_VIEW
             self._set_plotter_view_for_live_mode()
 
         self._clear_frozen_data()
@@ -3538,8 +2991,6 @@ class SpectrometerScreen:
         spectra_type: str,
         save_plot: bool = True,
     ) -> bool:
-        # This method does not need changes regarding PygamePlotter
-        # It saves the provided `intensities` (which should be unfiltered)
         assert (
             intensities is not None
             and wavelengths is not None
@@ -3624,9 +3075,7 @@ class SpectrometerScreen:
                     fig_temp, ax_temp = plt.subplots(figsize=(8, 6))
                     if not fig_temp or not ax_temp:
                         raise RuntimeError("Failed temp fig/axes for plot save.")
-                    ax_temp.plot(
-                        wavelengths, intensities
-                    )  # Plot the unfiltered intensities
+                    ax_temp.plot(wavelengths, intensities)
                     title_scan_count = (
                         self._scans_today_count
                         if spectra_type in [SPECTRA_TYPE_RAW, SPECTRA_TYPE_REFLECTANCE]
@@ -3665,8 +3114,8 @@ class SpectrometerScreen:
         ), "Dependencies missing for _rescale_y_axis"
         if not self._is_spectrometer_ready():
             logger.warning("Spectrometer not ready for Y-axis rescale.")
-            if self.pygame_plotter:
-                self.pygame_plotter.set_y_data(None)
+            if self.fast_renderer:
+                self.fast_renderer.plotter.clear_data()
             return
 
         logger.info("Attempting to rescale Y-axis...")
@@ -3689,8 +3138,8 @@ class SpectrometerScreen:
             assert intensities_for_rescale_unfiltered is not None
             if len(intensities_for_rescale_unfiltered) == 0:
                 logger.warning("Empty intensities array received during rescale.")
-                if self.pygame_plotter:
-                    self.pygame_plotter.set_y_data(None)
+                if self.fast_renderer:
+                    self.fast_renderer.plotter.clear_data()
                 return
 
             data_source_for_scaling: np.ndarray | None = None
@@ -3725,17 +3174,16 @@ class SpectrometerScreen:
                         f"Rescaling in Reflectance mode, but refs not valid ({reason_code}). Using raw data."
                     )
                     data_source_for_scaling = intensities_for_rescale_unfiltered
-            else:  # MODE_RAW
+            else:
                 data_source_for_scaling = intensities_for_rescale_unfiltered
 
             assert data_source_for_scaling is not None
             if len(data_source_for_scaling) == 0:
                 logger.warning("Data for max finding is empty in rescale.")
-                if self.pygame_plotter:
-                    self.pygame_plotter.set_y_data(None)
+                if self.fast_renderer:
+                    self.fast_renderer.plotter.clear_data()
                 return
 
-            # Apply smoothing FOR SCALING DECISION ONLY, if enabled
             data_to_find_max_from = data_source_for_scaling
             if (
                 USE_LIVE_SMOOTHING
@@ -3769,7 +3217,7 @@ class SpectrometerScreen:
                 new_y_max_val = min(
                     new_y_max_val, float(Y_AXIS_REFLECTANCE_RESCALE_MAX_CEILING)
                 )
-            else:  # Raw
+            else:
                 new_y_max_val = max(
                     float(Y_AXIS_MIN_CEILING),
                     float(max_val_for_scaling * Y_AXIS_RESCALE_FACTOR),
@@ -3780,17 +3228,16 @@ class SpectrometerScreen:
                 )
 
             self._current_y_max_for_plot = new_y_max_val
-            if self.pygame_plotter:
-                self.pygame_plotter.set_y_limits(0, self._current_y_max_for_plot)
-                # Update tick format based on the new scale and mode
+            if self.fast_renderer:
+                self.fast_renderer.set_y_limits(0, self._current_y_max_for_plot)
                 if is_reflectance_plot_for_rescale:
-                    self.pygame_plotter.set_y_tick_format(
+                    self.fast_renderer.set_y_tick_format(
                         "{:.2f}"
                         if new_y_max_val < 2.0 and new_y_max_val > 0
                         else "{:.1f}"
                     )
-                else:  # Raw
-                    self.pygame_plotter.set_y_tick_format("{:.0f}")
+                else:
+                    self.fast_renderer.set_y_tick_format("{:.0f}")
             logger.info(f"Y-axis max rescaled to: {self._current_y_max_for_plot:.2f}")
 
         except AssertionError as ae:
@@ -3799,21 +3246,14 @@ class SpectrometerScreen:
             logger.error(f"Error rescaling Y-axis: {e}", exc_info=True)
 
     def _draw_overlays(self):
-        # Ensure self.overlay_font is used for general status,
-        # and self.spectro_hint_font (if loaded) is used for the hint text.
-        if (
-            not self.screen or not self.menu_system
-        ):  # Removed self.overlay_font from this primary check
+        if not self.screen or not self.menu_system:
             logger.warning("Screen or MenuSystem missing in _draw_overlays.")
             return
 
-        # Check for general overlay font (used for most text)
         if not self.overlay_font:
             logger.warning(
                 "General overlay_font missing in _draw_overlays. Some text may not appear."
             )
-            # Decide on behavior: either return, or try to proceed without this font.
-            # For now, we'll let it proceed and individual render calls might fail or use None.
 
         state = self._current_state
         current_menu_mode = self.menu_system.get_collection_mode()
@@ -3841,7 +3281,6 @@ class SpectrometerScreen:
         top_y_pos, left_x_pos_start, right_margin, text_spacing = 5, 5, 5, 10
         current_x_pos = left_x_pos_start
 
-        # Render with self.overlay_font
         if self.overlay_font:
             try:
                 integ_surf = self.overlay_font.render(
@@ -3887,49 +3326,48 @@ class SpectrometerScreen:
         elif state == self.STATE_FROZEN_VIEW:
             mode_txt_l1, mode_color_l1, hint_txt = (
                 "Mode: REVIEW",
-                BLUE,
+                YELLOW,
                 "A:Save Frozen | B:Discard Frozen",
             )
         elif state == self.STATE_CALIBRATE:
             mode_txt_l1, mode_color_l1, hint_txt = (
                 "CALIBRATION MENU",
-                GREEN,
+                YELLOW,
                 "A:White | X:Dark | Y:Auto | B:Back",
             )
         elif state == self.STATE_DARK_CAPTURE_SETUP:
             mode_txt_l1, mode_color_l1, hint_txt = (
                 "Mode: DARK SETUP",
-                RED,
+                YELLOW,
                 "A:Freeze Dark | B:Back (Calib)",
             )
         elif state == self.STATE_WHITE_CAPTURE_SETUP:
             mode_txt_l1, mode_color_l1, hint_txt = (
                 "Mode: WHITE SETUP",
-                CYAN,
+                YELLOW,
                 "A:Freeze White | Y:Rescale | B:Back (Calib)",
             )
         elif state == self.STATE_AUTO_INTEG_SETUP:
             mode_txt_l1, mode_color_l1, hint_txt = (
                 "AUTO INTEG SETUP",
-                MAGENTA,
+                YELLOW,
                 "Aim White Ref -> A:Start | B:Back (Calib)",
             )
         elif state == self.STATE_AUTO_INTEG_RUNNING:
             mode_txt_l1, mode_color_l1, hint_txt = (
                 f"AUTO RUN iter:{self._auto_integ_iteration_count}",
-                MAGENTA,
+                YELLOW,
                 "B:Cancel Auto-Integration",
             )
         elif state == self.STATE_AUTO_INTEG_CONFIRM:
             mode_txt_l1, mode_color_l1, hint_txt = (
                 "AUTO INTEG CONFIRM",
-                MAGENTA,
+                YELLOW,
                 "A:Apply Result | B:Back (Calib)",
             )
         else:
             mode_txt_l1 = f"Mode: {state.upper()} (ERROR)"
 
-        # Render Mode text with self.overlay_font
         if mode_txt_l1 and self.overlay_font:
             try:
                 mode_surf_l1 = self.overlay_font.render(
@@ -3944,16 +3382,15 @@ class SpectrometerScreen:
             except Exception as e_render_mode:
                 logger.error(f"Error rendering mode overlay: {e_render_mode}")
 
-        # Render Hint text with self.spectro_hint_font (NEW)
         if hint_txt:
-            font_to_use_for_hint = self.spectro_hint_font  # Use the specific hint font
-            if not font_to_use_for_hint:  # Fallback if spectro_hint_font failed to load
+            font_to_use_for_hint = self.spectro_hint_font
+            if not font_to_use_for_hint:
                 logger.warning(
                     "SpectrometerScreen hint font not loaded, attempting to use general overlay_font for hint."
                 )
                 font_to_use_for_hint = self.overlay_font
 
-            if font_to_use_for_hint:  # If any font is available
+            if font_to_use_for_hint:
                 try:
                     hint_surf = font_to_use_for_hint.render(hint_txt, True, YELLOW)
                     self.screen.blit(
@@ -3973,9 +3410,10 @@ class SpectrometerScreen:
         if self.screen is None:
             logger.error("Screen object None in SpectrometerScreen.draw.")
             return
+
         self.screen.fill(BLACK)
 
-        self._update_plot_data_for_state()  # This prepares data for PygamePlotter
+        self._update_plot_data_for_state()
 
         spectrometer_can_operate = self._is_spectrometer_ready()
         is_frozen_data_display_state = (
@@ -3987,9 +3425,20 @@ class SpectrometerScreen:
             )
         )
 
-        if self.pygame_plotter:
+        if self.fast_renderer:
             if spectrometer_can_operate or is_frozen_data_display_state:
-                self.pygame_plotter.draw()
+                self.fast_renderer.draw()
+
+                if logger.isEnabledFor(logging.DEBUG):  # Optional performance logging
+                    perf_info = self.fast_renderer.get_performance_info()
+                    if (
+                        perf_info and perf_info.get("estimated_fps", 0) > 0
+                    ):  # Check if perf_info is not None
+                        logger.debug(
+                            f"Render FPS: {perf_info['estimated_fps']:.1f}, "
+                            f"Points: {perf_info.get('display_data_points', 'N/A')}, "
+                            f"Decimation: {perf_info.get('decimation_ratio', 'N/A'):.3f}"
+                        )
             else:
                 if self.overlay_font:
                     status_txt = "Spectrometer Disabled"
@@ -4000,19 +3449,18 @@ class SpectrometerScreen:
                     else:
                         status_txt = "Spectrometer Not Ready"
 
+                    # Use plot area from fast_renderer's internal plotter
+                    plot_rect = self.fast_renderer.plotter.plot_widget_rect
                     self.screen.fill(
-                        self.pygame_plotter.bg_color,
-                        self.pygame_plotter.plot_widget_rect,
-                    )
-                    status_surf = self.overlay_font.render(status_txt, True, RED)
-                    text_rect = status_surf.get_rect(
-                        center=self.pygame_plotter.plot_widget_rect.center
-                    )
+                        BLACK, plot_rect
+                    )  # Use BLACK or self.fast_renderer.plotter.bg_color
+                    status_surf = self.overlay_font.render(status_txt, True, YELLOW)
+                    text_rect = status_surf.get_rect(center=plot_rect.center)
                     self.screen.blit(status_surf, text_rect)
         else:
             if self.overlay_font:
                 status_surf = self.overlay_font.render(
-                    "Plotter System Error", True, RED
+                    "Plotter System Error", True, YELLOW
                 )
                 text_rect = status_surf.get_rect(
                     center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
@@ -4053,26 +3501,32 @@ class SpectrometerScreen:
 
             self.draw()
 
-            wait_ms = int(SPECTRO_LOOP_DELAY_S * 1000)
+            # FIXED: Use minimal loop delay since capture already includes integration time
+            base_wait_ms = int(SPECTRO_LOOP_DELAY_S * 1000)  # ~50ms base delay
+            wait_ms = base_wait_ms
+
             try:
-                if self._current_state not in [
+                # Dynamic wait based on actual cycle performance
+                timing = getattr(self, "_last_cycle_timing", {})
+                if timing and not timing.get("is_frozen", False):
+                    actual_cycle_ms = timing.get("total_cycle_ms", 0)
+                    # If cycle was very fast, use base wait; otherwise minimal wait
+                    if actual_cycle_ms < 100:  # Cycle under 100ms (rare)
+                        wait_ms = base_wait_ms
+                    else:
+                        # Minimal wait since capture already took the integration time
+                        wait_ms = max(10, min(base_wait_ms, 30))  # 10-30ms range
+                elif self._current_state in [
                     self.STATE_FROZEN_VIEW,
                     self.STATE_CALIBRATE,
                     self.STATE_AUTO_INTEG_CONFIRM,
                 ]:
-                    integ_ms_for_wait = (
-                        self._current_auto_integ_us // 1000
-                        if self._current_state == self.STATE_AUTO_INTEG_RUNNING
-                        else self.menu_system.get_integration_time_ms()
-                    )
-                    assert isinstance(integ_ms_for_wait, int) and integ_ms_for_wait >= 0
-                    if integ_ms_for_wait > 0:
-                        target_wait_s = (
-                            integ_ms_for_wait / 1000.0
-                        ) + SPECTRO_REFRESH_OVERHEAD_S
-                        wait_ms = int(max(SPECTRO_LOOP_DELAY_S, target_wait_s) * 1000)
+                    # For menu states, use base wait for responsiveness
+                    wait_ms = base_wait_ms
+
             except Exception as e_wait:
                 logger.warning(f"Error calculating dynamic wait: {e_wait}")
+                wait_ms = base_wait_ms
 
             assert isinstance(wait_ms, int) and wait_ms >= 0
             pygame.time.wait(wait_ms)
@@ -4084,6 +3538,17 @@ class SpectrometerScreen:
 
     def cleanup(self):
         logger.info("Cleaning up SpectrometerScreen resources...")
+        if self.fast_renderer:
+            try:
+                perf_info = self.fast_renderer.get_performance_info()
+                if perf_info:  # Check if perf_info is not None
+                    logger.info(f"Final render performance: {perf_info}")
+
+                self.fast_renderer.plotter.clear_data()
+                self.fast_renderer = None
+            except Exception as e:
+                logger.error(f"Error cleaning up fast renderer: {e}")
+
         if self.spectrometer:
             try:
                 dev_proxy = getattr(self.spectrometer, "_dev", None)
@@ -4092,8 +3557,867 @@ class SpectrometerScreen:
             except Exception as e:
                 logger.error(f"Error closing spectrometer: {e}", exc_info=True)
         self.spectrometer = None
-        self.pygame_plotter = None
+        # self.fast_renderer = None # Already set to None above
         logger.info("SpectrometerScreen cleanup complete.")
+
+
+class OptimizedPygamePlotter:
+    """High-performance plotter with data decimation and numpy vectorization"""
+
+    def __init__(
+        self,
+        parent_surface: pygame.Surface,
+        plot_widget_rect: pygame.Rect,
+        initial_x_data: np.ndarray | None = None,
+        x_label_text: str = "Wavelength (nm)",
+        y_label_text: str = "Intensity",
+        bg_color: tuple[int, int, int] = (0, 0, 0),
+        axis_color: tuple[int, int, int] = (128, 128, 128),
+        plot_color: tuple[int, int, int] = (0, 255, 255),
+        text_color: tuple[int, int, int] = (255, 255, 255),
+        grid_color: tuple[int, int, int] = (40, 40, 40),
+        num_x_ticks: int = 5,
+        num_y_ticks: int = 5,
+        target_display_points: int = 300,
+    ):
+
+        assert parent_surface is not None, "Parent surface cannot be None"
+        assert plot_widget_rect is not None, "Plot rect cannot be None"
+        assert pygame.font.get_init(), "Pygame font system not initialized"
+        assert target_display_points > 10, "Target display points must be reasonable"
+
+        self.parent_surface = parent_surface
+        self.plot_widget_rect = plot_widget_rect
+        self.target_display_points = target_display_points
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        assets_dir = os.path.join(script_dir, "assets")
+        axis_font_path = os.path.join(assets_dir, PLOTTER_AXIS_LABEL_FONT_FILENAME)
+        tick_font_path = os.path.join(assets_dir, PLOTTER_TICK_LABEL_FONT_FILENAME)
+
+        self.axis_label_font = _load_font_safe(
+            axis_font_path, PLOTTER_AXIS_LABEL_FONT_SIZE
+        )
+        self.tick_label_font = _load_font_safe(
+            tick_font_path, PLOTTER_TICK_LABEL_FONT_SIZE
+        )
+
+        self.x_label_text = x_label_text
+        self.y_label_text = y_label_text
+        self.bg_color = bg_color
+        self.axis_color = axis_color
+        self.plot_color = plot_color
+        self.text_color = text_color
+        self.grid_color = grid_color
+        self.num_x_ticks = max(0, num_x_ticks)
+        self.num_y_ticks = max(0, num_y_ticks)
+        self.y_tick_format_str = "{:.1f}"
+
+        self.padding_left = 60
+        self.padding_right = 20
+        self.padding_top = 20
+        self.padding_bottom = 50
+
+        self.graph_area = pygame.Rect(
+            self.plot_widget_rect.left + self.padding_left,
+            self.plot_widget_rect.top + self.padding_top,
+            max(
+                20, self.plot_widget_rect.width - self.padding_left - self.padding_right
+            ),
+            max(
+                20,
+                self.plot_widget_rect.height - self.padding_top - self.padding_bottom,
+            ),
+        )
+
+        self.original_x_data: np.ndarray | None = None
+        self.display_x_data: np.ndarray | None = None
+        self.display_y_data: np.ndarray | None = None
+        self.screen_x_coords: np.ndarray | None = None
+        self.screen_y_coords: np.ndarray | None = None
+
+        self.x_min_val = 0.0
+        self.x_max_val = 1.0
+        self.y_min_val_display = 0.0
+        self.y_max_val_display = 1.0
+
+        self.static_surface = pygame.Surface(self.plot_widget_rect.size)
+        self.plot_surface = pygame.Surface(self.plot_widget_rect.size, pygame.SRCALPHA)
+
+        self.needs_static_redraw = True
+        self.needs_plot_redraw = True
+
+        if initial_x_data is not None and len(initial_x_data) > 0:
+            self.set_x_data_static(initial_x_data)
+
+        self._render_static_elements()
+
+    def set_x_data_static(self, x_data: np.ndarray):
+        assert isinstance(x_data, np.ndarray) and x_data.ndim == 1 and len(x_data) > 0
+
+        self.original_x_data = x_data.copy()
+
+        # Decimate X data for display - This should now use the global decimate function
+        # This part seems to be simplified in the provided snippet, let's stick to it.
+        if len(x_data) > self.target_display_points:
+            indices = np.linspace(
+                0, len(x_data) - 1, self.target_display_points, dtype=int
+            )
+            self.display_x_data = x_data[indices].copy()
+        else:
+            self.display_x_data = x_data.copy()
+
+        self.x_min_val = float(np.min(self.display_x_data))
+        self.x_max_val = float(np.max(self.display_x_data))
+        if self.x_max_val == self.x_min_val:
+            self.x_max_val = self.x_min_val + 1.0
+
+        self._precompute_screen_x_coordinates()
+        self.needs_static_redraw = True
+
+    def _precompute_screen_x_coordinates(self):
+        """Pre-compute X coordinates with NaN handling"""
+        if self.display_x_data is None or len(self.display_x_data) == 0:
+            self.screen_x_coords = None
+            return
+
+        x_range = self.x_max_val - self.x_min_val
+        if x_range <= 1e-9:  # Use small epsilon to avoid division by zero
+            x_range = 1.0
+
+        # Ensure input data is finite
+        valid_x_data = self.display_x_data[np.isfinite(self.display_x_data)]
+        if len(valid_x_data) == 0:
+            self.screen_x_coords = None
+            return
+
+        normalized_x = (valid_x_data - self.x_min_val) / x_range
+        raw_coords = self.graph_area.left + normalized_x * self.graph_area.width
+
+        # Store only finite coordinates
+        self.screen_x_coords = raw_coords[np.isfinite(raw_coords)].astype(np.float32)
+        if len(self.screen_x_coords) == 0:
+            self.screen_x_coords = None
+
+    def set_y_data(self, y_data: np.ndarray | None):
+        if y_data is None:
+            self.display_y_data = None
+            self.screen_y_coords = None
+            self.needs_plot_redraw = True
+            return
+
+        assert isinstance(y_data, np.ndarray) and y_data.ndim == 1
+
+        # Y data is expected to be already decimated to match display_x_data length by FastSpectralRenderer
+        # So, no further decimation here. Just copy.
+        if self.display_x_data is not None and len(y_data) == len(self.display_x_data):
+            self.display_y_data = y_data.copy().astype(np.float32)
+        elif (
+            len(y_data) == self.target_display_points
+        ):  # if y_data is already target length
+            self.display_y_data = y_data.copy().astype(np.float32)
+        else:  # Fallback if lengths don't match - could try to resample or warn
+            logger.warning(
+                f"OptimizedPygamePlotter: Y_data length ({len(y_data)}) mismatch with display_x_data or target_points. Attempting to resample."
+            )
+            if self.display_x_data is not None and len(self.display_x_data) > 1:
+                current_indices = np.linspace(0, 1, len(y_data))
+                target_indices = np.linspace(0, 1, len(self.display_x_data))
+                self.display_y_data = np.interp(
+                    target_indices, current_indices, y_data
+                ).astype(np.float32)
+            else:  # Cannot resample if display_x_data is not set
+                self.display_y_data = None
+                self.screen_y_coords = None
+                self.needs_plot_redraw = True
+                return
+
+        self._precompute_screen_y_coordinates()
+        self.needs_plot_redraw = True
+
+    def _precompute_screen_y_coordinates(self):
+        """Pre-compute Y coordinates with NaN handling"""
+        if self.display_y_data is None or len(self.display_y_data) == 0:
+            self.screen_y_coords = None
+            return
+
+        y_range = self.y_max_val_display - self.y_min_val_display
+        if y_range <= 1e-9:
+            y_range = 1.0
+
+        # Ensure input data is finite
+        valid_y_data = self.display_y_data[np.isfinite(self.display_y_data)]
+        if len(valid_y_data) == 0:
+            self.screen_y_coords = None
+            return
+
+        clamped_y = np.clip(
+            valid_y_data, self.y_min_val_display, self.y_max_val_display
+        )
+        normalized_y = (clamped_y - self.y_min_val_display) / y_range
+        raw_coords = self.graph_area.bottom - normalized_y * self.graph_area.height
+
+        # Store only finite coordinates
+        self.screen_y_coords = raw_coords[np.isfinite(raw_coords)].astype(np.float32)
+        if len(self.screen_y_coords) == 0:
+            self.screen_y_coords = None
+
+    def set_y_limits(self, y_min: float, y_max: float):
+        assert isinstance(y_min, (int, float)) and isinstance(y_max, (int, float))
+
+        y_min_f, y_max_f = float(y_min), float(y_max)
+
+        if y_max_f == y_min_f:
+            y_max_f = y_min_f + 1.0
+        if y_max_f < y_min_f:
+            y_min_f, y_max_f = y_max_f, y_min_f
+
+        if self.y_min_val_display != y_min_f or self.y_max_val_display != y_max_f:
+            self.y_min_val_display = y_min_f
+            self.y_max_val_display = y_max_f
+
+            if self.display_y_data is not None:
+                self._precompute_screen_y_coordinates()
+
+            self.needs_static_redraw = True
+            self.needs_plot_redraw = True
+
+    def set_y_label(self, label: str):
+        assert isinstance(label, str)
+        if self.y_label_text != label:
+            self.y_label_text = label
+            self.needs_static_redraw = True
+
+    def set_y_tick_format(self, format_str: str):
+        assert isinstance(format_str, str)
+        if self.y_tick_format_str != format_str:
+            self.y_tick_format_str = format_str
+            self.needs_static_redraw = True
+
+    def _render_static_elements(self):
+        if not self.needs_static_redraw:
+            return
+
+        self.static_surface.fill(self.bg_color)
+
+        if not self.axis_label_font or not self.tick_label_font:
+            self.needs_static_redraw = False
+            return
+
+        graph_left = self.graph_area.left - self.plot_widget_rect.left
+        graph_right = self.graph_area.right - self.plot_widget_rect.left
+        graph_top = self.graph_area.top - self.plot_widget_rect.top
+        graph_bottom = self.graph_area.bottom - self.plot_widget_rect.top
+
+        pygame.draw.line(
+            self.static_surface,
+            self.axis_color,
+            (graph_left, graph_bottom),
+            (graph_right, graph_bottom),
+            1,
+        )
+        pygame.draw.line(
+            self.static_surface,
+            self.axis_color,
+            (graph_left, graph_top),
+            (graph_left, graph_bottom),
+            1,
+        )
+
+        if (
+            self.num_x_ticks > 0
+            and self.x_max_val > self.x_min_val
+            and self.display_x_data is not None
+        ):  # check display_x_data
+            x_tick_values = np.linspace(
+                self.x_min_val, self.x_max_val, self.num_x_ticks + 1
+            )
+            for val in x_tick_values:
+                x_pos = graph_left + (val - self.x_min_val) / (
+                    self.x_max_val - self.x_min_val
+                ) * (graph_right - graph_left)
+                pygame.draw.line(
+                    self.static_surface,
+                    self.axis_color,
+                    (x_pos, graph_bottom),
+                    (x_pos, graph_bottom + 5),
+                    1,
+                )
+                try:
+                    label_surf = self.tick_label_font.render(
+                        f"{val:.0f}", True, self.text_color
+                    )
+                    label_rect = label_surf.get_rect(
+                        centerx=x_pos, top=graph_bottom + 7
+                    )
+                    self.static_surface.blit(label_surf, label_rect)
+                except pygame.error:
+                    pass  # Silently ignore font render errors if minor
+
+        if self.num_y_ticks > 0 and self.y_max_val_display > self.y_min_val_display:
+            y_tick_values = np.linspace(
+                self.y_min_val_display, self.y_max_val_display, self.num_y_ticks + 1
+            )
+            for val in y_tick_values:
+                y_pos = graph_bottom - (val - self.y_min_val_display) / (
+                    self.y_max_val_display - self.y_min_val_display
+                ) * (graph_bottom - graph_top)
+                pygame.draw.line(
+                    self.static_surface,
+                    self.axis_color,
+                    (graph_left - 5, y_pos),
+                    (graph_left, y_pos),
+                    1,
+                )
+                pygame.draw.line(
+                    self.static_surface,
+                    self.grid_color,
+                    (graph_left + 1, y_pos),
+                    (graph_right, y_pos),
+                    1,
+                )
+                try:
+                    label_str = self.y_tick_format_str.format(val)
+                    label_surf = self.tick_label_font.render(
+                        label_str, True, self.text_color
+                    )
+                    label_rect = label_surf.get_rect(
+                        right=graph_left - 7, centery=y_pos
+                    )
+                    self.static_surface.blit(label_surf, label_rect)
+                except (pygame.error, ValueError):
+                    pass
+
+        if self.x_label_text:
+            try:
+                x_label_surf = self.axis_label_font.render(
+                    self.x_label_text, True, self.text_color
+                )
+                x_label_rect = x_label_surf.get_rect(
+                    centerx=(graph_left + graph_right) // 2, top=graph_bottom + 25
+                )
+                self.static_surface.blit(x_label_surf, x_label_rect)
+            except pygame.error:
+                pass
+
+        if self.y_label_text:
+            try:
+                y_label_surf = self.axis_label_font.render(
+                    self.y_label_text, True, self.text_color
+                )
+                y_label_rotated = pygame.transform.rotate(y_label_surf, 90)
+                y_label_rect = y_label_rotated.get_rect(
+                    centerx=self.plot_widget_rect.left
+                    + 15
+                    - self.plot_widget_rect.left,  # adjust for relative blit
+                    centery=(graph_top + graph_bottom) // 2,
+                )
+                self.static_surface.blit(y_label_rotated, y_label_rect)
+            except pygame.error:
+                pass
+
+        self.needs_static_redraw = False
+
+    def _render_plot_line(self):
+        """Render spectral data line with proper NaN/inf handling"""
+        if not self.needs_plot_redraw:
+            return
+
+        self.plot_surface.fill((0, 0, 0, 0))  # Clear previous plot line
+
+        # Check if we have valid coordinate arrays
+        if (
+            self.screen_x_coords is None
+            or self.screen_y_coords is None
+            or len(self.screen_x_coords) < 2
+            or len(self.screen_y_coords) < 2
+            or len(self.screen_x_coords) != len(self.screen_y_coords)
+        ):
+            self.needs_plot_redraw = False
+            return
+
+        # Convert coordinates relative to the plot_widget_rect
+        plot_x_coords = self.screen_x_coords - self.plot_widget_rect.left
+        plot_y_coords = self.screen_y_coords - self.plot_widget_rect.top
+
+        try:
+            # **CRITICAL**: Filter out NaN and infinite values before pygame
+            finite_mask = np.isfinite(plot_x_coords) & np.isfinite(plot_y_coords)
+            if not np.any(finite_mask):  # No valid points
+                self.needs_plot_redraw = False
+                return
+
+            valid_x = plot_x_coords[finite_mask]
+            valid_y = plot_y_coords[finite_mask]
+
+            if len(valid_x) < 2:  # Need at least 2 points to draw lines
+                self.needs_plot_redraw = False
+                return
+
+            # Create point list with guaranteed finite values
+            points_array = np.column_stack((valid_x, valid_y))
+            point_list = [(float(x), float(y)) for x, y in points_array]
+
+            if len(point_list) > 1:
+                # Set clipping rectangle
+                clip_rect = pygame.Rect(
+                    self.graph_area.left - self.plot_widget_rect.left,
+                    self.graph_area.top - self.plot_widget_rect.top,
+                    self.graph_area.width,
+                    self.graph_area.height,
+                )
+                self.plot_surface.set_clip(clip_rect)
+
+                # Draw the lines - now guaranteed to have valid coordinates
+                pygame.draw.lines(
+                    self.plot_surface, self.plot_color, False, point_list, 1
+                )
+
+                self.plot_surface.set_clip(None)  # Reset clipping
+
+        except Exception as e:
+            logger.error(
+                f"Error rendering plot line in OptimizedPygamePlotter: {e}",
+                exc_info=True,
+            )
+
+        self.needs_plot_redraw = False
+
+    def draw(self):
+        self._render_static_elements()
+        self._render_plot_line()
+        self.parent_surface.blit(self.static_surface, self.plot_widget_rect.topleft)
+        self.parent_surface.blit(self.plot_surface, self.plot_widget_rect.topleft)
+
+    def get_performance_stats(self) -> dict:
+        stats = {
+            "original_data_points": (
+                len(self.original_x_data) if self.original_x_data is not None else 0
+            ),
+            "display_data_points": (
+                len(self.display_x_data) if self.display_x_data is not None else 0
+            ),
+            "decimation_ratio": 0.0,
+            "memory_usage_mb": 0.0,
+        }
+        if (
+            stats["original_data_points"] > 0 and stats["display_data_points"] > 0
+        ):  # Avoid division by zero
+            stats["decimation_ratio"] = (
+                stats["display_data_points"] / stats["original_data_points"]
+            )
+
+        arrays_to_check = [
+            self.original_x_data,
+            self.display_x_data,
+            self.display_y_data,
+            self.screen_x_coords,
+            self.screen_y_coords,
+        ]
+        total_bytes = sum(
+            arr.nbytes
+            for arr in arrays_to_check
+            if arr is not None and hasattr(arr, "nbytes")
+        )
+        stats["memory_usage_mb"] = total_bytes / (1024 * 1024)
+        return stats
+
+    def clear_data(self):
+        self.original_x_data = None
+        self.display_x_data = None
+        self.display_y_data = None
+        self.screen_x_coords = None
+        self.screen_y_coords = None
+        self.needs_plot_redraw = True
+
+
+class FastSpectralRenderer:
+    """Ultra-fast spectral renderer with caching and performance monitoring"""
+
+    def __init__(
+        self,
+        parent_surface: pygame.Surface,
+        plot_rect: pygame.Rect,
+        target_fps: int = 30,
+        max_display_points: int = 300,
+    ):
+        assert parent_surface is not None, "Parent surface required"
+        assert plot_rect is not None, "Plot rectangle required"
+        assert target_fps > 0, "Target FPS must be positive"
+        assert max_display_points > 10, "Display points must be reasonable"
+
+        self.plotter = OptimizedPygamePlotter(
+            parent_surface=parent_surface,
+            plot_widget_rect=plot_rect,
+            target_display_points=max_display_points,
+        )
+
+        self.max_display_points = (
+            max_display_points  # Same as target_display_points for plotter
+        )
+        self._last_raw_data_hash: str | None = None
+        self._cached_display_data: np.ndarray | None = None
+        self.smoothing_enabled = True
+        self.smoothing_window = 5  # Default, can be configured
+
+        self.frame_times: list[float] = []  # For FPS calculation
+
+    def set_wavelengths(self, wavelengths):
+        """Set wavelength data with validation"""
+        assert isinstance(wavelengths, np.ndarray), "Wavelengths must be numpy array"
+        assert len(wavelengths) > 0, "Wavelengths cannot be empty"
+
+        logger.debug(
+            f"FastSpectralRenderer: Setting wavelengths {wavelengths[0]:.1f}-{wavelengths[-1]:.1f} nm ({len(wavelengths)} points)"
+        )
+
+        # Clear cache when wavelengths change
+        self._last_raw_data_hash = None
+        self._cached_display_data = None
+
+        # Set wavelengths on plotter
+        self.plotter.set_x_data_static(wavelengths)
+
+        # Verify it was set
+        if self.plotter.original_x_data is None:
+            logger.error("Failed to set wavelengths on plotter!")
+        else:
+            logger.debug(f"Wavelengths successfully set on plotter")
+
+    def update_spectrum(
+        self,
+        intensities: np.ndarray,
+        apply_smoothing: bool = True,
+        force_update: bool = False,
+    ) -> bool:
+        frame_start_time = time.perf_counter()
+
+        if self.plotter.original_x_data is None:
+            logger.warning(
+                "FastSpectralRenderer: No wavelengths set, cannot update spectrum"
+            )
+            return False
+
+        if not force_update:
+            data_hash = hashlib.md5(intensities.tobytes()).hexdigest()
+            if (
+                data_hash == self._last_raw_data_hash
+                and self._cached_display_data is not None
+            ):
+                self.plotter.set_y_data(
+                    self._cached_display_data
+                )  # Use cached, already processed data
+                # No need to record frame time if using cache, as it's not a full processing cycle.
+                return True  # Indicate update was "successful" (used cache)
+            self._last_raw_data_hash = data_hash
+
+        try:
+            original_wavelengths = self.plotter.original_x_data
+            if original_wavelengths is None:  # Should be set by set_wavelengths
+                logger.warning(
+                    "FastSpectralRenderer: original_x_data not set in plotter. Assuming default."
+                )
+                original_wavelengths = np.linspace(
+                    400, 800, len(intensities)
+                )  # Fallback
+
+            # Use the global prepare_display_data function
+            # This function handles smoothing and decimation
+            _disp_wl, display_intensities = prepare_display_data(
+                wavelengths=original_wavelengths,  # Pass full resolution WL
+                intensities=intensities,  # Pass full resolution Intensities
+                display_width=self.max_display_points,  # Target for decimation
+                apply_smoothing=apply_smoothing and self.smoothing_enabled,
+                smoothing_window=self.smoothing_window,
+            )
+
+            self._cached_display_data = (
+                display_intensities.copy()
+            )  # Cache the final display data
+
+            # OptimizedPygamePlotter expects Y data to match its display_x_data length
+            # prepare_display_data already returns decimated intensities
+            self.plotter.set_y_data(display_intensities)
+
+            frame_time = time.perf_counter() - frame_start_time
+            self.frame_times.append(frame_time)
+            if len(self.frame_times) > 100:  # Keep last 100 samples
+                self.frame_times = self.frame_times[-100:]
+
+            return True
+
+        except Exception as e:
+            logger.error(
+                f"FastSpectralRenderer error during update_spectrum: {e}", exc_info=True
+            )
+            return False
+
+    def draw(self):
+        self.plotter.draw()
+
+    def set_y_limits(self, y_min: float, y_max: float):
+        self.plotter.set_y_limits(y_min, y_max)
+
+    def set_y_label(self, label: str):
+        self.plotter.set_y_label(label)
+
+    def set_y_tick_format(self, format_str: str):
+        self.plotter.set_y_tick_format(format_str)
+
+    def get_performance_info(self) -> dict | None:  # Return None if no data
+        # Get base stats from OptimizedPygamePlotter
+        plotter_stats = self.plotter.get_performance_stats()
+
+        if not self.frame_times:
+            return plotter_stats  # Return plotter stats even if no frame times yet
+
+        avg_frame_time = np.mean(self.frame_times) if self.frame_times else 0
+        max_frame_time = np.max(self.frame_times) if self.frame_times else 0
+        estimated_fps = 1.0 / avg_frame_time if avg_frame_time > 0 else 0
+
+        plotter_stats.update(
+            {
+                "avg_frame_time_ms": avg_frame_time * 1000,
+                "max_frame_time_ms": max_frame_time * 1000,
+                "estimated_fps": estimated_fps,
+            }
+        )
+        return plotter_stats
+
+    def configure_smoothing(self, enabled: bool = True, window_size: int = 5):
+        assert isinstance(enabled, bool), "Enabled must be boolean"
+        assert (
+            isinstance(window_size, int) and window_size > 0
+        ), "Window size must be positive integer"
+
+        self.smoothing_enabled = enabled
+        self.smoothing_window = window_size
+
+        self._last_raw_data_hash = None  # Invalidate cache
+        self._cached_display_data = None
+        logger.info(
+            f"FastSpectralRenderer smoothing configured: enabled={enabled}, window={window_size}"
+        )
+
+
+def setup_signal_handlers(button_handler: ButtonHandler, network_info: NetworkInfo):
+    assert button_handler and network_info
+
+    def handler(sig, frame):
+        if not g_shutdown_flag.is_set():
+            logger.warning(f"Signal {sig}. Initiating shutdown...")
+            g_shutdown_flag.set()
+        else:
+            logger.debug(f"Signal {sig} again, shutdown in progress.")
+
+    try:
+        signal.signal(signal.SIGINT, handler)
+        signal.signal(signal.SIGTERM, handler)
+        logger.info("Signal handlers set.")
+    except Exception as e:
+        logger.error(f"Failed to set signal handlers: {e}", exc_info=True)
+
+
+# --- Helper Functions ---
+def get_safe_datetime(year, month, day, hour=0, minute=0, second=0):
+    assert all(isinstance(v, int) for v in [year, month, day, hour, minute, second])
+    try:
+        return datetime.datetime(
+            year, max(1, min(12, month)), day, hour, minute, second
+        )
+    except ValueError as e:
+        logger.warning(
+            f"Invalid date/time: Y{year}-M{month}-D{day} H{hour}:M{minute}:S{second}. {e}"
+        )
+        return None
+
+
+def update_hardware_display(screen: pygame.Surface, display_hat_obj):
+    assert screen is not None
+    if USE_ADAFRUIT_PITFT:
+        try:
+            raw = pygame.image.tostring(screen, "RGB")
+            rgb565_data = bytearray()
+            for i in range(0, len(raw), 3):
+                if i + 2 < len(raw):
+                    r = raw[i] >> 3
+                    g = raw[i + 1] >> 2
+                    b = raw[i + 2] >> 3
+                    rgb565 = (r << 11) | (g << 5) | b
+                    rgb565_data.extend(rgb565.to_bytes(2, byteorder="little"))
+            with open("/dev/fb1", "wb") as fb:
+                fb.write(rgb565_data)
+        except Exception as e:
+            logger.error(
+                f"Error updating Adafruit PiTFT framebuffer: {e}", exc_info=True
+            )
+    elif USE_DISPLAY_HAT and display_hat_obj:
+        try:
+            assert (
+                hasattr(display_hat_obj, "st7789")
+                and hasattr(display_hat_obj.st7789, "set_window")
+                and hasattr(display_hat_obj.st7789, "data")
+            )
+            rotated_surf = pygame.transform.rotate(screen, 180)
+            pixel_data_pygame_format = rotated_surf.convert(16, 0).get_buffer()
+            px_bytes_swapped = bytearray(pixel_data_pygame_format)
+            for i in range(0, len(px_bytes_swapped), 2):
+                px_bytes_swapped[i], px_bytes_swapped[i + 1] = (
+                    px_bytes_swapped[i + 1],
+                    px_bytes_swapped[i],
+                )
+            display_hat_obj.st7789.set_window()
+            chunk_size = 4096
+            for i in range(0, len(px_bytes_swapped), chunk_size):
+                display_hat_obj.st7789.data(px_bytes_swapped[i : i + chunk_size])
+        except Exception as e:
+            logger.error(f"Error updating Display HAT Mini: {e}", exc_info=False)
+    else:
+        try:
+            if pygame.display.get_init() and pygame.display.get_surface():
+                pygame.display.flip()
+        except Exception as e:
+            logger.error(
+                f"Error updating Adafruit PiTFT (pygame.display.flip): {e}",
+                exc_info=True,
+            )
+
+
+def _load_font_safe(font_name_or_path: str | None, size: int) -> pygame.font.Font:
+    """
+    Loads a Pygame font, falling back to default system font if specified font is not found.
+    """
+    assert isinstance(size, int) and size > 0, "Font size must be a positive integer."
+    loaded_font: pygame.font.Font | None = None
+
+    if font_name_or_path is None:
+        try:
+            loaded_font = pygame.font.Font(None, size)
+            logger.debug(f"_load_font_safe: Loaded Pygame default font, size {size}.")
+        except Exception as e:
+            logger.error(
+                f"_load_font_safe: Failed to load Pygame default font, size {size}: {e}"
+            )
+            raise
+        return loaded_font
+
+    try:
+        loaded_font = pygame.font.Font(font_name_or_path, size)
+        logger.debug(
+            f"_load_font_safe: Successfully loaded font '{font_name_or_path}', size {size}."
+        )
+        return loaded_font
+    except pygame.error as e:
+        logger.warning(
+            f"_load_font_safe: Font file '{font_name_or_path}' not found or error loading: {e}. Trying to match system font."
+        )
+
+    try:
+        base_font_name = os.path.splitext(os.path.basename(font_name_or_path))[0]
+        system_font_path = pygame.font.match_font(base_font_name)
+        if system_font_path:
+            logger.info(
+                f"_load_font_safe: Matched system font '{base_font_name}' to '{system_font_path}'."
+            )
+            loaded_font = pygame.font.Font(system_font_path, size)
+            return loaded_font
+        else:
+            logger.warning(
+                f"_load_font_safe: System font for '{base_font_name}' not matched."
+            )
+    except Exception as e_match:
+        logger.warning(
+            f"_load_font_safe: Error during system font matching for '{font_name_or_path}': {e_match}"
+        )
+
+    logger.warning(
+        f"_load_font_safe: Falling back to Pygame default font for '{font_name_or_path}', size {size}."
+    )
+    try:
+        loaded_font = pygame.font.Font(None, size)
+    except Exception as e_default:
+        logger.error(
+            f"_load_font_safe: CRITICAL - Failed to load Pygame default font as final fallback: {e_default}"
+        )
+        raise
+    return loaded_font
+
+
+# --- Spectral Helper Functions ---
+def decimate_spectral_data_for_display(
+    wavelengths: np.ndarray, intensities: np.ndarray, target_points: int = 300
+) -> tuple[np.ndarray, np.ndarray]:
+    """Reduce data points for display performance"""
+    if len(wavelengths) <= target_points:
+        return wavelengths.copy(), intensities.copy()
+
+    decimation_factor = len(wavelengths) // target_points
+    if (
+        decimation_factor <= 2
+    ):  # Or if original_length is only slightly larger than target_points
+        indices = np.linspace(0, len(wavelengths) - 1, target_points, dtype=int)
+        return wavelengths[indices], intensities[indices]
+    else:
+        # Block averaging for larger decimation
+        trim_length = (len(wavelengths) // decimation_factor) * decimation_factor
+
+        wl_trimmed = wavelengths[:trim_length]
+        int_trimmed = intensities[:trim_length]
+
+        wl_blocks = wl_trimmed.reshape(-1, decimation_factor)
+        int_blocks = int_trimmed.reshape(-1, decimation_factor)
+
+        # Take mean of each block for wavelengths and intensities
+        decimated_wl = np.mean(wl_blocks, axis=1)
+        decimated_int = np.mean(int_blocks, axis=1)
+
+        # If after block averaging, we don't have exactly target_points, interpolate.
+        # This can happen if target_points is not a neat divisor of original_length/decimation_factor
+        if (
+            len(decimated_wl) != target_points and len(decimated_wl) > 1
+        ):  # Ensure there's enough to interp
+            current_indices = np.arange(len(decimated_wl))
+            target_indices = np.linspace(0, len(decimated_wl) - 1, target_points)
+            final_wl = np.interp(target_indices, current_indices, decimated_wl)
+            final_int = np.interp(target_indices, current_indices, decimated_int)
+            return final_wl, final_int
+
+        return decimated_wl, decimated_int
+
+
+def apply_fast_smoothing(intensities: np.ndarray, window_size: int = 5) -> np.ndarray:
+    """Fast numpy-based smoothing"""
+    if window_size <= 1 or len(intensities) < window_size:
+        return intensities.copy()
+
+    if window_size % 2 == 0:  # Ensure odd window size for symmetry
+        window_size += 1
+
+    # Create normalized convolution kernel
+    kernel = np.ones(window_size, dtype=np.float32) / window_size
+
+    # Apply convolution with 'same' mode to maintain array size
+    smoothed = np.convolve(intensities.astype(np.float32), kernel, mode="same")
+
+    return smoothed
+
+
+def prepare_display_data(
+    wavelengths: np.ndarray,
+    intensities: np.ndarray,
+    display_width: int = 300,
+    apply_smoothing: bool = True,
+    smoothing_window: int = 5,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Complete optimization pipeline"""
+    if apply_smoothing and smoothing_window > 1:
+        smoothed_intensities = apply_fast_smoothing(intensities, smoothing_window)
+    else:
+        smoothed_intensities = intensities.copy()  # Ensure it's a copy if not smoothed
+
+    return decimate_spectral_data_for_display(
+        wavelengths, smoothed_intensities, display_width
+    )
 
 
 # --- Splash Screen Function ---
@@ -4107,7 +4431,6 @@ def show_splash_screen(screen: pygame.Surface, display_hat_obj, duration_s: floa
         )
         if not os.path.isfile(img_path):
             logger.error(f"Splash image not found: {img_path}")
-            # Fallback: just wait, allow leak check to occur if main loop is structured for it
             time.sleep(min(duration_s, 2.0))
             return
         img_raw = pygame.image.load(img_path)
@@ -4124,7 +4447,7 @@ def show_splash_screen(screen: pygame.Surface, display_hat_obj, duration_s: floa
             img_final = img_raw
     except Exception as e:
         logger.error(f"Error loading splash: {e}", exc_info=True)
-        time.sleep(min(duration_s, 2.0))  # Fallback wait
+        time.sleep(min(duration_s, 2.0))
         return
 
     if img_final:
@@ -4134,21 +4457,18 @@ def show_splash_screen(screen: pygame.Surface, display_hat_obj, duration_s: floa
             screen.blit(img_final, img_rect)
             update_hardware_display(screen, display_hat_obj)
 
-            wait_interval_s = 0.1  # Check flags every 100ms
+            wait_interval_s = 0.1
             num_intervals = int(duration_s / wait_interval_s)
 
             for i in range(num_intervals):
                 if g_shutdown_flag.is_set():
                     logger.info("Shutdown signal received during splash screen.")
                     break
-                # --- MODIFICATION FOR ISSUE 1: Check leak flag during splash screen loop ---
                 if g_leak_detected_flag.is_set():
                     logger.warning(
                         "Leak detected during splash screen. Exiting splash."
                     )
                     break
-                # --- END MODIFICATION ---
-                # Process Pygame events to allow window close/escape even during splash
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
                         logger.info("Pygame QUIT event during splash.")
@@ -4158,14 +4478,14 @@ def show_splash_screen(screen: pygame.Surface, display_hat_obj, duration_s: floa
                         logger.info("Escape key pressed during splash.")
                         g_shutdown_flag.set()
                         break
-                if g_shutdown_flag.is_set():  # Check again after event processing
+                if g_shutdown_flag.is_set():
                     break
 
                 time.sleep(wait_interval_s)
             logger.info("Splash screen finished or interrupted.")
         except Exception as e:
             logger.error(f"Error displaying splash: {e}", exc_info=True)
-    elif duration_s > 0:  # Ensure there's a pause even if image load fails
+    elif duration_s > 0:
         time.sleep(duration_s)
 
 
@@ -4210,7 +4530,7 @@ def show_disclaimer_screen(
         )
     if not disc_font:
         logger.error("No font for disclaimer. Skipping display but pausing.")
-        time.sleep(2.0)  # Pause briefly even if no font
+        time.sleep(2.0)
         return
 
     try:
@@ -4222,38 +4542,34 @@ def show_disclaimer_screen(
             4,
         )
         for line_txt in lines:
-            if line_txt.strip():  # Only render non-empty lines
+            if line_txt.strip():
                 surf = disc_font.render(line_txt, True, WHITE)
                 rendered.append(surf)
                 max_w, total_h = (
                     max(max_w, surf.get_width()),
                     total_h + surf.get_height() + l_space,
                 )
-            else:  # Handle blank lines in disclaimer for spacing
-                rendered.append(None)  # Placeholder for a blank line
-                total_h += (
-                    disc_font.get_height() // 2
-                ) + l_space  # Approximate height of a blank line
+            else:
+                rendered.append(None)
+                total_h += (disc_font.get_height() // 2) + l_space
 
-        if (
-            total_h > 0 and l_space > 0 and len(rendered) > 0
-        ):  # Avoid negative if l_space is 0 or no lines
-            total_h -= l_space  # Remove last line_space
+        if total_h > 0 and l_space > 0 and len(rendered) > 0:
+            total_h -= l_space
 
         hint_surf = hint_font.render("Press A or B to continue...", True, YELLOW)
-        total_h += hint_surf.get_height() + 10  # Space for hint
+        total_h += hint_surf.get_height() + 10
 
         start_y = max(10, (screen.get_height() - total_h) // 2)
 
         screen.fill(BLACK)
         current_y = start_y
         for surf in rendered:
-            if surf:  # If it's a rendered text surface
+            if surf:
                 screen.blit(
                     surf, surf.get_rect(centerx=screen.get_width() // 2, top=current_y)
                 )
                 current_y += surf.get_height() + l_space
-            else:  # If it's a placeholder for a blank line
+            else:
                 current_y += (disc_font.get_height() // 2) + l_space
 
         screen.blit(
@@ -4263,25 +4579,21 @@ def show_disclaimer_screen(
         update_hardware_display(screen, display_hat_obj)
     except Exception as e:
         logger.error(f"Error drawing disclaimer: {e}", exc_info=True)
-        return  # Exit if drawing fails
+        return
 
     logger.info("Waiting for disclaimer acknowledgement...")
     acknowledged = False
     while not acknowledged and not g_shutdown_flag.is_set():
-        if (
-            button_handler.process_pygame_events() == "QUIT"
-        ):  # Handles K_ESCAPE and window close
-            g_shutdown_flag.set()  # Ensure shutdown flag is set
+        if button_handler.process_pygame_events() == "QUIT":
+            g_shutdown_flag.set()
             logger.warning("QUIT signal received during disclaimer.")
-            break  # Exit loop
+            break
 
-        # --- MODIFICATION FOR ISSUE 1: Check leak flag during disclaimer loop ---
         if g_leak_detected_flag.is_set():
             logger.warning(
                 "Leak detected during disclaimer screen. Exiting disclaimer."
             )
             break
-        # --- END MODIFICATION ---
 
         if button_handler.check_button(BTN_ENTER) or button_handler.check_button(
             BTN_BACK
@@ -4289,11 +4601,9 @@ def show_disclaimer_screen(
             acknowledged = True
             logger.info("Disclaimer acknowledged.")
 
-        pygame.time.wait(50)  # Loop delay
+        pygame.time.wait(50)
 
-    if (
-        not acknowledged and not g_shutdown_flag.is_set()
-    ):  # If loop exited due to leak but not shutdown
+    if not acknowledged and not g_shutdown_flag.is_set():
         logger.warning("Exited disclaimer due to leak detection, not acknowledged.")
     elif not acknowledged and g_shutdown_flag.is_set():
         logger.warning("Exited disclaimer due to shutdown signal, not acknowledged.")
@@ -4329,7 +4639,8 @@ def show_leak_warning_screen(
         if show_txt and font_l and font_s:
             try:
                 texts = [
-                    ("LEAK DETECTED", font_l, -30),
+                    ("LEAK", font_l, -70),
+                    ("DETECTED", font_l, -30),
                     ("SOS SENSOR TRIGGERED", font_s, 20),
                     ("POWER OFF DEVICE", font_s, 50),
                 ]
@@ -4353,183 +4664,6 @@ def show_leak_warning_screen(
     return "QUIT"
 
 
-# --- Signal Handling ---
-def setup_signal_handlers(button_handler: ButtonHandler, network_info: NetworkInfo):
-    assert button_handler and network_info
-
-    def handler(sig, frame):
-        if not g_shutdown_flag.is_set():
-            logger.warning(f"Signal {sig}. Initiating shutdown...")
-            g_shutdown_flag.set()
-        else:
-            logger.debug(f"Signal {sig} again, shutdown in progress.")
-
-    try:
-        signal.signal(signal.SIGINT, handler)
-        signal.signal(signal.SIGTERM, handler)
-        logger.info("Signal handlers set.")
-    except Exception as e:
-        logger.error(f"Failed to set signal handlers: {e}", exc_info=True)
-
-
-# --- Helper Functions ---
-def get_safe_datetime(year, month, day, hour=0, minute=0, second=0):
-    assert all(isinstance(v, int) for v in [year, month, day, hour, minute, second])
-    try:
-        return datetime.datetime(
-            year, max(1, min(12, month)), day, hour, minute, second
-        )
-    except ValueError as e:
-        logger.warning(
-            f"Invalid date/time: Y{year}-M{month}-D{day} H{hour}:M{minute}:S{second}. {e}"
-        )
-        return None
-
-
-def update_hardware_display(
-    screen: pygame.Surface, display_hat_obj
-):  # display_hat_obj can be None
-    assert screen is not None
-    if USE_ADAFRUIT_PITFT:
-        try:
-            # Write pygame surface directly to framebuffer
-            raw = pygame.image.tostring(screen, "RGB")
-
-            # Convert RGB888 to RGB565 for the display
-            rgb565_data = bytearray()
-            for i in range(0, len(raw), 3):
-                if i + 2 < len(raw):
-                    r = raw[i] >> 3  # 5 bits
-                    g = raw[i + 1] >> 2  # 6 bits
-                    b = raw[i + 2] >> 3  # 5 bits
-                    rgb565 = (r << 11) | (g << 5) | b
-                    # Little endian for the display
-                    rgb565_data.extend(rgb565.to_bytes(2, byteorder="little"))
-
-            # Write to framebuffer
-            with open("/dev/fb1", "wb") as fb:
-                fb.write(rgb565_data)
-
-        except Exception as e:
-            logger.error(
-                f"Error updating Adafruit PiTFT framebuffer: {e}", exc_info=True
-            )
-    elif USE_DISPLAY_HAT and display_hat_obj:  # This is the Pimoroni specific path
-        try:
-            # --- This is your existing Pimoroni DisplayHATMini logic ---
-            assert (
-                hasattr(display_hat_obj, "st7789")
-                and hasattr(display_hat_obj.st7789, "set_window")
-                and hasattr(display_hat_obj.st7789, "data")
-            )
-            # The Pimoroni HAT needs 180 deg rotation often
-            rotated_surf = pygame.transform.rotate(screen, 180)
-
-            # Convert to 16-bit format (RGB565) that ST7789 expects
-            # The format 16,0 usually means RGB565.
-            # Check if the surface needs conversion or if it's already in a compatible format.
-            # If screen is already 16-bit, convert might not be needed or might be different.
-            # For ST7789, RGB565 is common.
-            pixel_data_pygame_format = rotated_surf.convert(16, 0).get_buffer()
-
-            # Byte swap for ST7789 (MSB first for 16-bit color)
-            # Pygame's buffer might be LSB first depending on system/pygame version.
-            # This byte swap is typical for direct ST7789 interaction.
-            px_bytes_swapped = bytearray(pixel_data_pygame_format)
-            for i in range(0, len(px_bytes_swapped), 2):
-                px_bytes_swapped[i], px_bytes_swapped[i + 1] = (
-                    px_bytes_swapped[i + 1],
-                    px_bytes_swapped[i],
-                )
-
-            display_hat_obj.st7789.set_window()  # Prepare ST7789 for data
-
-            # Send data in chunks
-            chunk_size = 4096
-            for i in range(0, len(px_bytes_swapped), chunk_size):
-                display_hat_obj.st7789.data(px_bytes_swapped[i : i + chunk_size])
-            # --- End of Pimoroni Logic ---
-        except Exception as e:
-            logger.error(
-                f"Error updating Display HAT Mini: {e}", exc_info=False
-            )  # exc_info=False if too verbose
-    else:  # Fallback for standard Pygame window (e.g., development on PC)
-        try:
-            if pygame.display.get_init() and pygame.display.get_surface():
-                pygame.display.flip()
-        except Exception as e:
-            logger.error(
-                f"Error updating Adafruit PiTFT (pygame.display.flip): {e}",
-                exc_info=True,
-            )
-
-
-def _load_font_safe(font_name_or_path: str | None, size: int) -> pygame.font.Font:
-    """
-    Loads a Pygame font, falling back to default system font if specified font is not found.
-    """
-    assert isinstance(size, int) and size > 0, "Font size must be a positive integer."
-
-    loaded_font: pygame.font.Font | None = None
-
-    if font_name_or_path is None:  # Request for default font
-        try:
-            loaded_font = pygame.font.Font(None, size)
-            logger.debug(
-                f"PygamePlotter: Loaded Pygame default font, size {size}."
-            )  # Consider a more generic logger message if used by other classes
-        except Exception as e:
-            logger.error(
-                f"_load_font_safe: Failed to load Pygame default font, size {size}: {e}"
-            )
-            raise
-        return loaded_font
-
-    # Try loading as a direct file path first
-    try:
-        loaded_font = pygame.font.Font(font_name_or_path, size)
-        logger.debug(
-            f"_load_font_safe: Successfully loaded font '{font_name_or_path}', size {size}."
-        )
-        return loaded_font
-    except pygame.error as e:
-        logger.warning(
-            f"_load_font_safe: Font file '{font_name_or_path}' not found or error loading: {e}. Trying to match system font."
-        )
-
-    # If direct load fails, try matching font name
-    try:
-        base_font_name = os.path.splitext(os.path.basename(font_name_or_path))[0]
-        system_font_path = pygame.font.match_font(base_font_name)
-        if system_font_path:
-            logger.info(
-                f"_load_font_safe: Matched system font '{base_font_name}' to '{system_font_path}'."
-            )
-            loaded_font = pygame.font.Font(system_font_path, size)
-            return loaded_font
-        else:
-            logger.warning(
-                f"_load_font_safe: System font for '{base_font_name}' not matched."
-            )
-    except Exception as e_match:
-        logger.warning(
-            f"_load_font_safe: Error during system font matching for '{font_name_or_path}': {e_match}"
-        )
-
-    # Final fallback to Pygame's default font
-    logger.warning(
-        f"_load_font_safe: Falling back to Pygame default font for '{font_name_or_path}', size {size}."
-    )
-    try:
-        loaded_font = pygame.font.Font(None, size)
-    except Exception as e_default:
-        logger.error(
-            f"_load_font_safe: CRITICAL - Failed to load Pygame default font as final fallback: {e_default}"
-        )
-        raise
-    return loaded_font
-
-
 # --- Main Application ---
 def main():
     logger.info(
@@ -4549,11 +4683,9 @@ def main():
     menu_sys = None
     spec_screen = None
     clock = None
-    spectrometer_hardware_ok = False  # Default to false
+    spectrometer_hardware_ok = False
 
     try:
-        # --- Pygame and Display Setup ---
-        # ... (No changes to this section) ...
         if USE_ADAFRUIT_PITFT:
             logger.info(
                 "Configuring Pygame for Adafruit PiTFT (dummy SDL_VIDEODRIVER for manual fb write)..."
@@ -4566,12 +4698,11 @@ def main():
             except Exception as e:
                 logger.warning(f"Could not disable cursor blink: {e}")
             try:
-                # This might need sudo or specific permissions
                 if os.path.exists("/sys/class/vtconsole/vtcon1/bind"):
                     with open("/sys/class/vtconsole/vtcon1/bind", "w") as f:
                         f.write("0")
                     logger.info("Console unbound from fb1 (vtcon1)")
-                else:  # Try fbcon (older method)
+                else:
                     subprocess.run(
                         ["sudo", "sh", "-c", "echo 0 > /sys/class/graphics/fbcon/bind"],
                         check=False,
@@ -4589,23 +4720,20 @@ def main():
                 "Adafruit PiTFT: Pygame surface created for manual framebuffer writing."
             )
         elif USE_DISPLAY_HAT and DisplayHATMini_lib:
-            if "SDL_VIDEODRIVER" not in os.environ:  # Ensure dummy if not already set
+            if "SDL_VIDEODRIVER" not in os.environ:
                 os.environ["SDL_VIDEODRIVER"] = "dummy"
             pygame.init()
             assert pygame.get_init(), "Pygame (core) init failed"
-            # Create a Pygame surface that matches the HAT dimensions
             screen = pygame.Surface(
                 (DisplayHATMini_lib.WIDTH, DisplayHATMini_lib.HEIGHT)
             )
-            display_hat = DisplayHATMini_lib(
-                screen
-            )  # Pass the surface to the HAT library
+            display_hat = DisplayHATMini_lib(screen)
             display_hat_active = True
-            pygame.mouse.set_visible(False)  # Usually no mouse with HATs
+            pygame.mouse.set_visible(False)
             logger.info("DisplayHATMini initialized with Pygame surface.")
-        else:  # Standard Pygame window
+        else:
             logger.info("Initializing standard Pygame display window...")
-            if (  # If dummy was set by mistake, unset it
+            if (
                 "SDL_VIDEODRIVER" in os.environ
                 and os.environ["SDL_VIDEODRIVER"] == "dummy"
             ):
@@ -4614,15 +4742,12 @@ def main():
             assert pygame.get_init(), "Pygame (core) init failed"
             screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
             pygame.display.set_caption("Spectrometer Menu")
-            # pygame.mouse.set_visible(True) # Or False, depending on preference for dev
             logger.info("Standard Pygame display window initialized.")
 
         assert screen, "Pygame screen/surface was not created."
         clock = pygame.time.Clock()
         assert clock, "Pygame clock failed to initialize."
 
-        # --- Temperature Sensor Initialization ---
-        # ... (No changes to this section) ...
         if USE_TEMP_SENSOR_IF_AVAILABLE:
             if MCP9808_Driver:
                 try:
@@ -4642,13 +4767,13 @@ def main():
                         logger.warning(
                             "MCP9808 sensor begin() returned False. Sensor likely not connected or faulty."
                         )
-                        mcp9808_physical_sensor = None  # Ensure it's None
+                        mcp9808_physical_sensor = None
                 except Exception as e_temp_init:
                     logger.error(
                         f"Error initializing MCP9808 sensor hardware: {e_temp_init}",
                         exc_info=True,
                     )
-                    mcp9808_physical_sensor = None  # Ensure it's None on error
+                    mcp9808_physical_sensor = None
             else:
                 logger.warning(
                     "MCP9808_Driver class not available. Cannot attempt temperature sensor init."
@@ -4659,10 +4784,8 @@ def main():
             )
         temp_sensor_info = TempSensorInfo(mcp9808_physical_sensor)
 
-        # --- Initialize Core Components ---
         logger.info("Initializing core components...")
         net_info = NetworkInfo()
-        # Pass display_hat only if it's active and of the correct type
         button_handler_display_hat_arg = (
             display_hat
             if (
@@ -4676,7 +4799,6 @@ def main():
 
         menu_sys = MenuSystem(screen, btn_handler, net_info, temp_sensor_info)
 
-        # Ensure menu_sys.display_hat is set correctly if Display HAT is used
         if (
             display_hat_active
             and DisplayHATMini_lib
@@ -4705,39 +4827,34 @@ def main():
             if (
                 spec_screen.display_hat is None
                 and spec_screen_display_hat_arg is not None
-            ):  # Redundant check, but safe
+            ):
                 spec_screen.display_hat = spec_screen_display_hat_arg
 
-            if spec_screen._is_spectrometer_ready():  # Use the robust check
+            if spec_screen._is_spectrometer_ready():
                 spectrometer_hardware_ok = True
                 logger.info(
                     "Spectrometer hardware initialized successfully within SpectrometerScreen."
                 )
             else:
-                spectrometer_hardware_ok = False  # Explicitly false
+                spectrometer_hardware_ok = False
                 logger.warning(
                     "Spectrometer hardware FAILED to initialize or not found within SpectrometerScreen. Operations will be limited."
                 )
         else:
             logger.info("Spectrometer usage disabled by USE_SPECTROMETER=False config.")
-            spectrometer_hardware_ok = False  # Ensure it's false if not used
+            spectrometer_hardware_ok = False
 
-        if not menu_sys.font:  # Check after menu_sys is initialized
+        if not menu_sys.font:
             logger.critical(
                 "Main font failed to load. UI will be impaired. Attempting to continue..."
             )
 
-        # --- Startup Screens (Splash, Disclaimer) ---
-        # Pass the active display_hat object if display_hat_active is True
         splash_display_arg = display_hat if display_hat_active else None
         show_splash_screen(screen, splash_display_arg, SPLASH_DURATION_S)
 
-        # Check for shutdown or leak *after* splash, before disclaimer
         if g_shutdown_flag.is_set() or g_leak_detected_flag.is_set():
-            pass  # Allow loop below to handle it immediately
-        elif (
-            menu_sys.hint_font
-        ):  # Only show disclaimer if hint font loaded and no critical flags
+            pass
+        elif menu_sys.hint_font:
             disclaimer_display_arg = display_hat if display_hat_active else None
             show_disclaimer_screen(
                 screen,
@@ -4745,49 +4862,37 @@ def main():
                 btn_handler,
                 menu_sys.hint_font,
             )
-        else:  # No hint font, or critical flag set before disclaimer
+        else:
             logger.warning(
                 "Hint font not loaded or critical flag set; skipping disclaimer screen text render, but pausing if no flags."
             )
             if not g_shutdown_flag.is_set() and not g_leak_detected_flag.is_set():
-                time.sleep(2.0)  # Brief pause if no critical flags
+                time.sleep(2.0)
 
-        # --- Start Background Tasks ---
         logger.info("Setting up signal handlers and starting background tasks...")
         setup_signal_handlers(btn_handler, net_info)
         net_info.start_updates()
         temp_sensor_info.start_updates()
 
-        # --- Main Application Loop ---
         logger.info("Starting main application loop...")
         current_scr_state = "MENU"
         while not g_shutdown_flag.is_set():
             if g_leak_detected_flag.is_set():
                 logger.critical("Leak detected! Switching to leak warning screen.")
-                # Pass the active display_hat object
                 leak_display_arg = display_hat if display_hat_active else None
                 leak_action = show_leak_warning_screen(
                     screen, leak_display_arg, btn_handler
                 )
-                # show_leak_warning_screen is a blocking loop.
-                # It should set g_shutdown_flag if a button is pressed.
                 if leak_action == "QUIT" or g_shutdown_flag.is_set():
-                    if (
-                        not g_shutdown_flag.is_set()
-                    ):  # Ensure flag is set if QUIT was returned
+                    if not g_shutdown_flag.is_set():
                         g_shutdown_flag.set()
                     logger.info(
                         "Leak warning screen signaled QUIT or shutdown flag set. Breaking main loop."
                     )
-                    break  # Exit main application loop
-
-                # If leak warning exits but flag is still set (e.g. if it could be cleared externally),
-                # this 'continue' will re-trigger the leak warning.
-                # If flag was cleared, normal operation resumes.
+                    break
                 logger.info("Leak warning screen exited. Re-evaluating flags.")
-                continue  # Restart the main while loop to re-check flags
+                continue
 
-            # State-specific logic:
             if current_scr_state == "MENU":
                 assert menu_sys is not None, "MenuSystem is None in MENU state"
                 menu_action = menu_sys.handle_input()
@@ -4806,7 +4911,7 @@ def main():
                             )
                     else:
                         logger.warning(
-                            "START_CAPTURE selected, but SpectrometerScreen not available (USE_SPECTROMETER might be False or init failed)."
+                            "START_CAPTURE selected, but SpectrometerScreen not available."
                         )
 
                 if current_scr_state == "MENU" and not g_shutdown_flag.is_set():
@@ -4830,19 +4935,19 @@ def main():
                 g_shutdown_flag.set()
 
             if not g_shutdown_flag.is_set():
-                clock.tick(1.0 / MAIN_LOOP_DELAY_S)  # Regulate loop speed
+                clock.tick(1.0 / MAIN_LOOP_DELAY_S)
 
     except SystemExit as e:
         logger.warning(f"Exiting due to SystemExit: {e}")
     except RuntimeError as e:
         logger.critical(f"RUNTIME ERROR in main: {e}", exc_info=True)
-        g_shutdown_flag.set()  # Ensure shutdown on critical errors
+        g_shutdown_flag.set()
     except KeyboardInterrupt:
         logger.warning("KeyboardInterrupt. Initiating shutdown...")
         g_shutdown_flag.set()
     except Exception as e:
         logger.critical(f"FATAL UNHANDLED EXCEPTION in main: {e}", exc_info=True)
-        g_shutdown_flag.set()  # Ensure shutdown
+        g_shutdown_flag.set()
     finally:
         logger.warning("Initiating final cleanup...")
         if net_info:
@@ -4860,18 +4965,18 @@ def main():
                 spec_screen.cleanup()
             except Exception as e_ss:
                 logger.error(f"Error cleaning spec_screen: {e_ss}")
-        if menu_sys:  # menu_sys might not be fully initialized if error occurs early
+        if menu_sys:
             try:
                 menu_sys.cleanup()
             except Exception as e_ms:
                 logger.error(f"Error cleaning menu_sys: {e_ms}")
-        if btn_handler:  # btn_handler might not be fully initialized
+        if btn_handler:
             try:
                 btn_handler.cleanup()
             except Exception as e_bh:
                 logger.error(f"Error cleaning btn_handler: {e_bh}")
 
-        if pygame.get_init():  # Check if Pygame was initialized
+        if pygame.get_init():
             try:
                 pygame.quit()
                 logger.info("Pygame quit successfully.")
